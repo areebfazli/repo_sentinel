@@ -1,0 +1,24 @@
+# Python environments
+venv/
+env/
+.env
+__pycache__/
+*.pyc
+*.pyo
+
+# Qdrant local data
+qdrant_data/
+
+# SQLite databases
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# IDEs
+.vscode/
+.idea/
+
+# MLflow tracking
+mlruns/

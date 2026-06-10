@@ -79,14 +79,14 @@ class VectorStore:
 
     def _search(self, collection_name: str, query_vector: List[float], limit: int) -> List[Dict[str, Any]]:
         """Helper to perform ANN search."""
-        hits = self.client.search(
+        response = self.client.query_points(
             collection_name=collection_name,
-            query_vector=query_vector,
+            query=query_vector,
             limit=limit
         )
         
         results = []
-        for hit in hits:
+        for hit in response.points:
             # Reconstruct dictionary with score
             res = hit.payload.copy() if hit.payload else {}
             res["similarity_score"] = hit.score

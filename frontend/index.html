@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RepoSentinel | Permanent Security Memory</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="./src/styles/main.css">
+</head>
+<body>
+    <!-- Background Elements -->
+    <div class="bg-glow top-left"></div>
+    <div class="bg-glow bottom-right"></div>
+
+    <div class="app-container">
+        <!-- Header -->
+        <header class="navbar glass-panel">
+            <div class="logo">
+                <div class="logo-icon"></div>
+                <h1>RepoSentinel</h1>
+            </div>
+            <nav>
+                <a href="#" class="nav-link active">Scanner</a>
+                <a href="#" class="nav-link">Team Memory DB</a>
+                <a href="#" class="nav-link">Settings</a>
+            </nav>
+        </header>
+
+        <!-- Main Workspace -->
+        <main class="workspace">
+            <!-- Left Column: Input -->
+            <section class="editor-section glass-panel">
+                <div class="section-header">
+                    <h2>Code Scanner</h2>
+                    <span class="badge">Live Analysis</span>
+                </div>
+                <div class="editor-container">
+                    <div class="editor-toolbar">
+                        <span class="dot red"></span>
+                        <span class="dot yellow"></span>
+                        <span class="dot green"></span>
+                        <span class="filename">pull_request.py</span>
+                    </div>
+                    <textarea id="codeInput" class="code-editor" spellcheck="false" placeholder="Paste developer code here to scan against global CVEs and internal Team Memory..."></textarea>
+                </div>
+                <button id="scanBtn" class="primary-btn">
+                    <span class="btn-text">Run Security Scan</span>
+                    <div class="loader hidden"></div>
+                </button>
+            </section>
+
+            <!-- Right Column: Output Report -->
+            <section class="report-section">
+                <div id="welcomeState" class="empty-state glass-panel">
+                    <div class="ghost-icon">👻</div>
+                    <h3>Ready to Scan</h3>
+                    <p>Paste a code snippet to cross-reference against global threat intelligence and your team's institutional memory.</p>
+                </div>
+
+                <div id="resultsState" class="results-container hidden">
+                    <!-- Dynamic Content Injected Here -->
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Script references -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="./src/app.js"></script>
+</body>
+</html>

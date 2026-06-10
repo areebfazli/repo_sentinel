@@ -14,7 +14,7 @@ class Settings(BaseSettings):
 
     # API Keys
     GITHUB_TOKEN: Optional[str] = None
-    ANTHROPIC_API_KEY: Optional[str] = None
+    OPENROUTER_API_KEY: Optional[str] = None
 
     # Service URLs (for production)
     DATABASE_URL: Optional[str] = None

@@ -60,15 +60,8 @@ def main():
     
     repo_url = "https://github.com/pallets/flask" # A popular repo to test against
     
-    print(f"Attempting to crawl recent PRs from {repo_url}...")
-    try:
-        # This might fail if the user hasn't set a GITHUB_TOKEN and is rate limited
-        team_docs = crawler.fetch_team_history(repo_url)
-        print(f"Successfully crawled {len(team_docs)} PRs from GitHub.")
-    except GithubException as e:
-        print(f"\n⚠️ GitHub API Error: {e.data.get('message', str(e))}")
-        print("Falling back to mock internal PR history (Rate limit likely hit)...\n")
-        team_docs = MOCK_TEAM_HISTORY
+    print("Using mock internal PR history (bypassing unauthenticated GitHub rate limits)...")
+    team_docs = MOCK_TEAM_HISTORY
 
     if not team_docs:
         print("No team history found to ingest.")

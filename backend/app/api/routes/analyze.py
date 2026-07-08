@@ -57,7 +57,7 @@ async def analyze_pr_code(
             Scan(
                 id=job_id,
                 status="queued",
-                mode="snippet",
+                mode="files" if request.files else "snippet",
                 request_json=request.model_dump_json(),
                 repo=str(request.repo_url) if request.repo_url else None,
                 pr_number=request.pr_number,

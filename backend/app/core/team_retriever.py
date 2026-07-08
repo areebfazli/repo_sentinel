@@ -32,17 +32,19 @@ class TeamRetriever:
         language: str | None = None,
         limit: int | None = None,
         threshold: float | None = None,
+        query_vector: list[float] | None = None,
     ) -> list[dict[str, Any]]:
         """Embed developer code and search Team Memory for related past PR reviews.
 
         Same recall -> similarity gate -> rerank -> probability gate pipeline as the
         CVE side. Reranks against the stored discussion text. Thresholds default to
-        settings.
+        settings. ``query_vector`` lets callers pass a precomputed embedding.
         """
         limit = settings.RETRIEVAL_TOP_K if limit is None else limit
         threshold = settings.SIM_THRESHOLD_TEAM if threshold is None else threshold
 
-        query_vector = self.embedder.embed_text(code_snippet)
+        if query_vector is None:
+            query_vector = self.embedder.embed_text(code_snippet)
 
         broad_matches = self.vector_store.search_team_history(
             query_vector, limit=settings.ANN_CANDIDATES, language=language

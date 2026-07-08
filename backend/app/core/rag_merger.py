@@ -54,6 +54,64 @@ class RagMerger:
             "is_vulnerable": bool(cve_findings or team_findings)
         }
 
+    async def analyze_units(self, units: list[dict[str, Any]]) -> dict[str, Any]:
+        """Files-mode analysis: one match set across per-function units.
+
+        Embeds every unit's code in a single batch (cache-aware), then runs
+        retrieval per unit and merges. Findings are anchored to their file/line
+        and deduped by (point_id, file_path) keeping the best-scoring hit.
+        """
+        if not units:
+            return {"ghost_hunter_findings": [], "team_memory_findings": [], "is_vulnerable": False}
+
+        codes = [u["code"] for u in units]
+        vectors = await asyncio.to_thread(self.embedder.embed_texts, codes)
+        return await asyncio.to_thread(self._analyze_units_sync, units, vectors)
+
+    def _analyze_units_sync(
+        self, units: list[dict[str, Any]], vectors: list[list[float]]
+    ) -> dict[str, Any]:
+        cve_findings: list[dict[str, Any]] = []
+        team_findings: list[dict[str, Any]] = []
+
+        for unit, vector in zip(units, vectors, strict=False):
+            language = unit.get("language") or "python"
+            for match in self.cve_retriever.find_vulnerabilities(
+                unit["code"], language=language, query_vector=vector
+            ):
+                cve_findings.append(_anchor(match, unit))
+            for match in self.team_retriever.find_team_history(
+                unit["code"], query_vector=vector
+            ):
+                team_findings.append(_anchor(match, unit))
+
+        cve_findings = _dedupe(cve_findings)
+        team_findings = _dedupe(team_findings)
+        return {
+            "ghost_hunter_findings": cve_findings,
+            "team_memory_findings": team_findings,
+            "is_vulnerable": bool(cve_findings or team_findings),
+        }
+
+
+def _anchor(match: dict[str, Any], unit: dict[str, Any]) -> dict[str, Any]:
+    match["file_path"] = unit["file_path"]
+    match["start_line"] = unit["start_line"]
+    match["end_line"] = unit["end_line"]
+    match["function_name"] = unit["function_name"]
+    return match
+
+
+def _dedupe(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the highest adjusted_score per (point_id, file_path)."""
+    best: dict[tuple, dict[str, Any]] = {}
+    for f in findings:
+        key = (f.get("point_id"), f.get("file_path"))
+        current = best.get(key)
+        if current is None or f.get("adjusted_score", 0.0) > current.get("adjusted_score", 0.0):
+            best[key] = f
+    return sorted(best.values(), key=lambda f: f.get("adjusted_score", 0.0), reverse=True)
+
 
 # Simple CLI test runner if executed directly
 if __name__ == "__main__":

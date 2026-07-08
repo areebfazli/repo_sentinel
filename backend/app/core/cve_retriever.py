@@ -19,17 +19,20 @@ class CVERetriever:
         language: str | None = None,
         limit: int | None = None,
         threshold: float | None = None,
+        query_vector: list[float] | None = None,
     ) -> list[dict[str, Any]]:
         """Embed developer code and search the CVE corpus for matches.
 
         High recall (ANN top-N, optionally language-filtered) -> similarity gate ->
         cross-encoder rerank code-against-code -> rerank-probability gate. All
-        thresholds default to settings (single source of truth).
+        thresholds default to settings (single source of truth). ``query_vector``
+        lets callers pass a precomputed embedding (files mode batches embedding).
         """
         limit = settings.RETRIEVAL_TOP_K if limit is None else limit
         threshold = settings.SIM_THRESHOLD_CVE if threshold is None else threshold
 
-        query_vector = self.embedder.embed_text(code_snippet)
+        if query_vector is None:
+            query_vector = self.embedder.embed_text(code_snippet)
 
         broad_matches = self.vector_store.search_cves(
             query_vector, limit=settings.ANN_CANDIDATES, language=language

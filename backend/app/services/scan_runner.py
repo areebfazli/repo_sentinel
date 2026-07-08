@@ -6,6 +6,7 @@ Owns its own DB session (it runs outside the request lifecycle).
 import asyncio
 import json
 from datetime import UTC, datetime
+from functools import lru_cache
 
 from loguru import logger
 
@@ -34,6 +35,10 @@ def _persist_findings(session, scan_id: str, raw: dict) -> list[Finding]:
                 cve_id=match.get("cve_id"),
                 title=match.get("description") or match.get("cve_id") or "CVE match",
                 severity=severity_from_cvss(match.get("severity")),
+                file_path=match.get("file_path"),
+                start_line=match.get("start_line"),
+                end_line=match.get("end_line"),
+                function_name=match.get("function_name"),
                 similarity_score=float(match.get("similarity_score", 0.0)),
                 rerank_score=float(match.get("rerank_score", 0.0)),
                 rerank_prob=float(match.get("rerank_prob", 0.0)),
@@ -53,6 +58,10 @@ def _persist_findings(session, scan_id: str, raw: dict) -> list[Finding]:
                 point_id=str(match.get("point_id", "")),
                 team_pr_id=match.get("pr_id"),
                 title=match.get("title") or match.get("pr_id") or "Team memory match",
+                file_path=match.get("file_path"),
+                start_line=match.get("start_line"),
+                end_line=match.get("end_line"),
+                function_name=match.get("function_name"),
                 similarity_score=float(match.get("similarity_score", 0.0)),
                 rerank_score=float(match.get("rerank_score", 0.0)),
                 rerank_prob=float(match.get("rerank_prob", 0.0)),
@@ -75,9 +84,56 @@ def _finding_out(row: Finding) -> dict:
         "severity": row.severity,
         "cve_id": row.cve_id,
         "team_pr_id": row.team_pr_id,
+        "file_path": row.file_path,
+        "start_line": row.start_line,
         "similarity_score": row.similarity_score,
         "rerank_prob": row.rerank_prob,
     }
+
+
+@lru_cache(maxsize=1)
+def _get_parser():
+    from backend.app.core.code_parser import CodeParser
+
+    return CodeParser()
+
+
+def _prompt_code_for_files(units: list[dict], raw: dict) -> str:
+    """Build the LLM prompt code from only the functions that produced matches."""
+    matched = {
+        (f.get("file_path"), f.get("function_name"))
+        for f in raw.get("ghost_hunter_findings", []) + raw.get("team_memory_findings", [])
+    }
+    parts = []
+    for unit in units:
+        if (unit["file_path"], unit["function_name"]) in matched:
+            fn = unit["function_name"] or ""
+            header = f"# {unit['file_path']}:{unit['start_line']} {fn}".rstrip()
+            parts.append(f"{header}\n{unit['code']}")
+    return "\n\n".join(parts)
+
+
+async def _analyze_request(merger, request: dict) -> tuple[dict, str, str]:
+    """Run the right retrieval mode. Returns (raw_findings, prompt_code, extra_note)."""
+    if request.get("files"):
+        from backend.app.config import settings
+        from backend.app.core.analysis_planner import plan_units
+        from backend.app.models.schemas import FileInput
+
+        files = [FileInput(**f) for f in request["files"]]
+        units, dropped = plan_units(files, _get_parser(), settings.MAX_UNITS_PER_SCAN)
+        raw = await merger.analyze_units(units)
+        note = (
+            f"\n\n_Analysis capped at {settings.MAX_UNITS_PER_SCAN} functions; "
+            f"{dropped} not scanned._"
+            if dropped
+            else ""
+        )
+        return raw, _prompt_code_for_files(units, raw), note
+
+    code = request["code_snippet"]
+    raw = await merger.analyze_code(code, request.get("language", "python"))
+    return raw, code, ""
 
 
 async def run_scan(scan_id: str, merger, router) -> None:
@@ -94,10 +150,7 @@ async def run_scan(scan_id: str, merger, router) -> None:
         session.commit()
 
         request = json.loads(scan.request_json)
-        code = request["code_snippet"]
-        language = request.get("language", "python")
-
-        raw = await merger.analyze_code(code, language)
+        raw, prompt_code, extra_note = await _analyze_request(merger, request)
         cves = raw.get("ghost_hunter_findings", [])
         team = raw.get("team_memory_findings", [])
 
@@ -107,14 +160,14 @@ async def run_scan(scan_id: str, merger, router) -> None:
         if raw.get("is_vulnerable"):
             allowed_cves = {c.get("cve_id") for c in cves if c.get("cve_id")}
             allowed_prs = {t.get("pr_id") for t in team if t.get("pr_id")}
-            user_prompt = build_user_prompt(code, cves, team)
+            user_prompt = build_user_prompt(prompt_code, cves, team)
             llm_json, provider_used = await asyncio.to_thread(
                 router.generate, SYSTEM_PROMPT, user_prompt
             )
             validated = validate_findings(llm_json.get("findings", []), allowed_cves, allowed_prs)
-            report_markdown = render_markdown(validated, len(cves), len(team))
+            report_markdown = render_markdown(validated, len(cves), len(team)) + extra_note
         else:
-            report_markdown = render_markdown([], len(cves), len(team))
+            report_markdown = render_markdown([], len(cves), len(team)) + extra_note
 
         result = {
             "is_vulnerable": bool(raw.get("is_vulnerable")),

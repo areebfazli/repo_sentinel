@@ -1,10 +1,12 @@
 import asyncio
-from typing import List, Dict, Any, Optional
+from typing import Any
+
 from backend.app.core.cve_retriever import CVERetriever
-from backend.app.core.team_retriever import TeamRetriever
 from backend.app.core.embedder import Embedder
-from backend.app.core.vector_store import VectorStore
 from backend.app.core.reranker import Reranker
+from backend.app.core.team_retriever import TeamRetriever
+from backend.app.core.vector_store import VectorStore
+
 
 class RagMerger:
     def __init__(self):
@@ -19,15 +21,15 @@ class RagMerger:
         self.cve_retriever = CVERetriever(self.embedder, self.vector_store, self.reranker)
         self.team_retriever = TeamRetriever(self.embedder, self.vector_store, self.reranker)
 
-    async def _async_find_cves(self, code_snippet: str) -> List[Dict[str, Any]]:
+    async def _async_find_cves(self, code_snippet: str) -> list[dict[str, Any]]:
         # In a fully async system, qdrant-client async would be used. 
         # Wrapping synchronous calls for now.
         return await asyncio.to_thread(self.cve_retriever.find_vulnerabilities, code_snippet)
 
-    async def _async_find_team_history(self, code_snippet: str) -> List[Dict[str, Any]]:
+    async def _async_find_team_history(self, code_snippet: str) -> list[dict[str, Any]]:
         return await asyncio.to_thread(self.team_retriever.find_team_history, code_snippet)
 
-    async def analyze_code(self, code_snippet: str) -> Dict[str, Any]:
+    async def analyze_code(self, code_snippet: str) -> dict[str, Any]:
         """
         The core RepoSentinel function: Takes developer code, hits both databases concurrently,
         and merges the results into a unified data structure.

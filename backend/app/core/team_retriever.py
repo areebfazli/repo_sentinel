@@ -1,7 +1,9 @@
-from typing import List, Dict, Any
+from typing import Any
+
 from backend.app.core.embedder import Embedder
-from backend.app.core.vector_store import VectorStore
 from backend.app.core.reranker import Reranker
+from backend.app.core.vector_store import VectorStore
+
 
 class TeamRetriever:
     def __init__(self, embedder: Embedder, vector_store: VectorStore, reranker: Reranker):
@@ -9,7 +11,9 @@ class TeamRetriever:
         self.vector_store = vector_store
         self.reranker = reranker
 
-    def find_team_history(self, code_snippet: str, limit: int = 1, threshold: float = 0.85) -> List[Dict[str, Any]]:
+    def find_team_history(
+        self, code_snippet: str, limit: int = 1, threshold: float = 0.85
+    ) -> list[dict[str, Any]]:
         """
         Embed a developer's code snippet and search the Team Memory for past PRs
         where the team discussed similar code patterns.

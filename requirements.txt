@@ -8,32 +8,32 @@ pydantic-settings>=2.2.1
 PyGithub>=2.3.0
 GitPython>=3.1.43
 
-# Code Parsing (AST)
-tree-sitter>=0.21.3
-tree-sitter-python>=0.21.0
-tree-sitter-javascript>=0.21.2
-tree-sitter-go>=0.21.2
-tree-sitter-java>=0.21.0
+# Code Parsing (AST) — tree-sitter >= 0.23 API (Parser(language), QueryCursor)
+tree-sitter>=0.23
+tree-sitter-python>=0.23
+tree-sitter-javascript>=0.23
+tree-sitter-go>=0.23
+tree-sitter-java>=0.23
 
 # Machine Learning & Embeddings
-torch>=2.12.0
+torch>=2.4.0
 transformers>=4.40.1
 sentence-transformers>=2.7.0
 
 # Vector Database
-qdrant-client>=1.9.0
+qdrant-client>=1.10.0
 
-# Background Tasks & Workers
-celery>=5.4.0
-redis>=5.0.4
-fakeredis>=2.23.0  # For local development without Docker
-
-# Database (Feedback and State)
+# Database (feedback, jobs, embedding cache, ingestion state)
 SQLAlchemy>=2.0.30
 
-# External APIs
-anthropic>=0.25.8
+# LLM + HTTP
+httpx>=0.27.0
+requests>=2.31.0
 
 # Utilities
 python-dotenv>=1.0.1
 loguru>=0.7.2
+
+# Dev tooling
+pytest>=8.0.0
+ruff>=0.5.0

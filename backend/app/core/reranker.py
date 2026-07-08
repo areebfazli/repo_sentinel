@@ -1,7 +1,10 @@
+from typing import Any
+
 import torch
-from typing import List, Dict, Any
 from sentence_transformers import CrossEncoder
+
 from backend.app.config import settings
+
 
 class Reranker:
     def __init__(self):
@@ -15,14 +18,16 @@ class Reranker:
         # We use the ms-marco model optimized for semantic search relevance
         self.model = CrossEncoder(settings.RERANKER_MODEL, device=self.device)
 
-    def rerank(self, query_code: str, candidate_cves: List[Dict[str, Any]], top_k: int = 1) -> List[Dict[str, Any]]:
+    def rerank(
+        self, query_code: str, candidate_cves: list[dict[str, Any]], top_k: int = 1
+    ) -> list[dict[str, Any]]:
         """
         Rerank a list of candidate CVEs against the developer's query code.
         """
         if not candidate_cves:
             return []
-            
-        # The CrossEncoder expects pairs of sentences: [[query, candidate1], [query, candidate2], ...]
+
+        # The CrossEncoder expects pairs of sentences: [[query, candidate1], ...].
         # We use the CVE's description + vulnerable code as the candidate text to compare against
         pairs = []
         for cve in candidate_cves:

@@ -1,7 +1,9 @@
-from typing import List
+
 import torch
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoModel, AutoTokenizer
+
 from backend.app.config import settings
+
 
 class Embedder:
     def __init__(self):
@@ -12,12 +14,12 @@ class Embedder:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Initializing Embedder on device: {self.device}")
         
-        # We use microsoft/codebert-base as defined in settings
-        self.tokenizer = AutoTokenizer.from_pretrained(settings.CODEBERT_MODEL)
-        self.model = AutoModel.from_pretrained(settings.CODEBERT_MODEL).to(self.device)
+        # Embedding model name comes from settings (EMBEDDING_MODEL, legacy alias CODEBERT_MODEL)
+        self.tokenizer = AutoTokenizer.from_pretrained(settings.EMBEDDING_MODEL)
+        self.model = AutoModel.from_pretrained(settings.EMBEDDING_MODEL).to(self.device)
         self.model.eval() # Set to evaluation mode
 
-    def embed_texts(self, texts: List[str], batch_size: int = 16) -> List[List[float]]:
+    def embed_texts(self, texts: list[str], batch_size: int = 16) -> list[list[float]]:
         """
         Embed a list of text strings (code snippets or PR comments).
         Returns a list of dense vector embeddings.
@@ -53,6 +55,6 @@ class Embedder:
             
         return all_embeddings
 
-    def embed_text(self, text: str) -> List[float]:
+    def embed_text(self, text: str) -> list[float]:
         """Embed a single text string."""
         return self.embed_texts([text])[0]

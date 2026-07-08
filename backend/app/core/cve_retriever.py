@@ -1,7 +1,9 @@
-from typing import List, Dict, Any
+from typing import Any
+
 from backend.app.core.embedder import Embedder
-from backend.app.core.vector_store import VectorStore
 from backend.app.core.reranker import Reranker
+from backend.app.core.vector_store import VectorStore
+
 
 class CVERetriever:
     def __init__(self, embedder: Embedder, vector_store: VectorStore, reranker: Reranker):
@@ -9,7 +11,9 @@ class CVERetriever:
         self.vector_store = vector_store
         self.reranker = reranker
 
-    def find_vulnerabilities(self, code_snippet: str, limit: int = 1, threshold: float = 0.85) -> List[Dict[str, Any]]:
+    def find_vulnerabilities(
+        self, code_snippet: str, limit: int = 1, threshold: float = 0.85
+    ) -> list[dict[str, Any]]:
         """
         Embed a developer's code snippet and search the CVE corpus for semantic matches.
         Uses a Cross-Encoder to rerank the top 5 base vector matches.

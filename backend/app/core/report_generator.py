@@ -1,6 +1,9 @@
+from typing import Any
+
 import requests
-from typing import Dict, Any
+
 from backend.app.config import settings
+
 
 class ReportGenerator:
     def __init__(self):
@@ -8,7 +11,7 @@ class ReportGenerator:
         self.api_key = settings.OPENROUTER_API_KEY
         self.use_api = bool(self.api_key and self.api_key != "your_openrouter_api_key_here")
 
-    def generate_pr_comment(self, code_snippet: str, merged_findings: Dict[str, Any]) -> str:
+    def generate_pr_comment(self, code_snippet: str, merged_findings: dict[str, Any]) -> str:
         """
         Takes the raw data from the RAG Merger and uses Claude (via OpenRouter) 
         to format it into a highly actionable, context-aware PR comment.

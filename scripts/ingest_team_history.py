@@ -4,11 +4,9 @@ from pathlib import Path
 # Add project root to path so we can import backend modules
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
+
 from backend.app.core.embedder import Embedder
 from backend.app.core.vector_store import VectorStore
-from backend.app.core.github_crawler import GithubCrawler
-from backend.app.config import settings
-from github import GithubException
 
 # Fallback dataset in case the unauthenticated GitHub API rate limits us (60 req/hr)
 MOCK_TEAM_HISTORY = [
@@ -56,10 +54,7 @@ def main():
     print("Initializing Team Memory Ingestion Pipeline...")
     embedder = Embedder()
     vector_store = VectorStore()
-    crawler = GithubCrawler(token=settings.GITHUB_TOKEN)
-    
-    repo_url = "https://github.com/pallets/flask" # A popular repo to test against
-    
+
     print("Using mock internal PR history (bypassing unauthenticated GitHub rate limits)...")
     team_docs = MOCK_TEAM_HISTORY
 

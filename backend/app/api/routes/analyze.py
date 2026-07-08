@@ -1,7 +1,9 @@
-from fastapi import APIRouter, HTTPException, Depends
-from backend.app.models.schemas import AnalyzeRequest, AnalyzeResponse
+from fastapi import APIRouter, Depends, HTTPException
+from loguru import logger
+
 from backend.app.core.rag_merger import RagMerger
 from backend.app.core.report_generator import ReportGenerator
+from backend.app.models.schemas import AnalyzeRequest, AnalyzeResponse
 
 router = APIRouter()
 
@@ -48,5 +50,6 @@ async def analyze_pr_code(
             team_memory_matches=len(raw_findings["team_memory_findings"])
         )
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        logger.exception("Analysis failed")
+        raise HTTPException(status_code=500, detail="Analysis failed") from None

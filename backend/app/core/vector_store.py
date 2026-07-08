@@ -1,8 +1,11 @@
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import Any
+
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
+
 from backend.app.config import settings
+
 
 class VectorStore:
     def __init__(self):
@@ -42,15 +45,20 @@ class VectorStore:
                     )
                 )
 
-    def insert_cves(self, vectors: List[List[float]], payloads: List[Dict[str, Any]]):
+    def insert_cves(self, vectors: list[list[float]], payloads: list[dict[str, Any]]):
         """Insert embedded CVEs into the Ghost Hunter pipeline."""
         self._insert(self.cve_collection, vectors, payloads)
         
-    def insert_team_history(self, vectors: List[List[float]], payloads: List[Dict[str, Any]]):
+    def insert_team_history(self, vectors: list[list[float]], payloads: list[dict[str, Any]]):
         """Insert embedded PRs/Commits into the Team Memory pipeline."""
         self._insert(self.team_collection, vectors, payloads)
 
-    def _insert(self, collection_name: str, vectors: List[List[float]], payloads: List[Dict[str, Any]]):
+    def _insert(
+        self,
+        collection_name: str,
+        vectors: list[list[float]],
+        payloads: list[dict[str, Any]],
+    ):
         """Helper to insert vectors into a specific collection."""
         points = [
             qmodels.PointStruct(
@@ -58,7 +66,7 @@ class VectorStore:
                 vector=vector,
                 payload=payload
             )
-            for vector, payload in zip(vectors, payloads)
+            for vector, payload in zip(vectors, payloads, strict=False)
         ]
         
         # Upsert in batches to avoid payload limits
@@ -69,15 +77,19 @@ class VectorStore:
                 points=points[i:i + batch_size]
             )
 
-    def search_cves(self, query_vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+    def search_cves(self, query_vector: list[float], limit: int = 5) -> list[dict[str, Any]]:
         """Find CVEs similar to the given code vector."""
         return self._search(self.cve_collection, query_vector, limit)
         
-    def search_team_history(self, query_vector: List[float], limit: int = 5) -> List[Dict[str, Any]]:
+    def search_team_history(
+        self, query_vector: list[float], limit: int = 5
+    ) -> list[dict[str, Any]]:
         """Find team history similar to the given code vector."""
         return self._search(self.team_collection, query_vector, limit)
 
-    def _search(self, collection_name: str, query_vector: List[float], limit: int) -> List[Dict[str, Any]]:
+    def _search(
+        self, collection_name: str, query_vector: list[float], limit: int
+    ) -> list[dict[str, Any]]:
         """Helper to perform ANN search."""
         response = self.client.query_points(
             collection_name=collection_name,
@@ -90,6 +102,10 @@ class VectorStore:
             # Reconstruct dictionary with score
             res = hit.payload.copy() if hit.payload else {}
             res["similarity_score"] = hit.score
+            # Carry identity through so findings can be tied back to a specific
+            # vector point (needed for the feedback loop).
+            res["point_id"] = str(hit.id)
+            res["collection"] = collection_name
             results.append(res)
-            
+
         return results

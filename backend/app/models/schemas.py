@@ -1,15 +1,16 @@
+
 from pydantic import BaseModel, HttpUrl
-from typing import Optional
+
 
 class AnalyzeRequest(BaseModel):
     """
     The incoming webhook payload from a GitHub Action or a manual developer request.
     """
-    repo_url: Optional[HttpUrl] = None
-    pr_number: Optional[int] = None
+    repo_url: HttpUrl | None = None
+    pr_number: int | None = None
     code_snippet: str
     language: str = "python"
-    author: Optional[str] = "unknown"
+    author: str | None = "unknown"
 
 class AnalyzeResponse(BaseModel):
     """

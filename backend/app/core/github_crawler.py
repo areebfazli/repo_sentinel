@@ -1,13 +1,14 @@
-import os
 import shutil
-from typing import List, Dict, Any, Optional
 from pathlib import Path
+from typing import Any
+
+from git import Repo
 from github import Github
 from github.Repository import Repository
-from git import Repo
+
 
 class GithubCrawler:
-    def __init__(self, token: Optional[str] = None):
+    def __init__(self, token: str | None = None):
         """
         Initialize the GitHub crawler.
         If no token is provided, it will make unauthenticated requests (with lower rate limits).
@@ -43,7 +44,7 @@ class GithubCrawler:
             
         return clone_dir
 
-    def fetch_team_history(self, repo_url: str) -> List[Dict[str, Any]]:
+    def fetch_team_history(self, repo_url: str) -> list[dict[str, Any]]:
         """
         Crawl PRs, issues, and commits to build the 'Team Memory'.
         Returns a list of documents to be embedded.
@@ -84,7 +85,10 @@ class GithubCrawler:
             # Get review comments (the actual code review discussions)
             review_comments = pr.get_review_comments()
             for comment in review_comments:
-                text_content += f"\nReview Comment by {comment.user.login} on file {comment.path}:\n{comment.body}"
+                text_content += (
+                    f"\nReview Comment by {comment.user.login} "
+                    f"on file {comment.path}:\n{comment.body}"
+                )
                 if comment.diff_hunk:
                     text_content += f"\nCode Diff:\n{comment.diff_hunk}"
             

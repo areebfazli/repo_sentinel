@@ -1,5 +1,6 @@
 import json
 import uuid
+from datetime import UTC
 from functools import lru_cache
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
@@ -34,7 +35,14 @@ def get_llm_router() -> LLMRouter:
 
 
 def _iso(dt) -> str | None:
-    return dt.isoformat() if dt else None
+    """ISO-8601 with a UTC designator. All writes are UTC, but SQLite can hand back
+    naive datetimes, so coerce to UTC to avoid offset-less strings that clients
+    misread as local time."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.isoformat()
 
 
 @router.post(

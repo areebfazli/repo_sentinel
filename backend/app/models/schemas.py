@@ -32,8 +32,12 @@ class AnalyzeRequest(BaseModel):
 
     @model_validator(mode="after")
     def _exactly_one_mode(self):
-        if (self.code_snippet is None) == (self.files is None):
-            raise ValueError("provide exactly one of 'code_snippet' or 'files'")
+        # An empty files list counts as "not provided" — reject it rather than
+        # letting it fall through to the snippet path with code_snippet=None.
+        has_snippet = self.code_snippet is not None
+        has_files = bool(self.files)
+        if has_snippet == has_files:
+            raise ValueError("provide exactly one of 'code_snippet' or a non-empty 'files'")
         return self
 
 

@@ -36,7 +36,7 @@ class EmbeddingCache(Base):
     model: Mapped[str] = mapped_column(String, nullable=False)
     dim: Mapped[int] = mapped_column(Integer, nullable=False)
     vector: Mapped[str] = mapped_column(Text, nullable=False)  # JSON-encoded list[float]
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
 class Scan(Base):
@@ -56,9 +56,11 @@ class Scan(Base):
     result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     llm_provider_used: Mapped[str | None] = mapped_column(String, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, index=True
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Finding(Base):
@@ -108,7 +110,7 @@ class Feedback(Base):
     point_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
     collection: Mapped[str] = mapped_column(String, nullable=False)
     vote: Mapped[int] = mapped_column(Integer, nullable=False)  # +1 or -1
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
 class IngestionState(Base):
@@ -118,4 +120,4 @@ class IngestionState(Base):
 
     repo: Mapped[str] = mapped_column(String, primary_key=True)  # owner/name
     last_pr_number: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    last_run_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    last_run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)

@@ -43,3 +43,16 @@ def test_ignores_headers_before_hunk():
 
 def test_empty_patch():
     assert parse_patch_changed_lines("") == []
+
+
+def test_blank_context_line_without_leading_space():
+    # A blank context line may lose its leading space; it must still advance the
+    # new-file counter so following additions get the right line number.
+    patch = "@@ -1,3 +1,3 @@\n a\n\n+b\n"
+    assert parse_patch_changed_lines(patch) == [3]
+
+
+def test_removed_lines_do_not_advance():
+    patch = "@@ -1,3 +1,2 @@\n keep\n-gone\n+added\n"
+    # new file: keep(1), added(2); the removed line doesn't advance.
+    assert parse_patch_changed_lines(patch) == [2]

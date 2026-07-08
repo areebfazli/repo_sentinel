@@ -1,4 +1,5 @@
 import shutil
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -47,26 +48,31 @@ class GithubCrawler:
     def fetch_team_history(
         self,
         repo_full_name: str,
-        since_pr_number: int | None = None,
+        since: datetime | None = None,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
         """Crawl closed-PR review comments into Team Memory documents.
 
         Emits ONE document per review comment (not one blob per PR) so each
         memory is a focused code-review discussion tied to a diff hunk — much
-        better for code-to-code matching. Newest PRs first; stops at
-        ``since_pr_number`` (the crawl cursor) or after ``limit`` PRs.
+        better for code-to-code matching. Ordered by most-recently-updated and
+        stopped once a PR older than ``since`` (the last-run timestamp) is
+        reached — so a long-lived PR that merges out of creation order is still
+        picked up (re-ingestion is idempotent via uuid5 point ids).
         """
         repo: Repository = self.gh.get_repo(repo_full_name)
-        prs = repo.get_pulls(state="closed", sort="created", direction="desc")
+        prs = repo.get_pulls(state="closed", sort="updated", direction="desc")
 
         docs: list[dict[str, Any]] = []
         count = 0
         for pr in prs:
             if count >= limit:
                 break
-            if since_pr_number is not None and pr.number <= since_pr_number:
-                break  # already ingested everything at/below this number
+            updated = pr.updated_at
+            if updated is not None and updated.tzinfo is None:
+                updated = updated.replace(tzinfo=UTC)
+            if since is not None and updated is not None and updated <= since:
+                break  # everything newer than the last run has been seen
             count += 1
 
             for comment in pr.get_review_comments():

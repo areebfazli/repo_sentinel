@@ -71,6 +71,7 @@ def test_analyze_queues_and_completes():
             assert status.status_code == 200
             data = status.json()
             assert data["status"] == "completed"
+            assert (data["created_at"] or "").endswith("+00:00")  # UTC-designated
             result = data["result"]
             assert result["is_vulnerable"] is True
             assert result["ghost_hunter_matches"] == 1

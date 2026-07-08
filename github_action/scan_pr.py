@@ -43,13 +43,16 @@ def parse_changed_lines(patch: str) -> list[int]:
         if header:
             new_line, in_hunk = int(header.group(1)), True
             continue
-        if not in_hunk or not line:
+        if not in_hunk:
             continue
-        if line[0] == "+":
+        tag = line[0] if line else " "  # stripped-blank context line
+        if tag == "+":
             changed.append(new_line)
             new_line += 1
-        elif line[0] == " ":
-            new_line += 1
+        elif tag == "-" or tag == "\\":
+            continue  # removals / no-newline markers don't advance the new file
+        else:
+            new_line += 1  # context line
     return changed
 
 
@@ -179,9 +182,7 @@ def collect_changed_files(repo: str, pr_number: int, head_sha: str, token: str) 
             continue
         if not any(path.endswith(ext) for ext in SUPPORTED_EXTS):
             continue
-        patch = f.get("patch")
-        if not patch:
-            continue
+        patch = f.get("patch")  # omitted by GitHub for very large diffs
         resp = requests.get(
             f"{GITHUB_API}/repos/{repo}/contents/{path}",
             headers=_gh_headers(token),
@@ -196,6 +197,10 @@ def collect_changed_files(repo: str, pr_number: int, head_sha: str, token: str) 
             print(f"  skip {path}: too large or non-text")
             continue
         content = base64.b64decode(data["content"]).decode("utf-8", "replace")
+        if not patch:
+            # No inline patch (huge diff): scan the whole file rather than
+            # silently dropping it. Findings can only anchor to the summary.
+            print(f"  {path}: no patch from GitHub (large diff) — scanning whole file")
         collected.append({"path": path, "content": content, "patch": patch})
     return collected
 
@@ -327,7 +332,7 @@ def main() -> int:
     findings = result.get("report_findings", [])
     print(f"{len(findings)} confirmed finding(s); is_vulnerable={result.get('is_vulnerable')}")
 
-    changed_by_file = {file["path"]: parse_changed_lines(file["patch"]) for file in files}
+    changed_by_file = {file["path"]: parse_changed_lines(file.get("patch") or "") for file in files}
     desired, unanchored = desired_comments(findings, changed_by_file)
     summary = build_summary(result.get("report_markdown", ""), gate)
 

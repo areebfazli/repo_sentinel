@@ -21,15 +21,18 @@ def parse_patch_changed_lines(patch: str) -> list[int]:
             new_line = int(header.group(1))
             in_hunk = True
             continue
-        if not in_hunk or not line:
+        if not in_hunk:
             continue
 
-        tag = line[0]
+        # A blank context line may arrive as "" if a tool stripped its leading
+        # space; treat it as context so it still advances the new-file counter.
+        tag = line[0] if line else " "
         if tag == "+":
             changed.append(new_line)
             new_line += 1
-        elif tag == " ":
-            new_line += 1
-        # '-' removals and '\' (no-newline markers) do not advance the new file.
+        elif tag == "-" or tag == "\\":
+            continue  # removals / no-newline markers don't advance the new file
+        else:
+            new_line += 1  # context line (leading space, or stripped blank)
 
     return changed

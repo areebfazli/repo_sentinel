@@ -86,14 +86,19 @@ def _language(file_path: str | None) -> str:
     return EXT_LANGUAGE.get(Path(file_path).suffix.lower(), "unknown")
 
 
-def _get_cursor(repo: str) -> int | None:
+def _get_since(repo: str) -> datetime | None:
+    """Incremental cursor = the previous run's timestamp (crawl is ordered by
+    updated_at, so this reliably captures PRs closed out of creation order)."""
     IngestionState.__table__.create(bind=engine, checkfirst=True)
     with SessionLocal() as session:
         state = session.get(IngestionState, repo)
-        return state.last_pr_number if state else None
+        if state is None or state.last_run_at is None:
+            return None
+        dt = state.last_run_at
+        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
-def _set_cursor(repo: str, last_pr_number: int) -> None:
+def _set_cursor(repo: str, run_started: datetime, last_pr_number: int) -> None:
     with SessionLocal() as session:
         state = session.get(IngestionState, repo)
         if state is None:
@@ -101,7 +106,9 @@ def _set_cursor(repo: str, last_pr_number: int) -> None:
             session.add(state)
         else:
             state.last_pr_number = max(state.last_pr_number, last_pr_number)
-        state.last_run_at = datetime.now(UTC)
+        # Store the time the run STARTED so PRs updated during the crawl aren't
+        # skipped next time.
+        state.last_run_at = run_started
         session.commit()
 
 
@@ -116,6 +123,7 @@ def main():
     args = parser.parse_args()
 
     print("Initializing Team Memory Ingestion Pipeline...")
+    run_started = datetime.now(UTC)
     embedder = Embedder(cache=EmbeddingCache())
     vector_store = VectorStore()
 
@@ -127,10 +135,10 @@ def main():
         docs = MOCK_TEAM_HISTORY
         print(f"Using mock team history ({len(docs)} review comments).")
     else:
-        since = None if args.full else _get_cursor(args.repo)
-        print(f"Crawling {args.repo} (since PR #{since}, limit {args.limit})...")
+        since = None if args.full else _get_since(args.repo)
+        print(f"Crawling {args.repo} (updated since {since}, limit {args.limit})...")
         crawler = GithubCrawler(token=settings.GITHUB_TOKEN)
-        docs = crawler.fetch_team_history(args.repo, since_pr_number=since, limit=args.limit)
+        docs = crawler.fetch_team_history(args.repo, since=since, limit=args.limit)
 
     if not docs:
         print("No new team history to ingest.")
@@ -168,8 +176,8 @@ def main():
 
     if not args.mock:
         max_pr = max(doc["pr_number"] for doc in docs)
-        _set_cursor(args.repo, max_pr)
-        print(f"Updated crawl cursor for {args.repo} -> PR #{max_pr}.")
+        _set_cursor(args.repo, run_started, max_pr)
+        print(f"Updated crawl cursor for {args.repo} (run at {run_started.isoformat()}).")
 
     total = vector_store.count(vector_store.team_collection)
     print(f"Ingestion complete! team_history now holds {total} points.")

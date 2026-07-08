@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from loguru import logger
 
-from backend.app.api.routes import analyze
+from backend.app.api.routes import analyze, feedback
 from backend.app.config import settings
 from backend.app.db.session import init_db
 
@@ -75,6 +75,9 @@ def create_app() -> FastAPI:
 
     app.include_router(
         analyze.router, prefix=f"{settings.API_V1_STR}/analyze", tags=["Analysis"]
+    )
+    app.include_router(
+        feedback.router, prefix=f"{settings.API_V1_STR}/feedback", tags=["Feedback"]
     )
 
     @app.get("/health")

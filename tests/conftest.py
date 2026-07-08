@@ -12,6 +12,7 @@ os.environ.setdefault("PRELOAD_MODELS", "false")
 os.environ.setdefault("LLM_PROVIDER", "mock")
 os.environ.setdefault("REPOSENTINEL_API_KEY", "")
 
-# Isolated SQLite file for the whole test session.
-_TEST_DB = os.path.join(tempfile.gettempdir(), "repo_sentinel_test.sqlite")
-os.environ.setdefault("DEV_SQLITE_PATH", _TEST_DB)
+# Fresh, isolated SQLite file per test run (so job/finding/feedback rows don't
+# accumulate across invocations).
+_TEST_DIR = tempfile.mkdtemp(prefix="reposentinel_test_")
+os.environ.setdefault("DEV_SQLITE_PATH", os.path.join(_TEST_DIR, "test.sqlite"))

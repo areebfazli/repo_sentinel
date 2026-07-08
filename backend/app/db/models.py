@@ -88,3 +88,34 @@ class Finding(Base):
     rerank_prob: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     adjusted_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class Feedback(Base):
+    """A developer's up/down vote on a finding.
+
+    Unique per finding (upsert = change your vote). Suppression aggregates by
+    point_id across scans, so downvoting the same memory in different scans
+    accumulates.
+    """
+
+    __tablename__ = "feedback"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    finding_id: Mapped[int] = mapped_column(
+        ForeignKey("findings.id"), nullable=False, unique=True
+    )
+    scan_id: Mapped[str] = mapped_column(String, nullable=False)
+    point_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    collection: Mapped[str] = mapped_column(String, nullable=False)
+    vote: Mapped[int] = mapped_column(Integer, nullable=False)  # +1 or -1
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class IngestionState(Base):
+    """Per-repo crawl cursor so Team Memory ingestion only fetches new PRs."""
+
+    __tablename__ = "ingestion_state"
+
+    repo: Mapped[str] = mapped_column(String, primary_key=True)  # owner/name
+    last_pr_number: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_run_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)

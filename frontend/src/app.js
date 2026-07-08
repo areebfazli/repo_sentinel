@@ -66,6 +66,7 @@ document.addEventListener('DOMContentLoaded', () => {
         html += renderFindingCards(result.findings || []);
         resultsState.innerHTML = html;
         resultsState.style.animation = 'slideUp 0.5s cubic-bezier(0.4, 0, 0.2, 1)';
+        wireFeedbackButtons(resultsState);
     };
 
     const pollJob = async (jobId) => {
@@ -130,7 +131,13 @@ function renderFindingCards(findings) {
             const sev = f.severity ? ` · ${f.severity}` : '';
             return `
             <div class="finding-card" data-finding-id="${f.finding_id}" style="border:1px solid var(--border, #333); border-radius:10px; padding:12px 14px; margin-top:10px;">
-                <div style="font-size:0.8rem; color:var(--text-secondary);">${badge}${sev}</div>
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <div style="font-size:0.8rem; color:var(--text-secondary);">${badge}${sev}</div>
+                    <div class="feedback" style="display:flex; gap:8px;">
+                        <button class="fb-up" data-vote="1" title="Helpful" style="cursor:pointer; background:none; border:none; font-size:1rem;">👍</button>
+                        <button class="fb-down" data-vote="-1" title="Not relevant" style="cursor:pointer; background:none; border:none; font-size:1rem;">👎</button>
+                    </div>
+                </div>
                 <div style="font-weight:600; margin:4px 0;">${escapeHtml(f.title)}</div>
                 <div style="font-size:0.8rem; color:var(--text-secondary);">
                     ${ref ? escapeHtml(ref) + ' · ' : ''}similarity ${Number(f.similarity_score).toFixed(2)}
@@ -139,6 +146,30 @@ function renderFindingCards(findings) {
         })
         .join('');
     return `<h3 style="margin-top:24px;">Matched memories</h3>${cards}`;
+}
+
+function wireFeedbackButtons(container) {
+    container.querySelectorAll('.finding-card').forEach((card) => {
+        const findingId = Number(card.getAttribute('data-finding-id'));
+        card.querySelectorAll('button[data-vote]').forEach((btn) => {
+            btn.addEventListener('click', async () => {
+                const vote = Number(btn.getAttribute('data-vote'));
+                try {
+                    const resp = await fetch(`${API_HOST}/api/v1/feedback/`, {
+                        method: 'POST',
+                        headers: apiHeaders({ 'Content-Type': 'application/json' }),
+                        body: JSON.stringify({ finding_id: findingId, vote }),
+                    });
+                    if (!resp.ok) throw new Error(`Feedback error: ${resp.status}`);
+                    // Highlight the chosen vote.
+                    card.querySelectorAll('button[data-vote]').forEach((b) => (b.style.opacity = '0.35'));
+                    btn.style.opacity = '1';
+                } catch (err) {
+                    console.error('Feedback failed:', err);
+                }
+            });
+        });
+    });
 }
 
 function escapeHtml(s) {

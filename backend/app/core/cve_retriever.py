@@ -1,6 +1,7 @@
 from typing import Any
 
 from backend.app.config import settings
+from backend.app.core import feedback_store
 from backend.app.core.embedder import Embedder
 from backend.app.core.reranker import Reranker
 from backend.app.core.vector_store import VectorStore
@@ -44,11 +45,12 @@ class CVERetriever:
         for match in viable_matches:
             match["rerank_text"] = match.get("vulnerable_code") or match.get("description", "")
 
-        reranked = self.reranker.rerank(code_snippet, viable_matches, top_k=limit)
-        return [
-            m for m in reranked
-            if m.get("rerank_prob", 0.0) >= settings.RERANK_THRESHOLD
-        ]
+        # Rerank all viable, then apply feedback suppression/downweight before
+        # taking the top-k (CVE score is just the rerank probability).
+        reranked = self.reranker.rerank(code_snippet, viable_matches, top_k=len(viable_matches))
+        return feedback_store.finalize_matches(
+            reranked, limit, settings, base_score=lambda m: m.get("rerank_prob", 0.0)
+        )
 
 
 # Simple CLI test runner if executed directly

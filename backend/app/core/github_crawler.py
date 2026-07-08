@@ -44,61 +44,61 @@ class GithubCrawler:
             
         return clone_dir
 
-    def fetch_team_history(self, repo_url: str) -> list[dict[str, Any]]:
+    def fetch_team_history(
+        self,
+        repo_full_name: str,
+        since_pr_number: int | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Crawl closed-PR review comments into Team Memory documents.
+
+        Emits ONE document per review comment (not one blob per PR) so each
+        memory is a focused code-review discussion tied to a diff hunk — much
+        better for code-to-code matching. Newest PRs first; stops at
+        ``since_pr_number`` (the crawl cursor) or after ``limit`` PRs.
         """
-        Crawl PRs, issues, and commits to build the 'Team Memory'.
-        Returns a list of documents to be embedded.
-        """
-        repo_name = self._get_repo_name_from_url(repo_url)
-        repo: Repository = self.gh.get_repo(repo_name)
-        
-        history_docs = []
-        
-        # 1. Fetch Pull Requests (closed/merged)
-        # We look at closed PRs because they contain resolved discussions/bugs
-        prs = repo.get_pulls(state='closed', sort='updated', direction='desc')
-        
-        # Limit to recent PRs for initial prototype to avoid massive rate limit hits
+        repo: Repository = self.gh.get_repo(repo_full_name)
+        prs = repo.get_pulls(state="closed", sort="created", direction="desc")
+
+        docs: list[dict[str, Any]] = []
         count = 0
         for pr in prs:
-            if count >= 50: # Temporary limit for MVP
+            if count >= limit:
                 break
-                
-            # Skip if no body or comments
-            if not pr.body and pr.comments == 0:
-                continue
-                
-            doc = {
-                "id": f"pr_{pr.number}",
-                "type": "pull_request",
-                "title": pr.title,
-                "body": pr.body or "",
-                "url": pr.html_url,
-                "created_at": pr.created_at.isoformat(),
-                "merged": pr.merged,
-                "author": pr.user.login if pr.user else "unknown"
-            }
-            
-            # Combine PR description and review comments into the text to embed
-            text_content = f"PR: {pr.title}\nDescription: {pr.body}\n"
-            
-            # Get review comments (the actual code review discussions)
-            review_comments = pr.get_review_comments()
-            for comment in review_comments:
-                text_content += (
-                    f"\nReview Comment by {comment.user.login} "
-                    f"on file {comment.path}:\n{comment.body}"
-                )
-                if comment.diff_hunk:
-                    text_content += f"\nCode Diff:\n{comment.diff_hunk}"
-            
-            doc["text_content"] = text_content
-            history_docs.append(doc)
+            if since_pr_number is not None and pr.number <= since_pr_number:
+                break  # already ingested everything at/below this number
             count += 1
-            
-        # TODO: Add Issue and Commit fetching in the future
-        
-        return history_docs
+
+            for comment in pr.get_review_comments():
+                body = comment.body or ""
+                diff_hunk = comment.diff_hunk or ""
+                if not body:
+                    continue
+                author = comment.user.login if comment.user else "unknown"
+                text_content = (
+                    f"{diff_hunk}\n\nReview by {author} on {comment.path}:\n{body}"
+                    if diff_hunk
+                    else f"Review by {author} on {comment.path}:\n{body}"
+                )
+                docs.append(
+                    {
+                        "id": f"pr{pr.number}_rc{comment.id}",
+                        "pr_number": pr.number,
+                        "pr_title": pr.title,
+                        "pr_url": pr.html_url,
+                        "comment_id": comment.id,
+                        "comment_url": comment.html_url,
+                        "author": author,
+                        "author_association": comment.raw_data.get("author_association", "NONE"),
+                        "file_path": comment.path,
+                        "created_at": comment.created_at.isoformat(),
+                        "body": body,
+                        "diff_hunk": diff_hunk,
+                        "text_content": text_content,
+                    }
+                )
+
+        return docs
 
     def cleanup_clone(self, repo_url: str):
         """Remove the local clone of the repository."""

@@ -1,9 +1,23 @@
+from datetime import UTC, datetime
 from typing import Any
 
 from backend.app.config import settings
+from backend.app.core import feedback_store
 from backend.app.core.embedder import Embedder
 from backend.app.core.reranker import Reranker
+from backend.app.core.scoring import compute_adjusted_score
 from backend.app.core.vector_store import VectorStore
+
+
+def _parse_dt(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    # Treat naive timestamps as UTC so the age math stays consistent.
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
 class TeamRetriever:
@@ -39,16 +53,26 @@ class TeamRetriever:
             if res.get("similarity_score", 0.0) >= threshold
         ]
 
-        # Rerank against the discussion text (full text once Phase 5 stores it;
-        # snippet_preview is the current fallback).
+        # Rerank against the stored discussion text (diff hunk + review body).
         for match in viable_matches:
             match["rerank_text"] = match.get("text") or match.get("snippet_preview", "")
 
-        reranked = self.reranker.rerank(code_snippet, viable_matches, top_k=limit)
-        return [
-            m for m in reranked
-            if m.get("rerank_prob", 0.0) >= settings.RERANK_THRESHOLD
-        ]
+        reranked = self.reranker.rerank(code_snippet, viable_matches, top_k=len(viable_matches))
+
+        # Team score weights rerank_prob by recency + reviewer seniority, then
+        # feedback suppression/downweighting is applied on top.
+        now = datetime.now(UTC)
+
+        def base_score(m: dict[str, Any]) -> float:
+            return compute_adjusted_score(
+                m.get("rerank_prob", 0.0),
+                _parse_dt(m.get("created_at")),
+                m.get("author_association"),
+                now,
+                settings,
+            )
+
+        return feedback_store.finalize_matches(reranked, limit, settings, base_score=base_score)
 
 
 # Simple CLI test runner if executed directly

@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, HttpUrl
 
 
@@ -53,3 +55,17 @@ class JobStatusResponse(BaseModel):
     finished_at: str | None = None
     error: str | None = None
     result: AnalyzeResult | None = None
+
+
+class FeedbackRequest(BaseModel):
+    """A thumbs up/down on a finding (vote must be +1 or -1)."""
+
+    finding_id: int
+    vote: Literal[-1, 1]
+
+
+class FeedbackResponse(BaseModel):
+    status: str
+    finding_id: int
+    point_id: str
+    net_votes: int

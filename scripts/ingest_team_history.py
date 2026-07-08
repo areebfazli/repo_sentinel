@@ -23,6 +23,7 @@ from backend.app.config import settings  # noqa: E402
 from backend.app.core.embedder import Embedder  # noqa: E402
 from backend.app.core.embedding_cache import EmbeddingCache  # noqa: E402
 from backend.app.core.github_crawler import GithubCrawler  # noqa: E402
+from backend.app.core.sparse_encoder import encode as sparse_encode  # noqa: E402
 from backend.app.core.vector_store import VectorStore  # noqa: E402
 from backend.app.db.models import IngestionState  # noqa: E402
 from backend.app.db.session import SessionLocal, engine  # noqa: E402
@@ -160,9 +161,10 @@ def main():
 
     print(f"Embedding {len(texts)} review comments via {settings.EMBEDDING_MODEL}...")
     embeddings = embedder.embed_texts(texts)
+    sparse = [sparse_encode(t) for t in texts] if settings.HYBRID_ENABLED else None
 
     print("Inserting embeddings into Qdrant 'team_history' collection...")
-    vector_store.insert_team_history(embeddings, payloads, ids=ids)
+    vector_store.insert_team_history(embeddings, payloads, ids=ids, sparse_vectors=sparse)
 
     if not args.mock:
         max_pr = max(doc["pr_number"] for doc in docs)

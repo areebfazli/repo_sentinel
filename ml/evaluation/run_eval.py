@@ -146,6 +146,44 @@ def evaluate(embedder, store, reranker, dataset_path=DEFAULT_DATASET, sim_t=None
     return score(gathered, sim_t, rerank_t)
 
 
+def evaluate_via_retriever(embedder, store, reranker, dataset_path=DEFAULT_DATASET) -> dict:
+    """Operating-point metrics by running the REAL CVERetriever per snippet.
+
+    Unlike the cosine sweep, this honours whatever retrieval mode is configured
+    (dense gate or hybrid RRF fusion) — the fair way to compare hybrid vs dense.
+    """
+    from backend.app.core.cve_retriever import CVERetriever
+
+    retriever = CVERetriever(embedder, store, reranker)
+    tp = fp = fn = tn = cat_hits = 0
+    for item in load_dataset(Path(dataset_path)):
+        findings = retriever.find_vulnerabilities(item["code"], language=item.get("language"))
+        predicted = len(findings) > 0
+        is_vuln = item["label"] == "vulnerable"
+        if predicted and is_vuln:
+            tp += 1
+            if findings[0].get("category") == item.get("category"):
+                cat_hits += 1
+        elif predicted and not is_vuln:
+            fp += 1
+        elif not predicted and is_vuln:
+            fn += 1
+        else:
+            tn += 1
+
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    return {
+        "mode": "hybrid" if settings.HYBRID_ENABLED else "dense",
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(f1, 4),
+        "category_hit_rate": round(cat_hits / tp, 4) if tp else 0.0,
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+    }
+
+
 def _print_table(rows: list[dict], top: int = 12):
     header = f"{'sim_t':>6} {'rerank_t':>9} {'prec':>6} {'recall':>7} {'f1':>6} {'cat_hit':>8}"
     print(header)

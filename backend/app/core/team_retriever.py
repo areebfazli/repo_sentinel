@@ -6,6 +6,7 @@ from backend.app.core import feedback_store
 from backend.app.core.embedder import Embedder
 from backend.app.core.reranker import Reranker
 from backend.app.core.scoring import compute_adjusted_score
+from backend.app.core.sparse_encoder import encode as sparse_encode
 from backend.app.core.vector_store import VectorStore
 
 
@@ -46,14 +47,23 @@ class TeamRetriever:
         if query_vector is None:
             query_vector = self.embedder.embed_text(code_snippet)
 
-        broad_matches = self.vector_store.search_team_history(
-            query_vector, limit=settings.ANN_CANDIDATES, language=language
-        )
-
-        viable_matches = [
-            res for res in broad_matches
-            if res.get("similarity_score", 0.0) >= threshold
-        ]
+        if settings.HYBRID_ENABLED:
+            broad_matches = self.vector_store.search_team_history(
+                query_vector,
+                limit=settings.ANN_CANDIDATES,
+                language=language,
+                sparse_query=sparse_encode(code_snippet),
+                dense_threshold=threshold,
+            )
+            viable_matches = broad_matches
+        else:
+            broad_matches = self.vector_store.search_team_history(
+                query_vector, limit=settings.ANN_CANDIDATES, language=language
+            )
+            viable_matches = [
+                res for res in broad_matches
+                if res.get("similarity_score", 0.0) >= threshold
+            ]
 
         # Rerank against the stored discussion text (diff hunk + review body).
         for match in viable_matches:

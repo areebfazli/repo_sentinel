@@ -23,6 +23,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from backend.app.config import BASE_DIR, settings  # noqa: E402
 from backend.app.core.embedder import Embedder  # noqa: E402
 from backend.app.core.embedding_cache import EmbeddingCache  # noqa: E402
+from backend.app.core.sparse_encoder import encode as sparse_encode  # noqa: E402
 from backend.app.core.vector_store import VectorStore  # noqa: E402
 
 DEFAULT_DATA_DIR = BASE_DIR / "data" / "cve_corpus"
@@ -92,9 +93,10 @@ def main():
 
     print(f"Embedding CVE code snippets via {settings.EMBEDDING_MODEL}...")
     embeddings = embedder.embed_texts(texts_to_embed)
+    sparse = [sparse_encode(t) for t in texts_to_embed] if settings.HYBRID_ENABLED else None
 
     print("Inserting embeddings into Qdrant 'cve_corpus' collection...")
-    vector_store.insert_cves(embeddings, payloads, ids=ids)
+    vector_store.insert_cves(embeddings, payloads, ids=ids, sparse_vectors=sparse)
 
     total = vector_store.count(vector_store.cve_collection)
     print(f"Ingestion complete! cve_corpus now holds {total} points.")

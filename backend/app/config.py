@@ -84,6 +84,13 @@ class Settings(BaseSettings):
     # Cap on per-scan analysis units (functions) in files mode.
     MAX_UNITS_PER_SCAN: int = 50
 
+    # Hybrid dense+sparse (BM25) retrieval with RRF fusion. Off by default; enabling
+    # it requires re-ingesting BOTH collections (--recreate) so points carry sparse
+    # vectors. HYBRID_SPARSE_MIN_SCORE gates the sparse prefetch so only strong
+    # lexical matches are fused in.
+    HYBRID_ENABLED: bool = False
+    HYBRID_SPARSE_MIN_SCORE: float = 10.0  # best-observed in ml/evaluation (recall 1.0)
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

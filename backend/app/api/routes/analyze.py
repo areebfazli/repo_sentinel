@@ -1,55 +1,106 @@
-from fastapi import APIRouter, Depends, HTTPException
-from loguru import logger
+import json
+import uuid
+from functools import lru_cache
 
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+
+from backend.app.api.deps import require_api_key
+from backend.app.config import settings
+from backend.app.core.llm_client import LLMRouter
 from backend.app.core.rag_merger import RagMerger
-from backend.app.core.report_generator import ReportGenerator
-from backend.app.models.schemas import AnalyzeRequest, AnalyzeResponse
+from backend.app.db.models import Scan
+from backend.app.db.session import SessionLocal
+from backend.app.models.schemas import (
+    AnalyzeAccepted,
+    AnalyzeRequest,
+    AnalyzeResult,
+    JobStatusResponse,
+)
+from backend.app.services.scan_runner import run_scan
 
 router = APIRouter()
 
-# Dependency injection for the heavy ML models so we don't reload them on every request
-def get_merger():
-    # In production, this would be attached to app.state
-    # For now, we'll instantiate it if needed, but ideally it's shared
-    if not hasattr(get_merger, "instance"):
-        get_merger.instance = RagMerger()
-    return get_merger.instance
 
-def get_report_generator():
-    if not hasattr(get_report_generator, "instance"):
-        get_report_generator.instance = ReportGenerator()
-    return get_report_generator.instance
+@lru_cache(maxsize=1)
+def get_merger() -> RagMerger:
+    """Shared RagMerger singleton (loads gigabytes of models — construct once)."""
+    return RagMerger()
 
-@router.post("/", response_model=AnalyzeResponse)
+
+@lru_cache(maxsize=1)
+def get_llm_router() -> LLMRouter:
+    """Shared LLM router singleton (validates provider keys at construction)."""
+    return LLMRouter()
+
+
+def _iso(dt) -> str | None:
+    return dt.isoformat() if dt else None
+
+
+@router.post(
+    "/",
+    status_code=202,
+    response_model=AnalyzeAccepted,
+    dependencies=[Depends(require_api_key)],
+)
 async def analyze_pr_code(
     request: AnalyzeRequest,
+    background_tasks: BackgroundTasks,
     merger: RagMerger = Depends(get_merger),
-    report_gen: ReportGenerator = Depends(get_report_generator)
+    llm_router: LLMRouter = Depends(get_llm_router),
 ):
-    """
-    Analyzes a code snippet from a Pull Request.
-    1. Embeds and searches against the Ghost Hunter (CVE) vector DB.
-    2. Embeds and searches against the Team Memory vector DB.
-    3. Reranks the findings.
-    4. Generates a unified Markdown report via LLM.
-    """
+    """Queue a scan and return a job id to poll. The heavy work runs in the background."""
+    job_id = uuid.uuid4().hex
+    session = SessionLocal()
     try:
-        # Step 1 & 2: RAG Merger (Dual Vector Search)
-        raw_findings = await merger.analyze_code(request.code_snippet, request.language)
-        
-        # Step 3: LLM Report Generation
-        final_markdown = report_gen.generate_pr_comment(
-            code_snippet=request.code_snippet, 
-            merged_findings=raw_findings
+        session.add(
+            Scan(
+                id=job_id,
+                status="queued",
+                mode="snippet",
+                request_json=request.model_dump_json(),
+                repo=str(request.repo_url) if request.repo_url else None,
+                pr_number=request.pr_number,
+                author=request.author,
+            )
         )
-        
-        return AnalyzeResponse(
-            is_vulnerable=raw_findings["is_vulnerable"],
-            report_markdown=final_markdown,
-            ghost_hunter_matches=len(raw_findings["ghost_hunter_findings"]),
-            team_memory_matches=len(raw_findings["team_memory_findings"])
+        session.commit()
+    finally:
+        session.close()
+
+    background_tasks.add_task(run_scan, job_id, merger, llm_router)
+
+    return AnalyzeAccepted(
+        job_id=job_id,
+        status="queued",
+        poll_url=f"{settings.API_V1_STR}/analyze/{job_id}",
+    )
+
+
+@router.get(
+    "/{job_id}",
+    response_model=JobStatusResponse,
+    dependencies=[Depends(require_api_key)],
+)
+async def get_scan_status(job_id: str):
+    """Poll a scan job; includes the full result once completed."""
+    session = SessionLocal()
+    try:
+        scan = session.get(Scan, job_id)
+        if scan is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        result = None
+        if scan.status == "completed" and scan.result_json:
+            result = AnalyzeResult(**json.loads(scan.result_json))
+
+        return JobStatusResponse(
+            job_id=scan.id,
+            status=scan.status,
+            created_at=_iso(scan.created_at),
+            finished_at=_iso(scan.finished_at),
+            error=scan.error,
+            result=result,
         )
-        
-    except Exception:
-        logger.exception("Analysis failed")
-        raise HTTPException(status_code=500, detail="Analysis failed") from None
+    finally:
+        session.close()

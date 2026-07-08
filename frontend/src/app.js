@@ -1,78 +1,119 @@
+const API_HOST = 'http://127.0.0.1:8000';
+const ANALYZE_URL = `${API_HOST}/api/v1/analyze/`;
+const POLL_INTERVAL_MS = 1500;
+const POLL_MAX_ATTEMPTS = 80; // ~120s
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function getApiKey() {
+    return localStorage.getItem('reposentinel_api_key') || '';
+}
+
+function apiHeaders(extra = {}) {
+    const headers = { ...extra };
+    const key = getApiKey();
+    if (key) headers['X-RepoSentinel-Key'] = key;
+    return headers;
+}
+
+// Expose the latest findings so the feedback UI (Phase 5) can reference them.
+window.repoSentinelFindings = [];
+
 document.addEventListener('DOMContentLoaded', () => {
     const codeInput = document.getElementById('codeInput');
     const scanBtn = document.getElementById('scanBtn');
     const btnText = scanBtn.querySelector('.btn-text');
     const loader = scanBtn.querySelector('.loader');
-    
+
     const welcomeState = document.getElementById('welcomeState');
     const resultsState = document.getElementById('resultsState');
 
-    // Setup marked.js options for security and styling
-    marked.setOptions({
-        breaks: true,
-        gfm: true
+    marked.setOptions({ breaks: true, gfm: true });
+
+    // Let the user set an API key via the Settings nav link (needed when the
+    // backend enforces REPOSENTINEL_API_KEY; unset for local dev).
+    document.querySelectorAll('.nav-link').forEach((link) => {
+        if (link.textContent.trim().toLowerCase() === 'settings') {
+            link.addEventListener('click', (e) => {
+                e.preventDefault();
+                const current = getApiKey();
+                const value = window.prompt('RepoSentinel API key (leave blank for none):', current);
+                if (value !== null) localStorage.setItem('reposentinel_api_key', value.trim());
+            });
+        }
     });
 
-    scanBtn.addEventListener('click', async () => {
-        const code = codeInput.value.trim();
-        
-        if (!code) {
-            // Shake animation for empty input
-            codeInput.style.animation = 'shake 0.5s ease';
-            setTimeout(() => codeInput.style.animation = '', 500);
-            return;
-        }
-
-        // UI Loading State
-        btnText.classList.add('hidden');
-        loader.classList.remove('hidden');
-        scanBtn.style.pointerEvents = 'none';
-        
-        welcomeState.classList.add('hidden');
-        resultsState.classList.remove('hidden');
+    const showSpinner = (message) => {
         resultsState.innerHTML = `
             <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; gap:20px; color:var(--text-secondary);">
                 <div class="loader" style="width:40px; height:40px; border-width:4px; border-top-color:var(--accent-purple);"></div>
-                <p>Running semantic vector search...</p>
-            </div>
-        `;
+                <p>${message}</p>
+            </div>`;
+    };
+
+    const showError = (message) => {
+        resultsState.innerHTML = `
+            <div style="text-align:center; padding:2rem;">
+                <h3 style="color:var(--accent-red); margin-bottom:1rem;">Scan Failed</h3>
+                <p>${message}</p>
+                <p style="font-size:0.8rem; margin-top:2rem;">Is the FastAPI backend running?</p>
+            </div>`;
+    };
+
+    const renderResult = (result) => {
+        window.repoSentinelFindings = result.findings || [];
+        let html = marked.parse(result.report_markdown || '');
+        html += renderFindingCards(result.findings || []);
+        resultsState.innerHTML = html;
+        resultsState.style.animation = 'slideUp 0.5s cubic-bezier(0.4, 0, 0.2, 1)';
+    };
+
+    const pollJob = async (jobId) => {
+        const url = `${ANALYZE_URL}${jobId}`;
+        for (let attempt = 0; attempt < POLL_MAX_ATTEMPTS; attempt++) {
+            await sleep(POLL_INTERVAL_MS);
+            const resp = await fetch(url, { headers: apiHeaders() });
+            if (!resp.ok) throw new Error(`Poll error: ${resp.status}`);
+            const data = await resp.json();
+            if (data.status === 'completed') return data.result;
+            if (data.status === 'failed') throw new Error(data.error || 'Scan failed');
+            showSpinner(data.status === 'running' ? 'Analyzing code…' : 'Queued…');
+        }
+        throw new Error('Timed out waiting for the scan to finish.');
+    };
+
+    scanBtn.addEventListener('click', async () => {
+        const code = codeInput.value.trim();
+        if (!code) {
+            codeInput.style.animation = 'shake 0.5s ease';
+            setTimeout(() => (codeInput.style.animation = ''), 500);
+            return;
+        }
+
+        btnText.classList.add('hidden');
+        loader.classList.remove('hidden');
+        scanBtn.style.pointerEvents = 'none';
+        welcomeState.classList.add('hidden');
+        resultsState.classList.remove('hidden');
+        showSpinner('Queuing scan…');
 
         try {
-            // Call the FastAPI endpoint
-            const response = await fetch('http://127.0.0.1:8000/api/v1/analyze/', {
+            const resp = await fetch(ANALYZE_URL, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                    code_snippet: code,
-                    language: 'python' // default for MVP
-                })
+                headers: apiHeaders({ 'Content-Type': 'application/json' }),
+                body: JSON.stringify({ code_snippet: code, language: 'python' }),
             });
+            if (resp.status === 401) throw new Error('Unauthorized — set your API key in Settings.');
+            if (!(resp.status === 202 || resp.ok)) throw new Error(`API Error: ${resp.status}`);
 
-            if (!response.ok) {
-                throw new Error(`API Error: ${response.status}`);
-            }
-
-            const data = await response.json();
-            
-            // Render the Markdown report
-            resultsState.innerHTML = marked.parse(data.report_markdown);
-            
-            // Add a subtle slide-up animation to the results
-            resultsState.style.animation = 'slideUp 0.5s cubic-bezier(0.4, 0, 0.2, 1)';
-
+            const { job_id: jobId } = await resp.json();
+            showSpinner('Running semantic vector search…');
+            const result = await pollJob(jobId);
+            renderResult(result);
         } catch (error) {
             console.error('Scan failed:', error);
-            resultsState.innerHTML = `
-                <div style="text-align:center; padding:2rem;">
-                    <h3 style="color:var(--accent-red); margin-bottom:1rem;">Scan Failed</h3>
-                    <p>${error.message}</p>
-                    <p style="font-size:0.8rem; margin-top:2rem;">Is the FastAPI backend running?</p>
-                </div>
-            `;
+            showError(error.message);
         } finally {
-            // Reset UI
             btnText.classList.remove('hidden');
             loader.classList.add('hidden');
             scanBtn.style.pointerEvents = 'auto';
@@ -80,7 +121,33 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 });
 
-// Add animations dynamically to the document
+function renderFindingCards(findings) {
+    if (!findings.length) return '';
+    const cards = findings
+        .map((f) => {
+            const ref = f.cve_id || (f.team_pr_id ? `PR ${f.team_pr_id}` : '');
+            const badge = f.source === 'cve' ? '🌐 CVE' : '🏠 Team';
+            const sev = f.severity ? ` · ${f.severity}` : '';
+            return `
+            <div class="finding-card" data-finding-id="${f.finding_id}" style="border:1px solid var(--border, #333); border-radius:10px; padding:12px 14px; margin-top:10px;">
+                <div style="font-size:0.8rem; color:var(--text-secondary);">${badge}${sev}</div>
+                <div style="font-weight:600; margin:4px 0;">${escapeHtml(f.title)}</div>
+                <div style="font-size:0.8rem; color:var(--text-secondary);">
+                    ${ref ? escapeHtml(ref) + ' · ' : ''}similarity ${Number(f.similarity_score).toFixed(2)}
+                </div>
+            </div>`;
+        })
+        .join('');
+    return `<h3 style="margin-top:24px;">Matched memories</h3>${cards}`;
+}
+
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]
+    );
+}
+
+// Animations
 const style = document.createElement('style');
 style.textContent = `
     @keyframes shake {

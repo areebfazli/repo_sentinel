@@ -14,15 +14,34 @@ from backend.app.db.session import init_db
 async def lifespan(app: FastAPI):
     logger.info("Booting RepoSentinel API Worker...")
     init_db()
+    _fail_orphaned_scans()
+    # Construct the LLM router eagerly so a missing provider key fails fast at
+    # boot (cheap; no model load) rather than on the first scan.
+    analyze.get_llm_router()
     if settings.PRELOAD_MODELS:
         logger.info("Loading ML models into memory (this may take a few seconds)...")
         analyze.get_merger()
-        analyze.get_report_generator()
         logger.info("ML Models loaded! API is ready to accept requests.")
     else:
         logger.info("PRELOAD_MODELS=False; skipping model warm-up (models load lazily).")
     yield
     logger.info("Shutting down...")
+
+
+def _fail_orphaned_scans() -> None:
+    """BackgroundTasks are in-process; a restart orphans queued/running scans."""
+    from sqlalchemy import update
+
+    from backend.app.db.models import Scan
+    from backend.app.db.session import SessionLocal
+
+    with SessionLocal() as session:
+        session.execute(
+            update(Scan)
+            .where(Scan.status.in_(("queued", "running")))
+            .values(status="failed", error="interrupted by server restart")
+        )
+        session.commit()
 
 
 def create_app() -> FastAPI:

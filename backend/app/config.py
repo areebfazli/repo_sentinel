@@ -26,7 +26,6 @@ class Settings(BaseSettings):
 
     # API Keys
     GITHUB_TOKEN: str | None = None
-    OPENROUTER_API_KEY: str | None = None  # legacy; removed once the LLM router lands
 
     # LLM providers (OpenAI-compatible chat-completions endpoints).
     # A configured provider with a missing key hard-errors at startup — never a silent mock.

@@ -35,7 +35,7 @@ async def analyze_pr_code(
     """
     try:
         # Step 1 & 2: RAG Merger (Dual Vector Search)
-        raw_findings = await merger.analyze_code(request.code_snippet)
+        raw_findings = await merger.analyze_code(request.code_snippet, request.language)
         
         # Step 3: LLM Report Generation
         final_markdown = report_gen.generate_pr_comment(

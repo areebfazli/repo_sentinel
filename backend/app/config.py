@@ -49,17 +49,24 @@ class Settings(BaseSettings):
     DEV_SQLITE_PATH: str | None = None
 
     # Models. EMBEDDING_MODEL accepts the legacy CODEBERT_MODEL env var name.
+    # UniXcoder + mean pooling is the calibrated default (see ml/evaluation).
     EMBEDDING_MODEL: str = Field(
-        default="microsoft/codebert-base",
+        default="microsoft/unixcoder-base",
         validation_alias=AliasChoices("EMBEDDING_MODEL", "CODEBERT_MODEL"),
     )
-    EMBEDDING_POOLING: str = "cls"  # "cls" or "mean"
+    EMBEDDING_POOLING: str = "mean"  # "cls" or "mean"
     RERANKER_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
-    # Retrieval thresholds (single source of truth; calibrated via ml/evaluation).
-    SIM_THRESHOLD_CVE: float = 0.85
-    SIM_THRESHOLD_TEAM: float = 0.85
-    RERANK_THRESHOLD: float = 0.0        # gate on sigmoid(logit); 0.0 = no gate until calibrated
+    # Retrieval thresholds (single source of truth; calibrated via ml/evaluation
+    # for unixcoder-base + mean pooling — see ml/evaluation/baseline.json).
+    # 0.25 gives recall ~0.96; precision is ~flat across thresholds (safe and
+    # vulnerable near-misses embed similarly), so the LLM report is the real
+    # precision filter and we favour recall. Mean pooling dilutes code with
+    # comment tokens, so real commented code scores lower than clean eval code —
+    # another reason to keep this gate low.
+    SIM_THRESHOLD_CVE: float = 0.25
+    SIM_THRESHOLD_TEAM: float = 0.25
+    RERANK_THRESHOLD: float = 0.0        # gate on sigmoid(logit); 0.0 = keep all reranked
     RETRIEVAL_TOP_K: int = 3             # findings returned per collection
     ANN_CANDIDATES: int = 10             # broad ANN recall before reranking
 

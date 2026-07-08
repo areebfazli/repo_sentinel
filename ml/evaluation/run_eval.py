@@ -26,6 +26,7 @@ sys.path.append(str(_ROOT))
 
 from backend.app.config import BASE_DIR, settings  # noqa: E402
 from backend.app.core.embedder import Embedder  # noqa: E402
+from backend.app.core.embedding_cache import EmbeddingCache  # noqa: E402
 from backend.app.core.reranker import Reranker  # noqa: E402
 from backend.app.core.vector_store import VectorStore  # noqa: E402
 
@@ -63,7 +64,7 @@ def frange(spec: str) -> list[float]:
 
 
 def build_components():
-    return Embedder(), VectorStore(), Reranker()
+    return Embedder(cache=EmbeddingCache()), VectorStore(), Reranker()
 
 
 def gather(items, embedder, store, reranker, ann_candidates: int) -> list[dict]:
@@ -73,6 +74,10 @@ def gather(items, embedder, store, reranker, ann_candidates: int) -> list[dict]:
         code = item["code"]
         vector = embedder.embed_text(code)
         candidates = store.search_cves(vector, limit=ann_candidates)
+        # Mirror the retriever: rerank code-against-code (vulnerable_code), not
+        # against the English description.
+        for c in candidates:
+            c["rerank_text"] = c.get("vulnerable_code") or c.get("description", "")
         if candidates:
             reranker.rerank(code, candidates, top_k=len(candidates))
         scored = [

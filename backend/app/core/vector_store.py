@@ -34,7 +34,7 @@ class VectorStore:
     def _init_collections(self):
         """Ensure both collections exist, creating them if they don't."""
         existing_collections = [c.name for c in self.client.get_collections().collections]
-        
+
         for collection_name in [self.cve_collection, self.team_collection]:
             if collection_name not in existing_collections:
                 self.client.create_collection(
@@ -44,6 +44,18 @@ class VectorStore:
                         distance=qmodels.Distance.COSINE
                     )
                 )
+            # Keyword index on `language` so payload filtering is fast in server
+            # mode. Local Qdrant filters without an index (and warns if you make
+            # one), so only create it in production. Idempotent / best-effort.
+            if not settings.is_dev:
+                try:
+                    self.client.create_payload_index(
+                        collection_name=collection_name,
+                        field_name="language",
+                        field_schema=qmodels.PayloadSchemaType.KEYWORD,
+                    )
+                except Exception:
+                    pass
 
     def insert_cves(
         self,
@@ -103,24 +115,41 @@ class VectorStore:
         """Return the number of points stored in a collection."""
         return self.client.count(collection_name).count
 
-    def search_cves(self, query_vector: list[float], limit: int = 5) -> list[dict[str, Any]]:
+    def search_cves(
+        self, query_vector: list[float], limit: int = 5, language: str | None = None
+    ) -> list[dict[str, Any]]:
         """Find CVEs similar to the given code vector."""
-        return self._search(self.cve_collection, query_vector, limit)
-        
+        return self._search(self.cve_collection, query_vector, limit, language)
+
     def search_team_history(
-        self, query_vector: list[float], limit: int = 5
+        self, query_vector: list[float], limit: int = 5, language: str | None = None
     ) -> list[dict[str, Any]]:
         """Find team history similar to the given code vector."""
-        return self._search(self.team_collection, query_vector, limit)
+        return self._search(self.team_collection, query_vector, limit, language)
 
     def _search(
-        self, collection_name: str, query_vector: list[float], limit: int
+        self,
+        collection_name: str,
+        query_vector: list[float],
+        limit: int,
+        language: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Helper to perform ANN search."""
+        """Helper to perform ANN search, optionally filtered by payload language."""
+        query_filter = None
+        if language:
+            query_filter = qmodels.Filter(
+                must=[
+                    qmodels.FieldCondition(
+                        key="language",
+                        match=qmodels.MatchValue(value=language),
+                    )
+                ]
+            )
         response = self.client.query_points(
             collection_name=collection_name,
             query=query_vector,
-            limit=limit
+            limit=limit,
+            query_filter=query_filter,
         )
         
         results = []

@@ -22,6 +22,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from backend.app.config import BASE_DIR, settings  # noqa: E402
 from backend.app.core.embedder import Embedder  # noqa: E402
+from backend.app.core.embedding_cache import EmbeddingCache  # noqa: E402
 from backend.app.core.vector_store import VectorStore  # noqa: E402
 
 DEFAULT_DATA_DIR = BASE_DIR / "data" / "cve_corpus"
@@ -53,7 +54,7 @@ def main():
     args = parser.parse_args()
 
     print("Initializing Ghost Hunter Ingestion Pipeline...")
-    embedder = Embedder()
+    embedder = Embedder(cache=EmbeddingCache())
     vector_store = VectorStore()
 
     if args.recreate:
@@ -80,6 +81,9 @@ def main():
                 "description": cve["description"],
                 "severity": cve["severity"],
                 "language": cve["language"],
+                # Store the vulnerable code so the reranker can compare
+                # code-against-code instead of code-against-description.
+                "vulnerable_code": cve["vulnerable_code"],
                 "source": cve.get("source", "nvd_sample"),
                 "embedding_model": settings.EMBEDDING_MODEL,
             }

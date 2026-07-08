@@ -45,30 +45,44 @@ class VectorStore:
                     )
                 )
 
-    def insert_cves(self, vectors: list[list[float]], payloads: list[dict[str, Any]]):
+    def insert_cves(
+        self,
+        vectors: list[list[float]],
+        payloads: list[dict[str, Any]],
+        ids: list[str] | None = None,
+    ):
         """Insert embedded CVEs into the Ghost Hunter pipeline."""
-        self._insert(self.cve_collection, vectors, payloads)
-        
-    def insert_team_history(self, vectors: list[list[float]], payloads: list[dict[str, Any]]):
+        self._insert(self.cve_collection, vectors, payloads, ids)
+
+    def insert_team_history(
+        self,
+        vectors: list[list[float]],
+        payloads: list[dict[str, Any]],
+        ids: list[str] | None = None,
+    ):
         """Insert embedded PRs/Commits into the Team Memory pipeline."""
-        self._insert(self.team_collection, vectors, payloads)
+        self._insert(self.team_collection, vectors, payloads, ids)
 
     def _insert(
         self,
         collection_name: str,
         vectors: list[list[float]],
         payloads: list[dict[str, Any]],
+        ids: list[str] | None = None,
     ):
-        """Helper to insert vectors into a specific collection."""
+        """Helper to insert vectors into a specific collection.
+
+        ``ids`` lets callers pass deterministic point IDs (e.g. uuid5 of a stable
+        key) so re-ingestion upserts in place instead of duplicating points.
+        """
+        if ids is None:
+            ids = [str(uuid.uuid4()) for _ in vectors]
+
         points = [
-            qmodels.PointStruct(
-                id=str(uuid.uuid4()),
-                vector=vector,
-                payload=payload
-            )
-            for vector, payload in zip(vectors, payloads, strict=False)
+            qmodels.PointStruct(id=pid, vector=vector, payload=payload)
+            for pid, vector, payload in zip(ids, vectors, payloads, strict=False)
         ]
-        
+
         # Upsert in batches to avoid payload limits
         batch_size = 100
         for i in range(0, len(points), batch_size):
@@ -76,6 +90,18 @@ class VectorStore:
                 collection_name=collection_name,
                 points=points[i:i + batch_size]
             )
+
+    def recreate_collection(self, collection_name: str):
+        """Drop and re-create a collection (used by ingestion --recreate)."""
+        try:
+            self.client.delete_collection(collection_name)
+        except Exception:
+            pass
+        self._init_collections()
+
+    def count(self, collection_name: str) -> int:
+        """Return the number of points stored in a collection."""
+        return self.client.count(collection_name).count
 
     def search_cves(self, query_vector: list[float], limit: int = 5) -> list[dict[str, Any]]:
         """Find CVEs similar to the given code vector."""

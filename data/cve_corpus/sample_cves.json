@@ -1,0 +1,202 @@
+[
+  {
+    "cve_id": "CVE-2023-28450",
+    "category": "sqli",
+    "description": "SQL Injection in user login query via string-formatted credentials",
+    "severity": 9.8,
+    "language": "python",
+    "vulnerable_code": "def login_user(db_cursor, username, password):\n    query = f\"SELECT * FROM users WHERE username='{username}' AND password='{password}'\"\n    db_cursor.execute(query)\n    return db_cursor.fetchone()"
+  },
+  {
+    "cve_id": "CVE-2024-90001",
+    "category": "sqli",
+    "description": "SQL Injection in order lookup using percent string formatting",
+    "severity": 8.6,
+    "language": "python",
+    "vulnerable_code": "def get_order(db, order_id):\n    sql = \"SELECT * FROM orders WHERE id = '%s'\" % order_id\n    db.execute(sql)\n    return db.fetchall()"
+  },
+  {
+    "cve_id": "CVE-2024-90002",
+    "category": "sqli",
+    "description": "SQL Injection in product search via string concatenation",
+    "severity": 8.2,
+    "language": "python",
+    "vulnerable_code": "def search_products(cursor, term):\n    query = \"SELECT name, price FROM products WHERE name LIKE '%\" + term + \"%'\"\n    cursor.execute(query)\n    return cursor.fetchall()"
+  },
+  {
+    "cve_id": "CVE-2024-90003",
+    "category": "sqli",
+    "description": "SQL Injection in row deletion built from unsanitised identifier",
+    "severity": 9.1,
+    "language": "python",
+    "vulnerable_code": "def delete_record(conn, table, record_id):\n    stmt = \"DELETE FROM \" + table + \" WHERE id = \" + str(record_id)\n    conn.execute(stmt)\n    conn.commit()"
+  },
+  {
+    "cve_id": "CVE-2024-90004",
+    "category": "sqli",
+    "description": "SQL Injection in profile update via .format() into query",
+    "severity": 8.4,
+    "language": "python",
+    "vulnerable_code": "def update_email(cursor, user_id, email):\n    q = \"UPDATE users SET email = '{}' WHERE id = {}\".format(email, user_id)\n    cursor.execute(q)"
+  },
+  {
+    "cve_id": "CVE-2021-3281",
+    "category": "path_traversal",
+    "description": "Path traversal via tar archive extraction without member validation",
+    "severity": 7.5,
+    "language": "python",
+    "vulnerable_code": "def extract_archive(archive_path, extract_to):\n    import tarfile\n    with tarfile.open(archive_path) as tar:\n        tar.extractall(path=extract_to)"
+  },
+  {
+    "cve_id": "CVE-2024-90005",
+    "category": "path_traversal",
+    "description": "Path traversal via zip extraction of attacker-controlled paths",
+    "severity": 7.4,
+    "language": "python",
+    "vulnerable_code": "def unpack(zip_path, dest):\n    import zipfile\n    with zipfile.ZipFile(zip_path) as z:\n        z.extractall(dest)"
+  },
+  {
+    "cve_id": "CVE-2024-90006",
+    "category": "path_traversal",
+    "description": "Arbitrary file read by joining user input onto a base directory",
+    "severity": 7.1,
+    "language": "python",
+    "vulnerable_code": "def read_user_file(base_dir, filename):\n    import os\n    path = os.path.join(base_dir, filename)\n    with open(path) as f:\n        return f.read()"
+  },
+  {
+    "cve_id": "CVE-2024-90007",
+    "category": "path_traversal",
+    "description": "Path traversal in Flask download endpoint serving user-supplied path",
+    "severity": 7.8,
+    "language": "python",
+    "vulnerable_code": "def download(request):\n    from flask import send_file\n    name = request.args.get('name')\n    return send_file('/var/data/' + name)"
+  },
+  {
+    "cve_id": "CVE-2024-90008",
+    "category": "path_traversal",
+    "description": "Directory traversal writing uploads to an unsanitised destination",
+    "severity": 7.6,
+    "language": "python",
+    "vulnerable_code": "def save_upload(upload_dir, filename, data):\n    import os\n    target = os.path.join(upload_dir, filename)\n    with open(target, 'wb') as f:\n        f.write(data)"
+  },
+  {
+    "cve_id": "CVE-2020-11022",
+    "category": "xss",
+    "description": "Cross-site scripting via unsanitised HTML assigned to innerHTML",
+    "severity": 6.1,
+    "language": "javascript",
+    "vulnerable_code": "function renderUserProfile(userData) {\n    const container = document.getElementById('profile');\n    container.innerHTML = '<h1>' + userData.name + '</h1><p>' + userData.bio + '</p>';\n}"
+  },
+  {
+    "cve_id": "CVE-2024-90009",
+    "category": "xss",
+    "description": "DOM XSS via document.write of untrusted query parameter",
+    "severity": 6.3,
+    "language": "javascript",
+    "vulnerable_code": "function showGreeting() {\n    const name = new URLSearchParams(location.search).get('name');\n    document.write('<div>Welcome ' + name + '</div>');\n}"
+  },
+  {
+    "cve_id": "CVE-2024-90010",
+    "category": "xss",
+    "description": "XSS via insertAdjacentHTML with untrusted comment text",
+    "severity": 6.0,
+    "language": "javascript",
+    "vulnerable_code": "function addComment(comment) {\n    const list = document.querySelector('#comments');\n    list.insertAdjacentHTML('beforeend', '<li>' + comment.text + '</li>');\n}"
+  },
+  {
+    "cve_id": "CVE-2024-90011",
+    "category": "xss",
+    "description": "XSS via jQuery .html() rendering unescaped server data",
+    "severity": 6.4,
+    "language": "javascript",
+    "vulnerable_code": "function loadBio(user) {\n    $('#bio').html(user.bio);\n}"
+  },
+  {
+    "cve_id": "CVE-2024-90012",
+    "category": "xss",
+    "description": "XSS by assigning untrusted markup to outerHTML",
+    "severity": 6.2,
+    "language": "javascript",
+    "vulnerable_code": "function replaceCard(el, payload) {\n    el.outerHTML = '<div class=\"card\">' + payload.html + '</div>';\n}"
+  },
+  {
+    "cve_id": "CVE-2022-23648",
+    "category": "cmd_injection",
+    "description": "Command injection via subprocess run with shell=True and concatenation",
+    "severity": 8.8,
+    "language": "python",
+    "vulnerable_code": "def ping_server(ip_address):\n    import subprocess\n    command = 'ping -c 4 ' + ip_address\n    result = subprocess.run(command, shell=True, capture_output=True)\n    return result.stdout.decode()"
+  },
+  {
+    "cve_id": "CVE-2024-90013",
+    "category": "cmd_injection",
+    "description": "Command injection via os.system with concatenated user input",
+    "severity": 9.0,
+    "language": "python",
+    "vulnerable_code": "def archive_dir(path):\n    import os\n    os.system('tar czf backup.tar.gz ' + path)"
+  },
+  {
+    "cve_id": "CVE-2024-90014",
+    "category": "cmd_injection",
+    "description": "Command injection via subprocess.call with shell=True",
+    "severity": 8.7,
+    "language": "python",
+    "vulnerable_code": "def convert(filename):\n    import subprocess\n    subprocess.call('convert ' + filename + ' out.png', shell=True)"
+  },
+  {
+    "cve_id": "CVE-2024-90015",
+    "category": "cmd_injection",
+    "description": "Command injection via os.popen executing user-controlled string",
+    "severity": 8.5,
+    "language": "python",
+    "vulnerable_code": "def whois(domain):\n    import os\n    return os.popen('whois ' + domain).read()"
+  },
+  {
+    "cve_id": "CVE-2024-90016",
+    "category": "cmd_injection",
+    "description": "Command injection via f-string command passed to shell",
+    "severity": 8.9,
+    "language": "python",
+    "vulnerable_code": "def git_clone(repo):\n    import subprocess\n    subprocess.run(f'git clone {repo}', shell=True)"
+  },
+  {
+    "cve_id": "CVE-2019-11324",
+    "category": "secrets",
+    "description": "Hardcoded database credentials in source-level connection string",
+    "severity": 7.5,
+    "language": "python",
+    "vulnerable_code": "def connect_to_database():\n    import psycopg2\n    conn = psycopg2.connect(\n        dbname='production_db',\n        user='admin',\n        password='SuperSecretPassword123!',\n        host='db.internal.network'\n    )\n    return conn"
+  },
+  {
+    "cve_id": "CVE-2024-90017",
+    "category": "secrets",
+    "description": "Hardcoded third-party API key embedded in client code",
+    "severity": 7.2,
+    "language": "python",
+    "vulnerable_code": "def get_client():\n    import stripe\n    stripe.api_key = 'sk_live_51H8xQ2eZvKYlo2C0aBcDeFgHiJkLmNoP'\n    return stripe"
+  },
+  {
+    "cve_id": "CVE-2024-90018",
+    "category": "secrets",
+    "description": "Hardcoded AWS access keys committed in source",
+    "severity": 8.1,
+    "language": "python",
+    "vulnerable_code": "def s3_client():\n    import boto3\n    return boto3.client(\n        's3',\n        aws_access_key_id='AKIAIOSFODNN7EXAMPLE',\n        aws_secret_access_key='wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'\n    )"
+  },
+  {
+    "cve_id": "CVE-2024-90019",
+    "category": "secrets",
+    "description": "Hardcoded JWT signing secret used for token issuance",
+    "severity": 7.9,
+    "language": "python",
+    "vulnerable_code": "def issue_token(payload):\n    import jwt\n    return jwt.encode(payload, 'my-super-secret-jwt-key-2021', algorithm='HS256')"
+  },
+  {
+    "cve_id": "CVE-2024-90020",
+    "category": "secrets",
+    "description": "Hardcoded bearer token embedded in an outbound request header",
+    "severity": 7.3,
+    "language": "python",
+    "vulnerable_code": "def fetch(url):\n    import requests\n    headers = {'Authorization': 'Bearer ghp_R2d3XkQ9pLmN0oPqRsTuVwXyZ1234567890'}\n    return requests.get(url, headers=headers).json()"
+  }
+]

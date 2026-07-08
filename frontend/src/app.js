@@ -30,6 +30,21 @@ document.addEventListener('DOMContentLoaded', () => {
 
     marked.setOptions({ breaks: true, gfm: true });
 
+    // Language selector — "Auto" sends no language so the backend doesn't
+    // filter the CVE search to the wrong partition (a wrong guess = false clean).
+    const langSelect = document.createElement('select');
+    langSelect.id = 'langSelect';
+    langSelect.style.cssText = 'margin-bottom:10px; padding:6px 10px; border-radius:8px;';
+    langSelect.innerHTML = `
+        <option value="">Language: Auto</option>
+        <option value="python">Python</option>
+        <option value="javascript">JavaScript / TypeScript</option>
+        <option value="go">Go</option>
+        <option value="java">Java</option>`;
+    if (codeInput && codeInput.parentNode) {
+        codeInput.parentNode.insertBefore(langSelect, codeInput);
+    }
+
     // Let the user set an API key via the Settings nav link (needed when the
     // backend enforces REPOSENTINEL_API_KEY; unset for local dev).
     document.querySelectorAll('.nav-link').forEach((link) => {
@@ -99,10 +114,12 @@ document.addEventListener('DOMContentLoaded', () => {
         showSpinner('Queuing scan…');
 
         try {
+            const body = { code_snippet: code };
+            if (langSelect.value) body.language = langSelect.value;
             const resp = await fetch(ANALYZE_URL, {
                 method: 'POST',
                 headers: apiHeaders({ 'Content-Type': 'application/json' }),
-                body: JSON.stringify({ code_snippet: code, language: 'python' }),
+                body: JSON.stringify(body),
             });
             if (resp.status === 401) throw new Error('Unauthorized — set your API key in Settings.');
             if (!(resp.status === 202 || resp.ok)) throw new Error(`API Error: ${resp.status}`);

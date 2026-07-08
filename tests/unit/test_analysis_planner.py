@@ -64,3 +64,36 @@ def test_max_units_cap_reports_dropped():
     units, dropped = plan_units(files, PARSER, max_units=1)
     assert len(units) == 1
     assert dropped == 1
+
+
+def test_explicit_empty_changed_lines_analyzes_nothing():
+    # changed_lines=[] means "nothing changed" (explicit), not "analyze all".
+    files = [FileInput(path="m.py", content=TWO_FUNCS, changed_lines=[])]
+    units, _ = plan_units(files, PARSER, max_units=50)
+    assert units == []
+
+
+def test_module_level_only_falls_back_to_whole_file():
+    # No functions, just a top-level vulnerable statement — must still be scanned.
+    content = "import subprocess\nsubprocess.run(cmd, shell=True)\n"
+    files = [FileInput(path="script.py", content=content)]
+    units, _ = plan_units(files, PARSER, max_units=50)
+    assert len(units) == 1
+    assert units[0]["function_name"] is None
+    assert units[0]["language"] == "python"
+    assert "shell=True" in units[0]["code"]
+
+
+def test_changed_module_level_line_falls_back_to_whole_file():
+    # A changed line outside any function (module-level) still gets scanned.
+    content = "API_KEY = 'sk_live_hardcoded'\n\ndef unrelated():\n    return 1\n"
+    files = [FileInput(path="m.py", content=content, changed_lines=[1])]
+    units, _ = plan_units(files, PARSER, max_units=50)
+    assert any(u["function_name"] is None for u in units)  # whole-file fallback fired
+
+
+def test_ts_maps_to_javascript_language():
+    content = "function render(u) {\n  el.innerHTML = u;\n}\n"
+    files = [FileInput(path="app.ts", content=content)]
+    units, _ = plan_units(files, PARSER, max_units=50)
+    assert units and units[0]["language"] == "javascript"

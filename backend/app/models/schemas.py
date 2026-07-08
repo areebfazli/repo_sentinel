@@ -24,7 +24,10 @@ class AnalyzeRequest(BaseModel):
     pr_number: int | None = None
     code_snippet: str | None = None
     files: list[FileInput] | None = None
-    language: str = "python"
+    # None = don't language-filter the CVE search (the dashboard can't reliably
+    # know the language; a wrong guess causes false "clean" verdicts). Files mode
+    # derives language per function and ignores this.
+    language: str | None = None
     author: str | None = "unknown"
 
     @model_validator(mode="after")

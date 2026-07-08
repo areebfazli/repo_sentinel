@@ -12,11 +12,13 @@ from backend.app.core.diff_utils import parse_patch_changed_lines
 IGNORE_DIRECTIVE = "reposentinel-ignore"
 
 # The parser reports a short language (ext without the dot, e.g. "py"); the vector
-# corpus stores full names ("python"). Normalize so the language filter matches.
+# corpus stores full names. TypeScript is parsed with the JS grammar and the corpus
+# labels those entries "javascript", so .ts maps to javascript (not typescript,
+# which the corpus never contains).
 _LANGUAGE_NAMES = {
     "py": "python",
     "js": "javascript",
-    "ts": "typescript",
+    "ts": "javascript",
     "go": "go",
     "java": "java",
 }
@@ -27,12 +29,25 @@ def _language_name(short: str) -> str:
 
 
 def _changed_line_set(file) -> set[int] | None:
-    """Explicit changed_lines, else parsed patch, else None (= analyze all functions)."""
-    if getattr(file, "changed_lines", None):
+    """Explicit changed_lines wins (even when empty), else parsed patch, else None
+    (= analyze all functions). An explicit empty list means 'no changed lines',
+    NOT 'not provided'."""
+    if getattr(file, "changed_lines", None) is not None:
         return set(file.changed_lines)
     if getattr(file, "patch", None):
         return set(parse_patch_changed_lines(file.patch))
     return None
+
+
+def _whole_file_unit(file, ext: str) -> dict:
+    return {
+        "file_path": file.path,
+        "function_name": None,
+        "start_line": 1,
+        "end_line": len(file.content.splitlines()) or 1,
+        "code": file.content,
+        "language": _language_name(ext.lstrip(".")),
+    }
 
 
 def _overlaps(start_line: int, end_line: int, changed: set[int]) -> bool:
@@ -59,20 +74,12 @@ def plan_units(files, parser, max_units: int) -> tuple[list[dict], int]:
         if not parser.supports(ext):
             # Unsupported language -> one whole-file unit (unless ignored).
             if IGNORE_DIRECTIVE not in file.content:
-                units.append(
-                    {
-                        "file_path": file.path,
-                        "function_name": None,
-                        "start_line": 1,
-                        "end_line": len(file.content.splitlines()) or 1,
-                        "code": file.content,
-                        "language": ext.lstrip(".") or "text",
-                    }
-                )
+                units.append(_whole_file_unit(file, ext))
             continue
 
         changed = _changed_line_set(file)
         source_lines = file.content.splitlines()
+        before = len(units)
         for func in parser.extract_functions(file.content, ext):
             if changed is not None and not _overlaps(func["start_line"], func["end_line"], changed):
                 continue
@@ -88,6 +95,18 @@ def plan_units(files, parser, max_units: int) -> tuple[list[dict], int]:
                     "language": _language_name(func["language"]),
                 }
             )
+
+        # Coverage fallback: if no function unit was produced but the file has
+        # changes (or was sent for whole analysis), scan the whole file — this
+        # catches module-level statements, no-function scripts, and changed code
+        # outside any function that the pre-rewrite raw-diff flow would have seen.
+        # An explicit empty changed set ("nothing changed") is respected.
+        if (
+            len(units) == before
+            and IGNORE_DIRECTIVE not in file.content
+            and (changed is None or len(changed) > 0)
+        ):
+            units.append(_whole_file_unit(file, ext))
 
     dropped = 0
     if len(units) > max_units:

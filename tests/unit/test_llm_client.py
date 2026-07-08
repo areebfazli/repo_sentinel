@@ -29,6 +29,50 @@ def test_router_builds_primary_and_fallback(monkeypatch):
     assert [c.provider for c in router.clients] == ["groq", "gemini"]
 
 
+def test_placeholder_key_is_not_configured(monkeypatch):
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "your_groq_api_key_here")
+    with pytest.raises(RuntimeError):
+        LLMClient("groq")
+
+
+def test_missing_fallback_key_degrades_to_primary_only(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "groq")
+    monkeypatch.setattr(settings, "LLM_FALLBACK_PROVIDER", "gemini")
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "gk")
+    monkeypatch.setattr(settings, "GEMINI_API_KEY", None)  # no Gemini account
+    router = LLMRouter()
+    assert [c.provider for c in router.clients] == ["groq"]  # boots, no crash
+
+
+class _FakeResp:
+    def __init__(self, status, data, text=""):
+        self.status_code = status
+        self._data = data
+        self.text = text
+
+    def json(self):
+        return self._data
+
+
+def test_complete_null_content_is_retriable(monkeypatch):
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "gk")
+    client = LLMClient("groq")
+    monkeypatch.setattr(
+        llm_client.httpx, "post",
+        lambda *a, **k: _FakeResp(200, {"choices": [{"message": {"content": None}}]}),
+    )
+    with pytest.raises(llm_client._Retriable):
+        client.complete("s", "u")
+
+
+def test_complete_empty_choices_is_retriable(monkeypatch):
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "gk")
+    client = LLMClient("groq")
+    monkeypatch.setattr(llm_client.httpx, "post", lambda *a, **k: _FakeResp(200, {"choices": []}))
+    with pytest.raises(llm_client._Retriable):
+        client.complete("s", "u")
+
+
 def test_router_falls_back_on_primary_failure(monkeypatch):
     monkeypatch.setattr(settings, "LLM_PROVIDER", "groq")
     monkeypatch.setattr(settings, "LLM_FALLBACK_PROVIDER", "gemini")

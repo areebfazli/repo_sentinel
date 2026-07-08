@@ -50,6 +50,19 @@ class _Retriable(Exception):
     """Internal marker: this provider failed but the next one should be tried."""
 
 
+def _key_configured(api_key: str | None) -> bool:
+    """A key counts as configured only if it's set and not a placeholder.
+
+    .env.example ships values like `your_groq_api_key_here`; treating those as
+    real keys would defeat the fail-fast-at-startup invariant.
+    """
+    return bool(api_key) and not api_key.endswith("_here")
+
+
+def _provider_key(provider: str) -> str | None:
+    return getattr(settings, PROVIDERS[provider]["key_setting"])
+
+
 class LLMClient:
     def __init__(self, provider: str):
         if provider not in PROVIDERS:
@@ -59,9 +72,10 @@ class LLMClient:
         self.url = cfg["url"]
         self.api_key = getattr(settings, cfg["key_setting"])
         self.model = getattr(settings, cfg["model_setting"])
-        if not self.api_key:
+        if not _key_configured(self.api_key):
             raise RuntimeError(
-                f"{cfg['key_setting']} is not set but LLM provider '{provider}' is configured"
+                f"{cfg['key_setting']} is not set (or still a placeholder) but LLM "
+                f"provider '{provider}' is configured"
             )
 
     def complete(self, system: str, user: str) -> str:
@@ -84,7 +98,15 @@ class LLMClient:
             if resp.status_code == 429 or resp.status_code >= 500:
                 raise _Retriable(f"{self.provider} HTTP {resp.status_code}")
             raise LLMError(f"{self.provider} HTTP {resp.status_code}: {resp.text[:200]}")
-        return resp.json()["choices"][0]["message"]["content"]
+        # Malformed 200s (null content, empty choices) are retriable — try the
+        # fallback rather than crashing the whole scan.
+        try:
+            content = resp.json()["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise _Retriable(f"{self.provider} malformed response: {exc}") from exc
+        if content is None:
+            raise _Retriable(f"{self.provider} returned null content")
+        return content
 
 
 class LLMRouter:
@@ -92,11 +114,19 @@ class LLMRouter:
         self.mock = settings.LLM_PROVIDER == "mock"
         self.clients: list[LLMClient] = []
         if not self.mock:
-            names = [settings.LLM_PROVIDER]
+            # Primary must be fully configured (fail fast). The fallback is
+            # best-effort: skip it if its key is absent so a valid single-provider
+            # setup still boots.
+            self.clients.append(LLMClient(settings.LLM_PROVIDER))
             fb = settings.LLM_FALLBACK_PROVIDER
             if fb and fb not in ("mock", settings.LLM_PROVIDER):
-                names.append(fb)
-            self.clients = [LLMClient(n) for n in names]  # raises on missing key
+                if _key_configured(_provider_key(fb)):
+                    self.clients.append(LLMClient(fb))
+                else:
+                    logger.warning(
+                        "Fallback provider '{}' has no key configured; "
+                        "running primary-only.", fb
+                    )
 
     def generate(self, system: str, user: str) -> tuple[dict, str]:
         """Return (parsed_json, provider_used). Raises LLMError if all fail."""

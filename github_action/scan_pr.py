@@ -95,12 +95,22 @@ def build_comment_body(finding: dict) -> str:
     )
     sev = finding.get("severity")
     badge = f"**`{sev.upper()}`** " if sev else ""
-    icon = "🌐" if finding.get("source") == "cve" else "🏠"
+    if finding.get("cve_id"):
+        icon = "🌐"
+    elif finding.get("team_pr_id"):
+        icon = "🏠"
+    else:
+        icon = "⚠️"
     header = f"{icon} {badge}{finding.get('title', 'Security finding')}"
     if ref:
         header += f" ({ref})"
-    marker = finding_marker(finding.get("file_path", ""), finding.get("point_id", ""))
-    return f"{header}\n\n<sub>RepoSentinel</sub>\n<!-- {marker} -->"
+    body = header
+    if finding.get("explanation"):
+        body += f"\n\n{finding['explanation']}"
+    if finding.get("fix_snippet"):
+        body += f"\n\n```\n{finding['fix_snippet']}\n```"
+    marker = finding_marker(finding.get("file_path", ""), finding.get("point_id") or "")
+    return f"{body}\n\n<sub>RepoSentinel</sub>\n<!-- {marker} -->"
 
 
 def plan_comment_ops(existing: list[dict], desired: list[dict]) -> dict:
@@ -129,24 +139,12 @@ def plan_comment_ops(existing: list[dict], desired: list[dict]) -> dict:
     return {"create": create, "update": update, "delete": delete}
 
 
-def build_summary(findings: list[dict], gate_threshold: str) -> str:
-    cve = [f for f in findings if f.get("source") == "cve"]
-    team = [f for f in findings if f.get("source") == "team"]
-    if not findings:
-        body = (
-            "## ✅ RepoSentinel\n"
-            "No known CVE patterns or past team antipatterns matched this diff."
-        )
-    else:
-        lines = [
-            "## 🔴 RepoSentinel Security Report",
-            f"- 🌐 {len(cve)} CVE match(es)",
-            f"- 🏠 {len(team)} team-memory match(es)",
-            "",
-            f"Severity gate: `{gate_threshold}`.",
-        ]
-        body = "\n".join(lines)
-    return f"{body}\n<!-- reposentinel:summary -->"
+def build_summary(report_markdown: str, gate_threshold: str) -> str:
+    """The summary comment is the LLM-authored report (already applicability-judged
+    and allowlist-validated), plus the gate footer and the dedup marker."""
+    body = report_markdown.strip() or "## ✅ RepoSentinel\nNo findings."
+    footer = f"\n\n<sub>Severity gate: `{gate_threshold}`</sub>"
+    return f"{body}{footer}\n<!-- reposentinel:summary -->"
 
 
 # ---------------------------------------------------------------------------
@@ -324,12 +322,14 @@ def main() -> int:
     print(f"Analyzing {len(files)} changed file(s)...")
 
     result = run_analysis(api_base, api_key, files, repo, pr_number)
-    findings = result.get("findings", [])
-    print(f"{len(findings)} finding(s); is_vulnerable={result.get('is_vulnerable')}")
+    # Gate + inline comments use the LLM-VALIDATED findings (applicability-judged,
+    # allowlist-checked) — not the raw high-recall retrieval matches.
+    findings = result.get("report_findings", [])
+    print(f"{len(findings)} confirmed finding(s); is_vulnerable={result.get('is_vulnerable')}")
 
     changed_by_file = {file["path"]: parse_changed_lines(file["patch"]) for file in files}
     desired, unanchored = desired_comments(findings, changed_by_file)
-    summary = build_summary(findings, gate)
+    summary = build_summary(result.get("report_markdown", ""), gate)
 
     if dry_run:
         print("DRY RUN — planned inline comments:")

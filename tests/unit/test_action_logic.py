@@ -75,8 +75,12 @@ def test_plan_comment_ops_noop_when_unchanged():
     assert ops == {"create": [], "update": [], "delete": []}
 
 
-def test_build_summary():
-    assert "✅" in build_summary([], "high")
-    md = build_summary([{"source": "cve"}, {"source": "team"}], "high")
-    assert "1 CVE match" in md and "1 team-memory match" in md
+def test_build_summary_wraps_report_markdown():
+    md = build_summary("## 🔴 RepoSentinel Security Report\nbody", "high")
+    assert "RepoSentinel Security Report" in md
+    assert "Severity gate: `high`" in md
     assert extract_marker(md) == "reposentinel:summary"
+
+    empty = build_summary("", "none")
+    assert "✅" in empty
+    assert extract_marker(empty) == "reposentinel:summary"

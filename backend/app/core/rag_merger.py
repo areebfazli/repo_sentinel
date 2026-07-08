@@ -95,18 +95,20 @@ class RagMerger:
 
 
 def _anchor(match: dict[str, Any], unit: dict[str, Any]) -> dict[str, Any]:
-    match["file_path"] = unit["file_path"]
-    match["start_line"] = unit["start_line"]
-    match["end_line"] = unit["end_line"]
-    match["function_name"] = unit["function_name"]
+    # Anchor keys are distinct from any payload fields (e.g. a team payload's own
+    # file_path), so snippet-mode findings never inherit a historical location.
+    match["anchor_file_path"] = unit["file_path"]
+    match["anchor_start_line"] = unit["start_line"]
+    match["anchor_end_line"] = unit["end_line"]
+    match["anchor_function_name"] = unit["function_name"]
     return match
 
 
 def _dedupe(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep the highest adjusted_score per (point_id, file_path)."""
+    """Keep the highest adjusted_score per (point_id, anchored file)."""
     best: dict[tuple, dict[str, Any]] = {}
     for f in findings:
-        key = (f.get("point_id"), f.get("file_path"))
+        key = (f.get("point_id"), f.get("anchor_file_path"))
         current = best.get(key)
         if current is None or f.get("adjusted_score", 0.0) > current.get("adjusted_score", 0.0):
             best[key] = f

@@ -40,10 +40,10 @@ class StubMerger:
         return {
             "ghost_hunter_findings": [
                 _cve_match(
-                    file_path=u["file_path"],
-                    start_line=u["start_line"],
-                    end_line=u["end_line"],
-                    function_name=u["function_name"],
+                    anchor_file_path=u["file_path"],
+                    anchor_start_line=u["start_line"],
+                    anchor_end_line=u["end_line"],
+                    anchor_function_name=u["function_name"],
                 )
             ],
             "team_memory_findings": [],

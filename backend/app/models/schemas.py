@@ -58,12 +58,33 @@ class FindingOut(BaseModel):
     rerank_prob: float
 
 
+class ReportFinding(BaseModel):
+    """An LLM-confirmed finding — what the GitHub Action gates on and comments.
+
+    Unlike FindingOut (every raw retrieval match, for the dashboard), these have
+    passed the LLM's applicability judgment + allowlist validation.
+    """
+
+    severity: str | None = None
+    cve_id: str | None = None
+    team_pr_id: str | None = None
+    title: str
+    explanation: str = ""
+    fix_snippet: str = ""
+    file_path: str | None = None
+    start_line: int | None = None
+    finding_id: int | None = None
+    point_id: str | None = None
+    source: str | None = None
+
+
 class AnalyzeResult(BaseModel):
     """The completed analysis payload."""
 
     is_vulnerable: bool
     report_markdown: str
     findings: list[FindingOut]
+    report_findings: list[ReportFinding] = []
     ghost_hunter_matches: int
     team_memory_matches: int
     llm_provider_used: str | None = None

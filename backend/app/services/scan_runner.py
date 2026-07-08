@@ -35,10 +35,10 @@ def _persist_findings(session, scan_id: str, raw: dict) -> list[Finding]:
                 cve_id=match.get("cve_id"),
                 title=match.get("description") or match.get("cve_id") or "CVE match",
                 severity=severity_from_cvss(match.get("severity")),
-                file_path=match.get("file_path"),
-                start_line=match.get("start_line"),
-                end_line=match.get("end_line"),
-                function_name=match.get("function_name"),
+                file_path=match.get("anchor_file_path"),
+                start_line=match.get("anchor_start_line"),
+                end_line=match.get("anchor_end_line"),
+                function_name=match.get("anchor_function_name"),
                 similarity_score=float(match.get("similarity_score", 0.0)),
                 rerank_score=float(match.get("rerank_score", 0.0)),
                 rerank_prob=float(match.get("rerank_prob", 0.0)),
@@ -58,10 +58,10 @@ def _persist_findings(session, scan_id: str, raw: dict) -> list[Finding]:
                 point_id=str(match.get("point_id", "")),
                 team_pr_id=match.get("pr_id"),
                 title=match.get("title") or match.get("pr_id") or "Team memory match",
-                file_path=match.get("file_path"),
-                start_line=match.get("start_line"),
-                end_line=match.get("end_line"),
-                function_name=match.get("function_name"),
+                file_path=match.get("anchor_file_path"),
+                start_line=match.get("anchor_start_line"),
+                end_line=match.get("anchor_end_line"),
+                function_name=match.get("anchor_function_name"),
                 similarity_score=float(match.get("similarity_score", 0.0)),
                 rerank_score=float(match.get("rerank_score", 0.0)),
                 rerank_prob=float(match.get("rerank_prob", 0.0)),
@@ -101,7 +101,7 @@ def _get_parser():
 def _prompt_code_for_files(units: list[dict], raw: dict) -> str:
     """Build the LLM prompt code from only the functions that produced matches."""
     matched = {
-        (f.get("file_path"), f.get("function_name"))
+        (f.get("anchor_file_path"), f.get("anchor_function_name"))
         for f in raw.get("ghost_hunter_findings", []) + raw.get("team_memory_findings", [])
     }
     parts = []
@@ -111,6 +111,61 @@ def _prompt_code_for_files(units: list[dict], raw: dict) -> str:
             header = f"# {unit['file_path']}:{unit['start_line']} {fn}".rstrip()
             parts.append(f"{header}\n{unit['code']}")
     return "\n\n".join(parts)
+
+
+def _row_snapshot(row: Finding) -> dict:
+    """Capture the fields we need from a persisted row before the session commit
+    expires its attributes."""
+    return {
+        "finding_id": row.id,
+        "point_id": row.point_id,
+        "source": row.source,
+        "cve_id": row.cve_id,
+        "team_pr_id": row.team_pr_id,
+        "file_path": row.file_path,
+        "start_line": row.start_line,
+    }
+
+
+def _build_report_findings(validated: list[dict], row_snaps: list[dict]) -> list[dict]:
+    """Join LLM-validated findings back to persisted retrieval rows so each carries
+    a file/line anchor. A validated finding referencing an id retrieved for several
+    functions yields one report finding per location; generic findings stay
+    unanchored."""
+    report: list[dict] = []
+    for f in validated:
+        base = {
+            "severity": f.get("severity"),
+            "cve_id": f.get("cve_id"),
+            "team_pr_id": f.get("team_pr_id"),
+            "title": f.get("title") or "Security finding",
+            "explanation": f.get("explanation") or "",
+            "fix_snippet": f.get("fix_snippet") or "",
+        }
+        matches = [
+            r
+            for r in row_snaps
+            if (f.get("cve_id") and r["cve_id"] == f["cve_id"])
+            or (f.get("team_pr_id") and str(r["team_pr_id"]) == str(f["team_pr_id"]))
+        ]
+        if matches:
+            for r in matches:
+                report.append(
+                    {
+                        **base,
+                        "file_path": r["file_path"],
+                        "start_line": r["start_line"],
+                        "finding_id": r["finding_id"],
+                        "point_id": r["point_id"],
+                        "source": r["source"],
+                    }
+                )
+        else:
+            report.append(
+                {**base, "file_path": None, "start_line": None,
+                 "finding_id": None, "point_id": None, "source": None}
+            )
+    return report
 
 
 async def _analyze_request(merger, request: dict) -> tuple[dict, str, str]:
@@ -154,17 +209,25 @@ async def run_scan(scan_id: str, merger, router) -> None:
         cves = raw.get("ghost_hunter_findings", [])
         team = raw.get("team_memory_findings", [])
 
+        # Persist retrieval findings and COMMIT before the (slow) LLM call so we
+        # don't hold SQLite's write lock across the network round-trip. Snapshot
+        # the rows first — commit expires the ORM attributes.
         rows = _persist_findings(session, scan_id, raw)
+        findings_out = [_finding_out(r) for r in rows]
+        row_snaps = [_row_snapshot(r) for r in rows]
+        session.commit()
 
         provider_used = None
+        report_findings: list[dict] = []
         if raw.get("is_vulnerable"):
             allowed_cves = {c.get("cve_id") for c in cves if c.get("cve_id")}
-            allowed_prs = {t.get("pr_id") for t in team if t.get("pr_id")}
+            allowed_prs = {str(t.get("pr_id")) for t in team if t.get("pr_id")}
             user_prompt = build_user_prompt(prompt_code, cves, team)
             llm_json, provider_used = await asyncio.to_thread(
                 router.generate, SYSTEM_PROMPT, user_prompt
             )
             validated = validate_findings(llm_json.get("findings", []), allowed_cves, allowed_prs)
+            report_findings = _build_report_findings(validated, row_snaps)
             report_markdown = render_markdown(validated, len(cves), len(team)) + extra_note
         else:
             report_markdown = render_markdown([], len(cves), len(team)) + extra_note
@@ -172,7 +235,8 @@ async def run_scan(scan_id: str, merger, router) -> None:
         result = {
             "is_vulnerable": bool(raw.get("is_vulnerable")),
             "report_markdown": report_markdown,
-            "findings": [_finding_out(r) for r in rows],
+            "findings": findings_out,
+            "report_findings": report_findings,
             "ghost_hunter_matches": len(cves),
             "team_memory_matches": len(team),
             "llm_provider_used": provider_used,

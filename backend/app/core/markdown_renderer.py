@@ -70,13 +70,18 @@ def build_user_prompt(code_snippet: str, cves: list[dict], team: list[dict]) -> 
 def validate_findings(
     llm_findings: list[dict], allowed_cves: set[str], allowed_prs: set[str]
 ) -> list[dict]:
-    """Drop findings referencing IDs not in the retrieved allowlist."""
+    """Drop findings referencing IDs not in the retrieved allowlist.
+
+    IDs are normalized to strings first: the prompt renders team_pr_id unquoted,
+    so the LLM may return it as a JSON number, and a naive `1042 in {"1042"}`
+    would wrongly discard a valid finding.
+    """
     validated = []
     for f in llm_findings:
         if not isinstance(f, dict):
             continue
-        cid = f.get("cve_id")
-        pid = f.get("team_pr_id")
+        cid = str(f["cve_id"]) if f.get("cve_id") is not None else None
+        pid = str(f["team_pr_id"]) if f.get("team_pr_id") is not None else None
         if cid and cid not in allowed_cves:
             continue
         if pid and pid not in allowed_prs:

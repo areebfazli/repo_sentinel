@@ -4,81 +4,35 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+# Least privilege: read the code, comment on the PR.
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
-  analyze-pr:
+  scan:
     name: RepoSentinel Security Scan
     runs-on: ubuntu-latest
-    
     steps:
       - name: Check out repository code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # We need full history for diffs
 
-      - name: Fetch PR diff
-        id: get_diff
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Fetch the diff of the pull request
-          PR_URL="https://api.github.com/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}"
-          DIFF=$(curl -s -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3.diff" $PR_URL)
-          
-          # We export this to an environment variable so the python script can read it
-          # In a real production deployment, the Action would just send the PR number 
-          # to the FastAPI backend and the backend would fetch the diff.
-          echo "PR_DIFF<<EOF" >> $GITHUB_ENV
-          echo "$DIFF" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
-
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          
-      - name: Install dependencies
-        # In a real scenario, this would curl our hosted FastAPI endpoint.
-        # But for standalone CI execution, we'd install the core logic here.
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
-          
-      - name: Send to RepoSentinel API
-        id: analyze
-        env:
-          # This should point to your production FastAPI server IP/Domain
-          REPOSENTINEL_URL: ${{ secrets.REPOSENTINEL_URL }} 
-        run: |
-          python -c "
-          import os
-          import requests
-          import json
-          
-          api_url = os.environ.get('REPOSENTINEL_URL', 'http://your-production-server.com') + '/api/v1/analyze/'
-          diff_text = os.environ.get('PR_DIFF', '')
-          
-          # Send the raw diff to the FastAPI backend
-          response = requests.post(api_url, json={
-              'code_snippet': diff_text,
-              'language': 'python',
-              'repo_url': 'https://github.com/${{ github.repository }}',
-              'pr_number': ${{ github.event.pull_request.number }}
-          })
-          
-          if response.status_code == 200:
-              data = response.json()
-              report = data.get('report_markdown', 'Scan completed.')
-              
-              # Save report to workspace for next step
-              with open('report.md', 'w') as f:
-                  f.write(report)
-          else:
-              print(f'Error: {response.status_code}')
-              exit(1)
-          "
 
-      - name: Post PR Comment
-        uses: mshick/add-pr-comment@v2
-        with:
-          message-path: report.md
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install runner dependency
+        run: pip install requests
+
+      - name: Run RepoSentinel scan
+        env:
+          # Built-in token — no PAT needed. Scoped by the permissions block above.
+          GITHUB_TOKEN: ${{ github.token }}
+          # Your hosted RepoSentinel backend + its shared secret.
+          REPOSENTINEL_URL: ${{ secrets.REPOSENTINEL_URL }}
+          REPOSENTINEL_API_KEY: ${{ secrets.REPOSENTINEL_API_KEY }}
+          # Fail the check when a finding is at/above this severity
+          # (none | low | medium | high | critical).
+          INPUT_FAIL_ON_SEVERITY: high
+        run: python github_action/scan_pr.py

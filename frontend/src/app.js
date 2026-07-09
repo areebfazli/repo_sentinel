@@ -5,6 +5,14 @@ const POLL_MAX_ATTEMPTS = 80; // ~120s
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Render Markdown to sanitized HTML. The report embeds LLM- and team-comment-
+// authored text (attacker-influenceable), and marked does not sanitize, so we
+// run the output through DOMPurify before it ever touches innerHTML.
+function renderMarkdownSafe(md) {
+    const html = marked.parse(md || '');
+    return typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(html) : escapeHtml(html);
+}
+
 function getApiKey() {
     return localStorage.getItem('reposentinel_api_key') || '';
 }
@@ -77,7 +85,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const renderResult = (result) => {
         window.repoSentinelFindings = result.findings || [];
-        let html = marked.parse(result.report_markdown || '');
+        let html = renderMarkdownSafe(result.report_markdown);
         html += renderFindingCards(result.findings || []);
         resultsState.innerHTML = html;
         resultsState.style.animation = 'slideUp 0.5s cubic-bezier(0.4, 0, 0.2, 1)';

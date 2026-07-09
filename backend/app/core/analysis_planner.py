@@ -79,8 +79,9 @@ def plan_units(files, parser, max_units: int) -> tuple[list[dict], int]:
 
         changed = _changed_line_set(file)
         source_lines = file.content.splitlines()
+        functions = parser.extract_functions(file.content, ext)
         before = len(units)
-        for func in parser.extract_functions(file.content, ext):
+        for func in functions:
             if changed is not None and not _overlaps(func["start_line"], func["end_line"], changed):
                 continue
             if _has_ignore(func, source_lines):
@@ -96,16 +97,20 @@ def plan_units(files, parser, max_units: int) -> tuple[list[dict], int]:
                 }
             )
 
-        # Coverage fallback: if no function unit was produced but the file has
-        # changes (or was sent for whole analysis), scan the whole file — this
-        # catches module-level statements, no-function scripts, and changed code
-        # outside any function that the pre-rewrite raw-diff flow would have seen.
-        # An explicit empty changed set ("nothing changed") is respected.
-        if (
-            len(units) == before
-            and IGNORE_DIRECTIVE not in file.content
-            and (changed is None or len(changed) > 0)
-        ):
+        # Coverage fallback: scan the whole file when changed code lives OUTSIDE
+        # any function (module-level statements, no-function scripts) — even if the
+        # file also has a function change. Without this, a hardcoded secret added
+        # at module level in a file that also edits a function is silently missed.
+        if IGNORE_DIRECTIVE in file.content:
+            continue
+        covered: set[int] = set()
+        for func in functions:
+            covered |= set(range(func["start_line"], func["end_line"] + 1))
+        if changed is None:
+            needs_whole_file = len(units) == before  # no functions at all
+        else:
+            needs_whole_file = bool(changed - covered)  # changed lines outside functions
+        if needs_whole_file:
             units.append(_whole_file_unit(file, ext))
 
     dropped = 0

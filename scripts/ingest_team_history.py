@@ -31,7 +31,9 @@ from backend.app.db.session import SessionLocal, engine  # noqa: E402
 _ID_NAMESPACE = uuid.NAMESPACE_URL
 
 EXT_LANGUAGE = {
-    ".py": "python", ".js": "javascript", ".ts": "typescript",
+    # .ts -> javascript to match the retrieval-side mapping (analysis_planner);
+    # the corpus never labels anything "typescript".
+    ".py": "python", ".js": "javascript", ".ts": "javascript",
     ".go": "go", ".java": "java",
 }
 
@@ -65,11 +67,11 @@ MOCK_TEAM_HISTORY = [
         "file_path": "payments.py",
         "created_at": "2025-11-15T09:00:00+00:00",
         "diff_hunk": "- try:\n-     make_payment()\n- except:\n-     retry()\n"
-                     "+ try:\n+     make_payment()\n+ except requests.exceptions.RequestException:\n"
-                     "+     retry()",
-        "body": "Never use a bare `except:`. It catches SystemExit and KeyboardInterrupt. We had a "
-                "nightmare debugging this exact pattern in the auth service last year. Catch "
-                "`requests.exceptions.RequestException` specifically.",
+                     "+ try:\n+     make_payment()\n"
+                     "+ except requests.exceptions.RequestException:\n+     retry()",
+        "body": "Never use a bare `except:`. It catches SystemExit and KeyboardInterrupt. "
+                "We had a nightmare debugging this exact pattern in the auth service last "
+                "year. Catch `requests.exceptions.RequestException` specifically.",
     },
 ]
 

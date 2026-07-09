@@ -1,7 +1,6 @@
 import os
 from pathlib import Path
 
-from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Base directory of the project
@@ -47,12 +46,10 @@ class Settings(BaseSettings):
     # avoid clobbering the real repo_sentinel.sqlite).
     DEV_SQLITE_PATH: str | None = None
 
-    # Models. EMBEDDING_MODEL accepts the legacy CODEBERT_MODEL env var name.
     # UniXcoder + mean pooling is the calibrated default (see ml/evaluation).
-    EMBEDDING_MODEL: str = Field(
-        default="microsoft/unixcoder-base",
-        validation_alias=AliasChoices("EMBEDDING_MODEL", "CODEBERT_MODEL"),
-    )
+    # No CODEBERT_MODEL alias: a stale legacy env var must not silently downgrade
+    # the model the thresholds/baseline were calibrated for.
+    EMBEDDING_MODEL: str = "microsoft/unixcoder-base"
     EMBEDDING_POOLING: str = "mean"  # "cls" or "mean"
     RERANKER_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 

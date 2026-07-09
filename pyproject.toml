@@ -27,10 +27,3 @@ extend-immutable-calls = [
     "fastapi.Path",
     "fastapi.Body",
 ]
-
-[tool.ruff.lint.per-file-ignores]
-# These carry large embedded text (an LLM prompt template / mock PR corpus) where
-# wrapping mid-sentence hurts readability. report_generator is replaced in Phase 4;
-# the mock block in ingest_team_history is replaced in Phase 5.
-"backend/app/core/report_generator.py" = ["E501"]
-"scripts/ingest_team_history.py" = ["E501"]

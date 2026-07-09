@@ -19,10 +19,17 @@ def test_prod_uses_database_url():
     assert s.get_database_url == "postgresql://u:p@h/db"
 
 
-def test_embedding_model_accepts_legacy_alias(monkeypatch):
-    monkeypatch.setenv("CODEBERT_MODEL", "microsoft/unixcoder-base")
+def test_legacy_codebert_env_var_is_ignored(monkeypatch):
+    # A stale CODEBERT_MODEL must NOT override the calibrated default.
+    monkeypatch.setenv("CODEBERT_MODEL", "microsoft/codebert-base")
     s = Settings()
     assert s.EMBEDDING_MODEL == "microsoft/unixcoder-base"
+
+
+def test_embedding_model_env_override(monkeypatch):
+    monkeypatch.setenv("EMBEDDING_MODEL", "microsoft/graphcodebert-base")
+    s = Settings()
+    assert s.EMBEDDING_MODEL == "microsoft/graphcodebert-base"
 
 
 def test_seniority_weights_default():

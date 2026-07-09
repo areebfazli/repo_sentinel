@@ -104,6 +104,30 @@ class GithubCrawler:
                     }
                 )
 
+            # Some teams review via the PR description / conversation rather than
+            # inline diff comments. Capture a substantive PR body as its own memory
+            # so that review knowledge isn't silently lost.
+            body = (pr.body or "").strip()
+            if len(body) >= 80:
+                author = pr.user.login if pr.user else "unknown"
+                docs.append(
+                    {
+                        "id": f"pr{pr.number}_body",
+                        "pr_number": pr.number,
+                        "pr_title": pr.title,
+                        "pr_url": pr.html_url,
+                        "comment_id": None,
+                        "comment_url": pr.html_url,
+                        "author": author,
+                        "author_association": "NONE",
+                        "file_path": None,
+                        "created_at": pr.created_at.isoformat(),
+                        "body": body,
+                        "diff_hunk": "",
+                        "text_content": f"PR: {pr.title}\n{body}",
+                    }
+                )
+
         return docs
 
     def cleanup_clone(self, repo_url: str):

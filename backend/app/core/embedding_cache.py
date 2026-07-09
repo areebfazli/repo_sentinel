@@ -6,6 +6,7 @@ standalone scripts (ingestion, eval) that don't call init_db() still work.
 import json
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from backend.app.db.models import EmbeddingCache as EmbeddingCacheModel
 from backend.app.db.session import SessionLocal
@@ -53,4 +54,10 @@ class EmbeddingCache:
                         vector=json.dumps(r["vector"]),
                     )
                 )
-            session.commit()
+            try:
+                session.commit()
+            except IntegrityError:
+                # A concurrent scan inserted the same key(s) between our SELECT and
+                # commit. The value is identical, so just drop ours — the cache is
+                # already populated.
+                session.rollback()

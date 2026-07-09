@@ -92,6 +92,25 @@ def test_changed_module_level_line_falls_back_to_whole_file():
     assert any(u["function_name"] is None for u in units)  # whole-file fallback fired
 
 
+def test_changed_module_level_alongside_function_change():
+    # A module-level secret changed in the SAME file as a function change must
+    # still be scanned (whole-file fallback), not silently skipped.
+    content = "API_KEY = 'sk_live_hardcoded'\n\ndef bar():\n    return 1\n"
+    files = [FileInput(path="m.py", content=content, changed_lines=[1, 3])]
+    units, _ = plan_units(files, PARSER, max_units=50)
+    names = [u["function_name"] for u in units]
+    assert "bar" in names   # the changed function
+    assert None in names    # whole-file fallback covers the module-level line
+
+
+def test_function_only_change_no_whole_file_noise():
+    # A change entirely inside a function should NOT add a whole-file unit.
+    content = "def bar():\n    x = 1\n    return x\n"
+    files = [FileInput(path="m.py", content=content, changed_lines=[2])]
+    units, _ = plan_units(files, PARSER, max_units=50)
+    assert [u["function_name"] for u in units] == ["bar"]
+
+
 def test_ts_maps_to_javascript_language():
     content = "function render(u) {\n  el.innerHTML = u;\n}\n"
     files = [FileInput(path="app.ts", content=content)]

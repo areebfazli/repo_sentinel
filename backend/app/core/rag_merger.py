@@ -31,8 +31,10 @@ class RagMerger:
         )
 
     async def _async_find_team_history(self, code_snippet: str) -> list[dict[str, Any]]:
-        # Team payloads don't carry a language field until Phase 5, so we don't
-        # filter Team Memory by language yet (it would drop all mock results).
+        # Team Memory is intentionally NOT language-filtered: a past review of a
+        # pattern is relevant across languages, and code-vs-discussion similarity
+        # is already low, so filtering would mostly cost recall. (Payloads do
+        # carry `language` now if we ever want to revisit this.)
         return await asyncio.to_thread(self.team_retriever.find_team_history, code_snippet)
 
     async def analyze_code(
@@ -75,7 +77,9 @@ class RagMerger:
         team_findings: list[dict[str, Any]] = []
 
         for unit, vector in zip(units, vectors, strict=False):
-            language = unit.get("language") or "python"
+            # None (not "python") when the unit's language is unknown/empty, so an
+            # extensionless whole-file unit isn't wrongly filtered to Python CVEs.
+            language = unit.get("language") or None
             for match in self.cve_retriever.find_vulnerabilities(
                 unit["code"], language=language, query_vector=vector
             ):
@@ -105,10 +109,15 @@ def _anchor(match: dict[str, Any], unit: dict[str, Any]) -> dict[str, Any]:
 
 
 def _dedupe(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep the highest adjusted_score per (point_id, anchored file)."""
+    """Keep the highest adjusted_score per (point_id, file, function).
+
+    Keyed by function too, so the same CVE/team match occurring in two different
+    functions of one file stays as two findings (each needs its own anchor + gate
+    entry) rather than collapsing to one.
+    """
     best: dict[tuple, dict[str, Any]] = {}
     for f in findings:
-        key = (f.get("point_id"), f.get("anchor_file_path"))
+        key = (f.get("point_id"), f.get("anchor_file_path"), f.get("anchor_function_name"))
         current = best.get(key)
         if current is None or f.get("adjusted_score", 0.0) > current.get("adjusted_score", 0.0):
             best[key] = f

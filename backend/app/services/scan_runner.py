@@ -176,7 +176,10 @@ async def _analyze_request(merger, request: dict) -> tuple[dict, str, str]:
         from backend.app.models.schemas import FileInput
 
         files = [FileInput(**f) for f in request["files"]]
-        units, dropped = plan_units(files, _get_parser(), settings.MAX_UNITS_PER_SCAN)
+        # tree-sitter parsing is CPU-bound; keep it off the event loop.
+        units, dropped = await asyncio.to_thread(
+            plan_units, files, _get_parser(), settings.MAX_UNITS_PER_SCAN
+        )
         raw = await merger.analyze_units(units)
         note = (
             f"\n\n_Analysis capped at {settings.MAX_UNITS_PER_SCAN} functions; "
@@ -232,8 +235,10 @@ async def run_scan(scan_id: str, merger, router) -> None:
         else:
             report_markdown = render_markdown([], len(cves), len(team)) + extra_note
 
+        # is_vulnerable reflects the LLM verdict (the precision filter), not the
+        # raw high-recall retrieval — so it agrees with the report + report_findings.
         result = {
-            "is_vulnerable": bool(raw.get("is_vulnerable")),
+            "is_vulnerable": bool(report_findings),
             "report_markdown": report_markdown,
             "findings": findings_out,
             "report_findings": report_findings,

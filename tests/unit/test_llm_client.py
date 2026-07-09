@@ -35,6 +35,14 @@ def test_placeholder_key_is_not_configured(monkeypatch):
         LLMClient("groq")
 
 
+def test_unknown_fallback_provider_gives_clean_error(monkeypatch):
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "groq")
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "gk")
+    monkeypatch.setattr(settings, "LLM_FALLBACK_PROVIDER", "openai")  # not supported
+    with pytest.raises(ValueError):  # clean message, not a raw KeyError
+        LLMRouter()
+
+
 def test_missing_fallback_key_degrades_to_primary_only(monkeypatch):
     monkeypatch.setattr(settings, "LLM_PROVIDER", "groq")
     monkeypatch.setattr(settings, "LLM_FALLBACK_PROVIDER", "gemini")

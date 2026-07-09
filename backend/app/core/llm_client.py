@@ -60,6 +60,8 @@ def _key_configured(api_key: str | None) -> bool:
 
 
 def _provider_key(provider: str) -> str | None:
+    if provider not in PROVIDERS:
+        raise ValueError(f"Unknown LLM provider: {provider}")
     return getattr(settings, PROVIDERS[provider]["key_setting"])
 
 

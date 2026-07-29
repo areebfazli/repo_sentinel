@@ -25,3 +25,6 @@ mlruns/
 
 # Local-only agent guidance (kept on disk, not tracked)
 CLAUDE.md
+
+# Local-only working report (kept on disk, not tracked)
+REPORT.md

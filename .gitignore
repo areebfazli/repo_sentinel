@@ -22,3 +22,6 @@ qdrant_data/
 
 # MLflow tracking
 mlruns/
+
+# Local-only agent guidance (kept on disk, not tracked)
+CLAUDE.md

@@ -27,21 +27,33 @@ class TeamRetriever:
         self.vector_store = vector_store
         self.reranker = reranker
 
-    def find_team_history(
+    def base_score_factory(self):
+        """Return a base_score(match) closure that weights rerank_prob by recency +
+        reviewer seniority, with ``now`` captured once so a batch of matches scores
+        against a single reference time."""
+        now = datetime.now(UTC)
+
+        def base_score(m: dict[str, Any]) -> float:
+            return compute_adjusted_score(
+                m.get("rerank_prob", 0.0),
+                _parse_dt(m.get("created_at")),
+                m.get("author_association"),
+                now,
+                settings,
+            )
+
+        return base_score
+
+    def rerank_candidates(
         self,
         code_snippet: str,
         language: str | None = None,
-        limit: int | None = None,
         threshold: float | None = None,
         query_vector: list[float] | None = None,
     ) -> list[dict[str, Any]]:
-        """Embed developer code and search Team Memory for related past PR reviews.
-
-        Same recall -> similarity gate -> rerank -> probability gate pipeline as the
-        CVE side. Reranks against the stored discussion text. Thresholds default to
-        settings. ``query_vector`` lets callers pass a precomputed embedding.
-        """
-        limit = settings.RETRIEVAL_TOP_K if limit is None else limit
+        """ANN top-N -> similarity gate -> rerank against stored discussion text,
+        WITHOUT feedback. Split out so files mode can batch the feedback lookup
+        across units (see ``find_team_history`` for the single-snippet path)."""
         threshold = settings.SIM_THRESHOLD_TEAM if threshold is None else threshold
 
         if query_vector is None:
@@ -69,22 +81,29 @@ class TeamRetriever:
         for match in viable_matches:
             match["rerank_text"] = match.get("text") or match.get("snippet_preview", "")
 
-        reranked = self.reranker.rerank(code_snippet, viable_matches, top_k=len(viable_matches))
+        return self.reranker.rerank(code_snippet, viable_matches, top_k=len(viable_matches))
 
+    def find_team_history(
+        self,
+        code_snippet: str,
+        language: str | None = None,
+        limit: int | None = None,
+        threshold: float | None = None,
+        query_vector: list[float] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Embed developer code and search Team Memory for related past PR reviews.
+
+        Same recall -> similarity gate -> rerank -> probability gate pipeline as the
+        CVE side. Reranks against the stored discussion text. Thresholds default to
+        settings. ``query_vector`` lets callers pass a precomputed embedding.
+        """
+        limit = settings.RETRIEVAL_TOP_K if limit is None else limit
+        reranked = self.rerank_candidates(code_snippet, language, threshold, query_vector)
         # Team score weights rerank_prob by recency + reviewer seniority, then
         # feedback suppression/downweighting is applied on top.
-        now = datetime.now(UTC)
-
-        def base_score(m: dict[str, Any]) -> float:
-            return compute_adjusted_score(
-                m.get("rerank_prob", 0.0),
-                _parse_dt(m.get("created_at")),
-                m.get("author_association"),
-                now,
-                settings,
-            )
-
-        return feedback_store.finalize_matches(reranked, limit, settings, base_score=base_score)
+        return feedback_store.finalize_matches(
+            reranked, limit, settings, base_score=self.base_score_factory()
+        )
 
 
 # Simple CLI test runner if executed directly

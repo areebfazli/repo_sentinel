@@ -14,22 +14,24 @@ class CVERetriever:
         self.vector_store = vector_store
         self.reranker = reranker
 
-    def find_vulnerabilities(
+    @staticmethod
+    def base_score(match: dict[str, Any]) -> float:
+        """Pre-feedback CVE score — just the rerank probability."""
+        return match.get("rerank_prob", 0.0)
+
+    def rerank_candidates(
         self,
         code_snippet: str,
         language: str | None = None,
-        limit: int | None = None,
         threshold: float | None = None,
         query_vector: list[float] | None = None,
     ) -> list[dict[str, Any]]:
-        """Embed developer code and search the CVE corpus for matches.
+        """ANN top-N -> similarity gate -> code-to-code rerank, WITHOUT feedback.
 
-        High recall (ANN top-N, optionally language-filtered) -> similarity gate ->
-        cross-encoder rerank code-against-code -> rerank-probability gate. All
-        thresholds default to settings (single source of truth). ``query_vector``
-        lets callers pass a precomputed embedding (files mode batches embedding).
+        Returns reranked candidates (ordered, not truncated). Split out from
+        ``find_vulnerabilities`` so files mode can gather candidates across all
+        units, fetch feedback votes once, and finalize in a batch.
         """
-        limit = settings.RETRIEVAL_TOP_K if limit is None else limit
         threshold = settings.SIM_THRESHOLD_CVE if threshold is None else threshold
 
         if query_vector is None:
@@ -60,11 +62,27 @@ class CVERetriever:
         for match in viable_matches:
             match["rerank_text"] = match.get("vulnerable_code") or match.get("description", "")
 
-        # Rerank all viable, then apply feedback suppression/downweight before
-        # taking the top-k (CVE score is just the rerank probability).
-        reranked = self.reranker.rerank(code_snippet, viable_matches, top_k=len(viable_matches))
+        return self.reranker.rerank(code_snippet, viable_matches, top_k=len(viable_matches))
+
+    def find_vulnerabilities(
+        self,
+        code_snippet: str,
+        language: str | None = None,
+        limit: int | None = None,
+        threshold: float | None = None,
+        query_vector: list[float] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Embed developer code and search the CVE corpus for matches.
+
+        High recall (ANN top-N, optionally language-filtered) -> similarity gate ->
+        cross-encoder rerank code-against-code -> rerank-probability gate. All
+        thresholds default to settings (single source of truth). ``query_vector``
+        lets callers pass a precomputed embedding (files mode batches embedding).
+        """
+        limit = settings.RETRIEVAL_TOP_K if limit is None else limit
+        reranked = self.rerank_candidates(code_snippet, language, threshold, query_vector)
         return feedback_store.finalize_matches(
-            reranked, limit, settings, base_score=lambda m: m.get("rerank_prob", 0.0)
+            reranked, limit, settings, base_score=self.base_score
         )
 
 

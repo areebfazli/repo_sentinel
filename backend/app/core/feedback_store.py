@@ -37,13 +37,21 @@ def feedback_multiplier(net_vote: int, settings) -> float:
     return max(0.3, 1.0 + settings.FEEDBACK_DOWNWEIGHT_PER_VOTE * min(net_vote, 0))
 
 
-def finalize_matches(matches: list[dict], limit: int, settings, base_score) -> list[dict]:
+def finalize_matches(
+    matches: list[dict], limit: int, settings, base_score, net_votes: dict[str, int] | None = None
+) -> list[dict]:
     """Apply feedback suppression + downweighting, gate, and sort by adjusted_score.
 
     base_score(match) -> float is the pre-feedback score (rerank_prob for CVEs,
     recency/seniority-weighted for Team Memory).
+
+    ``net_votes`` lets a caller pass a pre-fetched {point_id: net_vote} map so a
+    batch of finalize calls (files mode, one per unit) shares a single DB query
+    instead of one round-trip each. When None, the votes are fetched here.
     """
-    net = get_net_votes([m.get("point_id", "") for m in matches])
+    if net_votes is None:
+        net_votes = get_net_votes([m.get("point_id", "") for m in matches])
+    net = net_votes
     kept = []
     for m in matches:
         vote = net.get(m.get("point_id", ""), 0)

@@ -1,6 +1,8 @@
 import asyncio
 from typing import Any
 
+from backend.app.config import settings
+from backend.app.core import feedback_store
 from backend.app.core.cve_retriever import CVERetriever
 from backend.app.core.embedder import Embedder
 from backend.app.core.embedding_cache import EmbeddingCache
@@ -76,16 +78,38 @@ class RagMerger:
         cve_findings: list[dict[str, Any]] = []
         team_findings: list[dict[str, Any]] = []
 
+        # Pass 1: retrieve + rerank per unit WITHOUT hitting the feedback table, so
+        # the vote lookup can be batched into a single query below (one round-trip
+        # for the whole scan instead of two per unit).
+        per_unit: list[tuple[dict[str, Any], list[dict], list[dict]]] = []
+        point_ids: set[str] = set()
         for unit, vector in zip(units, vectors, strict=False):
             # None (not "python") when the unit's language is unknown/empty, so an
             # extensionless whole-file unit isn't wrongly filtered to Python CVEs.
             language = unit.get("language") or None
-            for match in self.cve_retriever.find_vulnerabilities(
+            cve_c = self.cve_retriever.rerank_candidates(
                 unit["code"], language=language, query_vector=vector
+            )
+            team_c = self.team_retriever.rerank_candidates(
+                unit["code"], query_vector=vector
+            )
+            per_unit.append((unit, cve_c, team_c))
+            point_ids.update(m.get("point_id", "") for m in cve_c)
+            point_ids.update(m.get("point_id", "") for m in team_c)
+
+        # Pass 2: one feedback query for every candidate, then finalize per unit
+        # against the shared vote map.
+        net_votes = feedback_store.get_net_votes(list(point_ids))
+        limit = settings.RETRIEVAL_TOP_K
+        cve_base = self.cve_retriever.base_score
+        team_base = self.team_retriever.base_score_factory()
+        for unit, cve_c, team_c in per_unit:
+            for match in feedback_store.finalize_matches(
+                cve_c, limit, settings, base_score=cve_base, net_votes=net_votes
             ):
                 cve_findings.append(_anchor(match, unit))
-            for match in self.team_retriever.find_team_history(
-                unit["code"], query_vector=vector
+            for match in feedback_store.finalize_matches(
+                team_c, limit, settings, base_score=team_base, net_votes=net_votes
             ):
                 team_findings.append(_anchor(match, unit))
 

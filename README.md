@@ -1,8 +1,8 @@
 # RepoSentinel
 
 **An AI security reviewer for pull requests.** RepoSentinel embeds a developer's code and
-runs it concurrently against two vector collections — **Ghost Hunter** (known CVE
-vulnerable-code snippets) and **Team Memory** (the team's own past PR review discussions) —
+runs it concurrently against two vector collections: **Ghost Hunter** (known CVE
+vulnerable-code snippets) and **Team Memory** (the team's own past PR review discussions). It
 reranks the matches with a cross-encoder, then asks an LLM to write a structured, actionable
 PR comment.
 
@@ -18,7 +18,7 @@ It ships as three surfaces:
 
 Most AI reviewers only know about public vulnerabilities. RepoSentinel adds a second memory:
 the review comments your team has *already written*. When a new PR repeats a mistake a senior
-reviewer flagged six months ago, RepoSentinel surfaces that past discussion — weighted by how
+reviewer flagged six months ago, RepoSentinel surfaces that past discussion, weighted by how
 recent it was and how senior the reviewer is.
 
 | Collection | Qdrant name | Source | What it catches |
@@ -92,17 +92,17 @@ The API returns useful results only once **both** collections are seeded. Local 
 (`./qdrant_data`) is single-process, so **stop the API before running any ingest script.**
 
 ```bash
-# Ghost Hunter — CVE corpus (reads data/cve_corpus/*.json)
+# Ghost Hunter: CVE corpus (reads data/cve_corpus/*.json)
 python scripts/ingest_cve_corpus.py --recreate
 
-# Team Memory — demo data (offline)
+# Team Memory: demo data (offline)
 python scripts/ingest_team_history.py --mock --recreate
 
-# Team Memory — real closed-PR review comments (needs GITHUB_TOKEN)
+# Team Memory: real closed-PR review comments (needs GITHUB_TOKEN)
 python scripts/ingest_team_history.py --repo owner/name
 ```
 
-> Re-run with `--recreate` on **both** collections whenever the embedding model changes —
+> Re-run with `--recreate` on **both** collections whenever the embedding model changes;
 > mixed-model vectors silently destroy relevance.
 
 ### 2. Run the API
@@ -122,7 +122,7 @@ cd frontend && python -m http.server 8080
 ```
 
 CORS is scoped to `CORS_ORIGINS` (default `localhost:8080`). Opening `index.html` directly via
-`file://` won't work — `Origin: null` isn't allowed. The dashboard POSTs to
+`file://` won't work; `Origin: null` isn't allowed. The dashboard POSTs to
 `http://127.0.0.1:8000/api/v1/analyze/` and polls for the result.
 
 ---
@@ -135,11 +135,11 @@ Settings come from `.env` via Pydantic (`backend/app/config.py`). Highlights:
 |---------|---------|-------|
 | `ENVIRONMENT` | `development` | `development` = file Qdrant + SQLite (Docker-free); `production` = networked Qdrant + Postgres |
 | `EMBEDDING_MODEL` | `microsoft/unixcoder-base` | Mean-pooled, 768-dim |
-| `SIM_THRESHOLD_CVE` | `0.25` | Similarity gate — tuned for high recall |
+| `SIM_THRESHOLD_CVE` | `0.25` | Similarity gate, tuned for high recall |
 | `RERANK_THRESHOLD` | `0.0` | The ms-marco reranker gives near-zero absolute scores on code; it only provides ordering |
 | `LLM_PROVIDER` / `LLM_FALLBACK_PROVIDER` | `groq` / `gemini` | OpenAI-compatible endpoints; primary → fallback |
-| `GROQ_API_KEY` / `GEMINI_API_KEY` | — | A configured provider with a missing key **hard-fails at startup** |
-| `REPOSENTINEL_API_KEY` | — | `X-RepoSentinel-Key` header — optional in dev, required in production |
+| `GROQ_API_KEY` / `GEMINI_API_KEY` | (none) | A configured provider with a missing key **hard-fails at startup** |
+| `REPOSENTINEL_API_KEY` | (none) | `X-RepoSentinel-Key` header, optional in dev, required in production |
 | `HYBRID_ENABLED` | `False` | Dense + sparse (BM25) RRF fusion; off by default (measured F1 gain below the adoption bar) |
 
 See `.env.example` for the full list.
@@ -150,14 +150,14 @@ See `.env.example` for the full list.
 
 `.github/workflows/repo_sentinel.yml` runs `github_action/scan_pr.py` on pull requests. It
 collects the PR's changed files, POSTs them in files mode, and posts **inline review comments**
-anchored to changed lines — deduped across pushes via hidden
-`<!-- reposentinel:f:<sha1> -->` markers — plus a summary comment and a configurable severity
+anchored to changed lines (deduped across pushes via hidden
+`<!-- reposentinel:f:<sha1> -->` markers), plus a summary comment and a configurable severity
 gate.
 
 Configure two repository secrets:
 
-- `REPOSENTINEL_URL` — where your API is reachable
-- `REPOSENTINEL_API_KEY` — matches the backend's `REPOSENTINEL_API_KEY`
+- `REPOSENTINEL_URL`: where your API is reachable
+- `REPOSENTINEL_API_KEY`: matches the backend's `REPOSENTINEL_API_KEY`
 
 `INPUT_FAIL_ON_SEVERITY` (default `high`) controls when the check fails the build.
 
@@ -166,7 +166,7 @@ Configure two repository secrets:
 ## Tests & lint
 
 ```bash
-python -m pytest -m "not slow"        # fast suite — no model loads
+python -m pytest -m "not slow"        # fast suite (no model loads)
 python -m pytest -m slow              # eval regression (needs a seeded cve_corpus + API stopped)
 ruff check backend scripts tests ml github_action
 ```
@@ -182,7 +182,7 @@ Calibrate thresholds or compare embedding models:
 python -m ml.evaluation.run_eval --sim-sweep 0.20:0.70:0.05 --write-baseline
 ```
 
-The eval quantifies the precision ceiling (~0.5 across thresholds — safe and vulnerable
+The eval quantifies the precision ceiling (~0.5 across thresholds, since safe and vulnerable
 near-twins embed alike), which is *why* the gate favors recall and the LLM report is the real
 precision filter. **Category hit rate** (did we retrieve the right CVE?) is the meaningful
 retrieval metric; the calibrated baseline lives in `ml/evaluation/baseline.json`.
@@ -212,7 +212,7 @@ tests/            pytest suite (unit + integration; slow eval regression)
 
 - **The LLM is Groq/Gemini, never a silent mock.** Mock output only happens with an explicit
   `LLM_PROVIDER=mock`.
-- **Local Qdrant is single-process** — the API, ingest scripts, and eval can never run at the
+- **Local Qdrant is single-process.** The API, ingest scripts, and eval can never run at the
   same time; scripts print "stop the API first" on a lock error.
 - **Any embedding-model change requires `--recreate` on both collections.** Payloads carry
   `embedding_model` so drift is detectable.

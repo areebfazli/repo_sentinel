@@ -23,7 +23,7 @@ def test_legacy_codebert_env_var_is_ignored(monkeypatch):
     # A stale CODEBERT_MODEL must NOT override the calibrated default.
     monkeypatch.setenv("CODEBERT_MODEL", "microsoft/codebert-base")
     s = Settings()
-    assert s.EMBEDDING_MODEL == "microsoft/unixcoder-base"
+    assert s.EMBEDDING_MODEL == "jinaai/jina-embeddings-v2-base-code"
 
 
 def test_embedding_model_env_override(monkeypatch):
@@ -35,3 +35,14 @@ def test_embedding_model_env_override(monkeypatch):
 def test_seniority_weights_default():
     s = Settings()
     assert s.SENIORITY_WEIGHTS["OWNER"] > s.SENIORITY_WEIGHTS["MEMBER"]
+
+
+def test_embedder_and_reranker_defaults():
+    # jina-embeddings-v2-base-code + bge-reranker-v2-m3 (roadmap items 1c/1d).
+    s = Settings()
+    assert s.EMBEDDING_DIM == 768
+    assert s.EMBEDDING_MAX_TOKENS == 2048
+    assert s.EMBEDDING_TRUST_REMOTE_CODE is True
+    assert s.RERANKER_MODEL == "BAAI/bge-reranker-v2-m3"
+    assert s.RERANKER_MAX_TOKENS == 1024
+    assert s.RERANKER_BATCH_SIZE == 8

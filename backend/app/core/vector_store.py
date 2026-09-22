@@ -29,8 +29,10 @@ class VectorStore:
         self.cve_collection = "cve_corpus"
         self.team_collection = "team_history"
 
-        # CodeBERT/UniXcoder hidden size
-        self.vector_size = 768
+        # Must match the embedder's hidden size (see Embedder's dim check); Qdrant
+        # collection dims are fixed at creation, so an EMBEDDING_DIM mismatch
+        # requires --recreate on both collections.
+        self.vector_size = settings.EMBEDDING_DIM
         self.hybrid = settings.HYBRID_ENABLED
 
         self._init_collections()

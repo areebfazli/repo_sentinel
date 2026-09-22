@@ -132,9 +132,16 @@ def test_analyze_files_mode_anchors_finding():
 
 @pytest.mark.integration
 def test_rejects_both_snippet_and_files():
-    with TestClient(app) as client:
-        resp = client.post(
-            "/api/v1/analyze/",
-            json={"code_snippet": "x", "files": [{"path": "a.py", "content": "y"}]},
-        )
-        assert resp.status_code == 422  # validator: exactly one mode
+    # FastAPI resolves Depends(get_merger) while solving dependencies even though
+    # body validation subsequently fails with 422, so this must stub the merger
+    # like the other tests here — otherwise it constructs a real RagMerger/Embedder.
+    app.dependency_overrides[analyze.get_merger] = lambda: StubMerger()
+    try:
+        with TestClient(app) as client:
+            resp = client.post(
+                "/api/v1/analyze/",
+                json={"code_snippet": "x", "files": [{"path": "a.py", "content": "y"}]},
+            )
+            assert resp.status_code == 422  # validator: exactly one mode
+    finally:
+        app.dependency_overrides.clear()

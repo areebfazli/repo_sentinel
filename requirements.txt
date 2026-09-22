@@ -17,7 +17,7 @@ tree-sitter-java>=0.23
 
 # Machine Learning & Embeddings
 torch>=2.4.0
-transformers>=4.40.1
+transformers>=4.40.1,<5  # jina-embeddings-v2 remote code targets the 4.x API
 sentence-transformers>=2.7.0
 
 # Vector Database

@@ -46,20 +46,27 @@ class Settings(BaseSettings):
     # avoid clobbering the real repo_sentinel.sqlite).
     DEV_SQLITE_PATH: str | None = None
 
-    # UniXcoder + mean pooling is the calibrated default (see ml/evaluation).
-    # No CODEBERT_MODEL alias: a stale legacy env var must not silently downgrade
-    # the model the thresholds/baseline were calibrated for.
-    EMBEDDING_MODEL: str = "microsoft/unixcoder-base"
+    # jina-embeddings-v2-base-code + mean pooling is the calibrated default (see
+    # ml/evaluation). No CODEBERT_MODEL alias: a stale legacy env var must not
+    # silently downgrade the model the thresholds/baseline were calibrated for.
+    EMBEDDING_MODEL: str = "jinaai/jina-embeddings-v2-base-code"
     EMBEDDING_POOLING: str = "mean"  # "cls" or "mean"
-    RERANKER_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    EMBEDDING_DIM: int = 768
+    EMBEDDING_MAX_TOKENS: int = 2048
+    # jina v2 uses a custom BERT-ALiBi architecture that requires trust_remote_code=True
+    # to load; kept as a setting so a plain HF model can turn it off later.
+    EMBEDDING_TRUST_REMOTE_CODE: bool = True
+    RERANKER_MODEL: str = "BAAI/bge-reranker-v2-m3"
+    # BAAI's recommended max token length; activation memory scales with length.
+    RERANKER_MAX_TOKENS: int = 1024
+    RERANKER_BATCH_SIZE: int = 8
 
     # Retrieval thresholds (single source of truth; calibrated via ml/evaluation
-    # for unixcoder-base + mean pooling — see ml/evaluation/baseline.json).
-    # 0.25 gives recall ~0.96; precision is ~flat across thresholds (safe and
-    # vulnerable near-misses embed similarly), so the LLM report is the real
-    # precision filter and we favour recall. Mean pooling dilutes code with
-    # comment tokens, so real commented code scores lower than clean eval code —
-    # another reason to keep this gate low.
+    # for jina-embeddings-v2-base-code + bge-reranker-v2-m3 — see baseline.json).
+    # 0.25 gives recall 1.0; precision is ~flat at 0.5 across thresholds (a safe
+    # query and its vulnerable twin embed alike), so the LLM report is the real
+    # precision filter and we favour recall. bge's sigmoid sits at 0.50-0.73 on
+    # code pairs (raw logit near zero) — it only provides ordering, hence 0.0.
     SIM_THRESHOLD_CVE: float = 0.25
     SIM_THRESHOLD_TEAM: float = 0.25
     RERANK_THRESHOLD: float = 0.0        # gate on sigmoid(logit); 0.0 = keep all reranked

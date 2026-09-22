@@ -42,7 +42,7 @@ POST /api/v1/analyze/  ──▶  Scan row (queued)  ──▶  202 + job_id
              CVE retriever                  Team retriever
         (Ghost Hunter, gather)          (Team Memory, gather)
                      │                              │
-   Embedder (UniXcoder, mean-pooled, 768-d, cached)
+   Embedder (jina-embeddings-v2-base-code, mean-pooled, 768-d, cached)
    → VectorStore ANN top-N (optional language filter)
    → similarity gate → cross-encoder rerank (code-vs-code)
    → feedback suppression / downweight → top-k
@@ -134,9 +134,9 @@ Settings come from `.env` via Pydantic (`backend/app/config.py`). Highlights:
 | Setting | Default | Notes |
 |---------|---------|-------|
 | `ENVIRONMENT` | `development` | `development` = file Qdrant + SQLite (Docker-free); `production` = networked Qdrant + Postgres |
-| `EMBEDDING_MODEL` | `microsoft/unixcoder-base` | Mean-pooled, 768-dim |
+| `EMBEDDING_MODEL` | `jinaai/jina-embeddings-v2-base-code` | Mean-pooled, 768-dim; needs `EMBEDDING_TRUST_REMOTE_CODE=True` |
 | `SIM_THRESHOLD_CVE` | `0.25` | Similarity gate, tuned for high recall |
-| `RERANK_THRESHOLD` | `0.0` | The ms-marco reranker gives near-zero absolute scores on code; it only provides ordering |
+| `RERANK_THRESHOLD` | `0.0` | bge gives near-0.5 sigmoid scores on code pairs; it only provides ordering |
 | `LLM_PROVIDER` / `LLM_FALLBACK_PROVIDER` | `groq` / `gemini` | OpenAI-compatible endpoints; primary → fallback |
 | `GROQ_API_KEY` / `GEMINI_API_KEY` | (none) | A configured provider with a missing key **hard-fails at startup** |
 | `REPOSENTINEL_API_KEY` | (none) | `X-RepoSentinel-Key` header, optional in dev, required in production |

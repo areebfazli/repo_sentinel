@@ -25,9 +25,22 @@ class Embedder:
             f"on device: {self.device}"
         )
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = AutoModel.from_pretrained(self.model_name).to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_name, trust_remote_code=settings.EMBEDDING_TRUST_REMOTE_CODE
+        )
+        self.model = AutoModel.from_pretrained(
+            self.model_name, trust_remote_code=settings.EMBEDDING_TRUST_REMOTE_CODE
+        ).to(self.device)
         self.model.eval()
+
+        hidden_size = self.model.config.hidden_size
+        if hidden_size != settings.EMBEDDING_DIM:
+            raise ValueError(
+                f"Embedding model '{self.model_name}' has hidden_size={hidden_size}, "
+                f"which does not match settings.EMBEDDING_DIM={settings.EMBEDDING_DIM}. "
+                "Update EMBEDDING_DIM to match the model (and --recreate both Qdrant "
+                "collections) before proceeding."
+            )
 
     def _cache_key(self, text: str) -> str:
         digest = f"{self.model_name}:{self.pooling}:{text}"
@@ -81,7 +94,7 @@ class Embedder:
             batch_texts,
             padding=True,
             truncation=True,
-            max_length=512,
+            max_length=settings.EMBEDDING_MAX_TOKENS,
             return_tensors="pt",
         ).to(self.device)
 

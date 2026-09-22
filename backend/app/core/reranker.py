@@ -23,8 +23,10 @@ class Reranker:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Initializing Cross-Encoder Reranker on device: {self.device}")
 
-        # We use the ms-marco model optimized for semantic search relevance
-        self.model = CrossEncoder(settings.RERANKER_MODEL, device=self.device)
+        # We use bge-reranker-v2-m3, a general-purpose multilingual cross-encoder reranker
+        self.model = CrossEncoder(
+            settings.RERANKER_MODEL, max_length=settings.RERANKER_MAX_TOKENS, device=self.device
+        )
 
     def rerank(
         self, query_code: str, candidates: list[dict[str, Any]], top_k: int = 1
@@ -43,7 +45,7 @@ class Reranker:
             [query_code, c.get("rerank_text") or c.get("description", "")]
             for c in candidates
         ]
-        scores = self.model.predict(pairs)
+        scores = self.model.predict(pairs, batch_size=settings.RERANKER_BATCH_SIZE)
 
         for i, candidate in enumerate(candidates):
             score = float(scores[i])

@@ -28,3 +28,6 @@ CLAUDE.md
 
 # Local-only working report (kept on disk, not tracked)
 REPORT.md
+
+# OSV bulk-export + GitHub API response cache for scripts/build_corpus_from_osv.py
+data/osv_cache/

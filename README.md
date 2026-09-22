@@ -218,3 +218,35 @@ tests/            pytest suite (unit + integration; slow eval regression)
   same time; scripts print "stop the API first" on a lock error.
 - **Any embedding-model change requires `--recreate` on both collections.** Payloads carry
   `embedding_model` so drift is detectable.
+
+---
+
+## Growing the corpus from real CVE fixes
+
+`scripts/build_corpus_from_osv.py` mines the [OSV](https://osv.dev) bulk export for an
+ecosystem (`PyPI`, `npm`) for advisories that reference a GitHub fix commit, fetches that
+commit via the GitHub API, and pairs up the pre-commit ("vulnerable") and post-commit
+("fixed") version of every function whose body actually changed inside the commit's diff. It
+produces a corpus grounded in real fixes rather than handwritten snippets, plus a held-out eval
+set split **by advisory** (never by individual function) so nothing in eval shares an advisory
+with the training corpus.
+
+```bash
+python scripts/build_corpus_from_osv.py --ecosystem PyPI --ecosystem npm --max-advisories 200
+```
+
+- Writes `data/cve_corpus/osv_{pypi,npm}.json` (same shape as `sample_cves.json`, plus
+  `fixed_code`/`repo`/`commit`/`file_path`/`function_name`) — feed it to
+  `scripts/ingest_cve_corpus.py` like any other corpus file.
+- Writes `ml/evaluation/datasets/detection_eval_osv.jsonl` (two lines per held-out pair: one
+  `vulnerable`, one `safe`), in the same format as `detection_eval.jsonl`.
+- Caches the OSV zip and every raw GitHub API response under `data/osv_cache/` (gitignored),
+  keyed by request URL, so re-runs — especially `--resume` — make zero redundant API calls.
+- Without `GITHUB_TOKEN` set, GitHub's unauthenticated rate limit (60 requests/hour) is the
+  practical ceiling; the script always respects `--max-advisories` and, on hitting the rate
+  limit, stops cleanly with a clear message rather than crashing or hammering the API (pass
+  `--wait-on-rate-limit` to sleep until it resets instead).
+- All of the pure logic — commit-URL parsing, diff-hunk overlap, the CWE→category table,
+  whitespace-only-change detection, the advisory split, and the dedupe key — lives in
+  importable, network-free module-level functions; see
+  `tests/unit/test_build_corpus_from_osv.py`.

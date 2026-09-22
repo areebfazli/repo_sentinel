@@ -39,7 +39,6 @@ class Settings(BaseSettings):
 
     # Service URLs (for production)
     DATABASE_URL: str | None = None
-    REDIS_URL: str | None = None
     QDRANT_HOST: str | None = None
     QDRANT_PORT: int | None = 6333
 

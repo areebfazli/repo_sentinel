@@ -82,8 +82,12 @@ def anchor_line(finding: dict, changed_lines: list[int]) -> int | None:
     return min(changed_lines, key=lambda ln: abs(ln - (start or changed_lines[0])))
 
 
-def finding_marker(file_path: str, point_id: str) -> str:
-    digest = hashlib.sha1(f"{file_path}|{point_id}".encode()).hexdigest()[:16]
+def finding_marker(file_path: str, point_id: str, function_name: str | None) -> str:
+    """Marker granularity matches the backend's (point_id, file, function) dedupe
+    key, so it stays stable across pushes even when line numbers shift."""
+    digest = hashlib.sha1(
+        f"{file_path}|{point_id}|{function_name or ''}".encode()
+    ).hexdigest()[:16]
     return f"reposentinel:f:{digest}"
 
 
@@ -112,7 +116,9 @@ def build_comment_body(finding: dict) -> str:
         body += f"\n\n{finding['explanation']}"
     if finding.get("fix_snippet"):
         body += f"\n\n```\n{finding['fix_snippet']}\n```"
-    marker = finding_marker(finding.get("file_path", ""), finding.get("point_id") or "")
+    marker = finding_marker(
+        finding.get("file_path", ""), finding.get("point_id") or "", finding.get("function_name")
+    )
     return f"{body}\n\n<sub>RepoSentinel</sub>\n<!-- {marker} -->"
 
 
@@ -240,7 +246,7 @@ def desired_comments(findings: list[dict], changed_by_file: dict[str, list[int]]
     for f in findings:
         path = f.get("file_path")
         line = anchor_line(f, changed_by_file.get(path, [])) if path else None
-        marker = finding_marker(path or "", f.get("point_id", ""))
+        marker = finding_marker(path or "", f.get("point_id", ""), f.get("function_name"))
         body = build_comment_body(f)
         if line is None:
             unanchored.append(f)

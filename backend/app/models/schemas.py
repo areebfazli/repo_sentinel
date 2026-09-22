@@ -80,6 +80,7 @@ class ReportFinding(BaseModel):
     fix_snippet: str = ""
     file_path: str | None = None
     start_line: int | None = None
+    function_name: str | None = None
     finding_id: int | None = None
     point_id: str | None = None
     source: str | None = None

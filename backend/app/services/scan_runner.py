@@ -124,6 +124,7 @@ def _row_snapshot(row: Finding) -> dict:
         "team_pr_id": row.team_pr_id,
         "file_path": row.file_path,
         "start_line": row.start_line,
+        "function_name": row.function_name,
     }
 
 
@@ -155,6 +156,7 @@ def _build_report_findings(validated: list[dict], row_snaps: list[dict]) -> list
                         **base,
                         "file_path": r["file_path"],
                         "start_line": r["start_line"],
+                        "function_name": r["function_name"],
                         "finding_id": r["finding_id"],
                         "point_id": r["point_id"],
                         "source": r["source"],
@@ -162,7 +164,7 @@ def _build_report_findings(validated: list[dict], row_snaps: list[dict]) -> list
                 )
         else:
             report.append(
-                {**base, "file_path": None, "start_line": None,
+                {**base, "file_path": None, "start_line": None, "function_name": None,
                  "finding_id": None, "point_id": None, "source": None}
             )
     return report

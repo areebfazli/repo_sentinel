@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     # Cap on per-scan analysis units (functions) in files mode.
     MAX_UNITS_PER_SCAN: int = 50
 
+    # Scans running at once in this process; the rest wait as "queued".
+    MAX_CONCURRENT_SCANS: int = 2
+
     # Hybrid dense+sparse (BM25) retrieval with RRF fusion. Off by default; enabling
     # it requires re-ingesting BOTH collections (--recreate) so points carry sparse
     # vectors. HYBRID_SPARSE_MIN_SCORE gates the sparse prefetch so only strong

@@ -34,6 +34,17 @@ def get_llm_router() -> LLMRouter:
     return LLMRouter()
 
 
+async def run_scan_job(job_id: str) -> None:
+    """Run a scan against the shared singletons.
+
+    The route hands ``run_scan`` its own ``Depends``-resolved instances (so tests
+    can override them); callers outside the request lifecycle — restart recovery —
+    go through here instead, resolving the singletons only once there is a scan
+    to run, so a lazily-loaded merger stays unbuilt until it is really needed.
+    """
+    await run_scan(job_id, get_merger(), get_llm_router())
+
+
 def _iso(dt) -> str | None:
     """ISO-8601 with a UTC designator. All writes are UTC, but SQLite can hand back
     naive datetimes, so coerce to UTC to avoid offset-less strings that clients

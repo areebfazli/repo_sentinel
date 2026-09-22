@@ -9,7 +9,9 @@ from datetime import UTC, datetime
 from functools import lru_cache
 
 from loguru import logger
+from sqlalchemy import update
 
+from backend.app.config import settings
 from backend.app.core.markdown_renderer import (
     SYSTEM_PROMPT,
     build_user_prompt,
@@ -19,6 +21,35 @@ from backend.app.core.markdown_renderer import (
 )
 from backend.app.db.models import Finding, Scan
 from backend.app.db.session import SessionLocal
+
+_semaphore: asyncio.Semaphore | None = None
+_semaphore_loop: asyncio.AbstractEventLoop | None = None
+
+
+def get_scan_semaphore() -> asyncio.Semaphore:
+    """The process-wide gate on concurrent model inference.
+
+    Built lazily inside the running loop — a module-level Semaphore would bind to
+    whatever loop existed at import time (none, under uvicorn). Rebuilt when the
+    loop changes so tests, which get a fresh loop per case, never wait on a
+    semaphore belonging to a closed one.
+    """
+    global _semaphore, _semaphore_loop
+
+    loop = asyncio.get_running_loop()
+    if _semaphore is None or _semaphore_loop is not loop:
+        _semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_SCANS)
+        _semaphore_loop = loop
+    return _semaphore
+
+
+def reset_scan_semaphore() -> None:
+    """Drop the cached gate so the next scan rebuilds it (tests re-read
+    MAX_CONCURRENT_SCANS through this)."""
+    global _semaphore, _semaphore_loop
+
+    _semaphore = None
+    _semaphore_loop = None
 
 
 def _persist_findings(session, scan_id: str, raw: dict) -> list[Finding]:
@@ -173,7 +204,6 @@ def _build_report_findings(validated: list[dict], row_snaps: list[dict]) -> list
 async def _analyze_request(merger, request: dict) -> tuple[dict, str, str]:
     """Run the right retrieval mode. Returns (raw_findings, prompt_code, extra_note)."""
     if request.get("files"):
-        from backend.app.config import settings
         from backend.app.core.analysis_planner import plan_units
         from backend.app.models.schemas import FileInput
 
@@ -196,18 +226,45 @@ async def _analyze_request(merger, request: dict) -> tuple[dict, str, str]:
     return raw, code, ""
 
 
+def _mark_failed(session, scan_id: str, error: str) -> None:
+    """Flip a scan to failed with a sanitized message (the real cause is logged)."""
+    session.rollback()
+    scan = session.get(Scan, scan_id)
+    if scan is not None:
+        scan.status = "failed"
+        scan.error = error
+        scan.finished_at = datetime.now(UTC)
+        session.commit()
+
+
 async def run_scan(scan_id: str, merger, router) -> None:
-    """Execute a queued scan end-to-end and persist the outcome."""
+    """Execute a queued scan end-to-end and persist the outcome.
+
+    The scan stays ``queued`` until the concurrency gate admits it, so a burst of
+    requests waits its turn instead of running N model inferences at once. An
+    interrupted wait never held a permit, which leaves the scan queued — exactly
+    the state restart recovery re-runs.
+    """
+    async with get_scan_semaphore():
+        await _run_scan_guarded(scan_id, merger, router)
+
+
+async def _run_scan_guarded(scan_id: str, merger, router) -> None:
+    """The scan itself; runs only while holding a permit from the gate."""
     session = SessionLocal()
     try:
-        scan = session.get(Scan, scan_id)
-        if scan is None:
-            logger.error("run_scan: scan {} not found", scan_id)
-            return
-
-        scan.status = "running"
-        scan.started_at = datetime.now(UTC)
+        # Atomic claim: only one runner (across processes too — every worker's
+        # restart recovery sees the same queued rows) may take a scan.
+        claimed = session.execute(
+            update(Scan)
+            .where(Scan.id == scan_id, Scan.status == "queued")
+            .values(status="running", started_at=datetime.now(UTC))
+        ).rowcount
         session.commit()
+        if not claimed:
+            logger.warning("run_scan: scan {} missing or already claimed; skipping", scan_id)
+            return
+        scan = session.get(Scan, scan_id)
 
         request = json.loads(scan.request_json)
         raw, prompt_code, extra_note = await _analyze_request(merger, request)
@@ -257,14 +314,14 @@ async def run_scan(scan_id: str, merger, router) -> None:
         scan.finished_at = datetime.now(UTC)
         session.commit()
 
+    except asyncio.CancelledError:
+        # Shutdown (or an explicit cancel) killed the scan mid-flight; record it
+        # rather than leaving the row stuck in "running", then propagate.
+        logger.warning("run_scan cancelled for {}", scan_id)
+        _mark_failed(session, scan_id, "interrupted")
+        raise
     except Exception:
         logger.exception("run_scan failed for {}", scan_id)
-        session.rollback()
-        scan = session.get(Scan, scan_id)
-        if scan is not None:
-            scan.status = "failed"
-            scan.error = "Analysis failed"  # sanitized; real traceback is logged
-            scan.finished_at = datetime.now(UTC)
-            session.commit()
+        _mark_failed(session, scan_id, "Analysis failed")
     finally:
         session.close()

@@ -28,6 +28,8 @@ def test_detection_f1_not_below_baseline():
     except Exception as exc:  # qdrant lock held (API running) or models missing
         pytest.skip(f"components unavailable: {exc}")
 
+    if store.cve_schema_error:
+        pytest.skip(store.cve_schema_error)
     if store.count(store.cve_collection) == 0:
         pytest.skip("cve_corpus not seeded — run scripts/ingest_cve_corpus.py")
 

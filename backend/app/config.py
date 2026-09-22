@@ -72,6 +72,12 @@ class Settings(BaseSettings):
     RERANK_THRESHOLD: float = 0.0        # gate on sigmoid(logit); 0.0 = keep all reranked
     RETRIEVAL_TOP_K: int = 3             # findings returned per collection
     ANN_CANDIDATES: int = 10             # broad ANN recall before reranking
+    # Patched-twin gate (ROADMAP 1b): drop a CVE candidate whose twin_margin
+    # (cos(query, vulnerable) - cos(query, fixed)) is below this, i.e. the code
+    # looks at least as much like the fix as like the bug. Candidates without a
+    # stored fix always pass. None = off until ml/evaluation (--margin-sweep)
+    # calibrates it.
+    TWIN_MARGIN_MIN: float | None = None
 
     # Feedback loop tuning.
     FEEDBACK_SUPPRESS_NET: int = -2                # net vote at/below which a memory is dropped

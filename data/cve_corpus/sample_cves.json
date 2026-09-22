@@ -5,7 +5,8 @@
     "description": "SQL Injection in user login query via string-formatted credentials",
     "severity": 9.8,
     "language": "python",
-    "vulnerable_code": "def login_user(db_cursor, username, password):\n    query = f\"SELECT * FROM users WHERE username='{username}' AND password='{password}'\"\n    db_cursor.execute(query)\n    return db_cursor.fetchone()"
+    "vulnerable_code": "def login_user(db_cursor, username, password):\n    query = f\"SELECT * FROM users WHERE username='{username}' AND password='{password}'\"\n    db_cursor.execute(query)\n    return db_cursor.fetchone()",
+    "fixed_code": "def login_user(db_cursor, username, password):\n    query = \"SELECT * FROM users WHERE username = %s AND password = %s\"\n    db_cursor.execute(query, (username, password))\n    return db_cursor.fetchone()"
   },
   {
     "cve_id": "CVE-2024-90001",
@@ -13,7 +14,8 @@
     "description": "SQL Injection in order lookup using percent string formatting",
     "severity": 8.6,
     "language": "python",
-    "vulnerable_code": "def get_order(db, order_id):\n    sql = \"SELECT * FROM orders WHERE id = '%s'\" % order_id\n    db.execute(sql)\n    return db.fetchall()"
+    "vulnerable_code": "def get_order(db, order_id):\n    sql = \"SELECT * FROM orders WHERE id = '%s'\" % order_id\n    db.execute(sql)\n    return db.fetchall()",
+    "fixed_code": "def get_order(db, order_id):\n    sql = \"SELECT * FROM orders WHERE id = %s\"\n    db.execute(sql, (order_id,))\n    return db.fetchall()"
   },
   {
     "cve_id": "CVE-2024-90002",
@@ -45,7 +47,8 @@
     "description": "Path traversal via tar archive extraction without member validation",
     "severity": 7.5,
     "language": "python",
-    "vulnerable_code": "def extract_archive(archive_path, extract_to):\n    import tarfile\n    with tarfile.open(archive_path) as tar:\n        tar.extractall(path=extract_to)"
+    "vulnerable_code": "def extract_archive(archive_path, extract_to):\n    import tarfile\n    with tarfile.open(archive_path) as tar:\n        tar.extractall(path=extract_to)",
+    "fixed_code": "def extract_archive(archive_path, extract_to):\n    import tarfile\n    with tarfile.open(archive_path) as tar:\n        tar.extractall(path=extract_to, filter='data')"
   },
   {
     "cve_id": "CVE-2024-90005",
@@ -61,7 +64,8 @@
     "description": "Arbitrary file read by joining user input onto a base directory",
     "severity": 7.1,
     "language": "python",
-    "vulnerable_code": "def read_user_file(base_dir, filename):\n    import os\n    path = os.path.join(base_dir, filename)\n    with open(path) as f:\n        return f.read()"
+    "vulnerable_code": "def read_user_file(base_dir, filename):\n    import os\n    path = os.path.join(base_dir, filename)\n    with open(path) as f:\n        return f.read()",
+    "fixed_code": "def read_user_file(base_dir, filename):\n    import os\n    root = os.path.realpath(base_dir)\n    path = os.path.realpath(os.path.join(root, filename))\n    if os.path.commonpath([root, path]) != root:\n        raise ValueError(\"path escapes base_dir\")\n    with open(path) as f:\n        return f.read()"
   },
   {
     "cve_id": "CVE-2024-90007",
@@ -109,7 +113,8 @@
     "description": "XSS via jQuery .html() rendering unescaped server data",
     "severity": 6.4,
     "language": "javascript",
-    "vulnerable_code": "function loadBio(user) {\n    $('#bio').html(user.bio);\n}"
+    "vulnerable_code": "function loadBio(user) {\n    $('#bio').html(user.bio);\n}",
+    "fixed_code": "function loadBio(user) {\n    $('#bio').text(user.bio);\n}"
   },
   {
     "cve_id": "CVE-2024-90012",
@@ -125,7 +130,8 @@
     "description": "Command injection via subprocess run with shell=True and concatenation",
     "severity": 8.8,
     "language": "python",
-    "vulnerable_code": "def ping_server(ip_address):\n    import subprocess\n    command = 'ping -c 4 ' + ip_address\n    result = subprocess.run(command, shell=True, capture_output=True)\n    return result.stdout.decode()"
+    "vulnerable_code": "def ping_server(ip_address):\n    import subprocess\n    command = 'ping -c 4 ' + ip_address\n    result = subprocess.run(command, shell=True, capture_output=True)\n    return result.stdout.decode()",
+    "fixed_code": "def ping_server(ip_address):\n    import ipaddress\n    import subprocess\n    ipaddress.ip_address(ip_address)  # rejects anything that isn't an IP\n    result = subprocess.run(['ping', '-c', '4', ip_address], capture_output=True)\n    return result.stdout.decode()"
   },
   {
     "cve_id": "CVE-2024-90013",

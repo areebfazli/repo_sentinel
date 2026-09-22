@@ -8,6 +8,16 @@ from backend.app.core.sparse_encoder import encode as sparse_encode
 from backend.app.core.vector_store import VectorStore
 
 
+def passes_twin_margin(match: dict[str, Any], margin_min: float | None) -> bool:
+    """TWIN_MARGIN_MIN semantics, shared with ml/evaluation: a candidate passes
+    when the gate is off, when it has no patched twin (twin_margin None), or
+    when it looks enough more like the vulnerable version than the fix."""
+    if margin_min is None:
+        return True
+    margin = match.get("twin_margin")
+    return margin is None or margin >= margin_min
+
+
 class CVERetriever:
     def __init__(self, embedder: Embedder, vector_store: VectorStore, reranker: Reranker):
         self.embedder = embedder
@@ -26,7 +36,8 @@ class CVERetriever:
         threshold: float | None = None,
         query_vector: list[float] | None = None,
     ) -> list[dict[str, Any]]:
-        """ANN top-N -> similarity gate -> code-to-code rerank, WITHOUT feedback.
+        """ANN top-N -> similarity gate -> twin-margin gate -> code-to-code
+        rerank, WITHOUT feedback.
 
         Returns reranked candidates (ordered, not truncated). Split out from
         ``find_vulnerabilities`` so files mode can gather candidates across all
@@ -57,6 +68,12 @@ class CVERetriever:
                 if res.get("similarity_score", 0.0) >= threshold
             ]
 
+        # Patched-twin gate (off unless TWIN_MARGIN_MIN is set). Applied before
+        # the rerank so dropped candidates don't cost a cross-encoder pass; the
+        # rerank is pairwise, so this doesn't change survivors' scores.
+        margin_min = settings.TWIN_MARGIN_MIN
+        viable_matches = [m for m in viable_matches if passes_twin_margin(m, margin_min)]
+
         # Rerank against the stored vulnerable code (code-to-code), not the
         # English description.
         for match in viable_matches:
@@ -75,7 +92,8 @@ class CVERetriever:
         """Embed developer code and search the CVE corpus for matches.
 
         High recall (ANN top-N, optionally language-filtered) -> similarity gate ->
-        cross-encoder rerank code-against-code -> rerank-probability gate. All
+        twin-margin gate -> cross-encoder rerank code-against-code ->
+        rerank-probability gate. All
         thresholds default to settings (single source of truth). ``query_vector``
         lets callers pass a precomputed embedding (files mode batches embedding).
         """
@@ -113,5 +131,7 @@ def delete_user_account(db, user_id):
             print(f"Description: {finding['description']}")
             print(f"Base Vector Score: {finding.get('similarity_score', 0.0):.4f}")
             print(f"Reranker Confidence: {finding.get('rerank_prob', 0.0):.4f}")
+            margin = finding.get("twin_margin")
+            print(f"Twin Margin: {'n/a (no fix stored)' if margin is None else f'{margin:+.4f}'}")
     else:
         print("\n✅ Code looks safe. No CVE patterns matched.")

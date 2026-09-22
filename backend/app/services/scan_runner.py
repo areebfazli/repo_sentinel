@@ -74,8 +74,14 @@ def _persist_findings(session, scan_id: str, raw: dict) -> list[Finding]:
                 rerank_score=float(match.get("rerank_score", 0.0)),
                 rerank_prob=float(match.get("rerank_prob", 0.0)),
                 adjusted_score=float(match.get("adjusted_score", match.get("rerank_prob", 0.0))),
+                # Twin scores live in payload_json rather than new columns: tables
+                # are made by create_all (no migrations), which would not add
+                # columns to an existing findings table.
                 payload_json=json.dumps(
-                    {k: match.get(k) for k in ("category", "severity", "language")}
+                    {
+                        k: match.get(k)
+                        for k in ("category", "severity", "language", "sim_fixed", "twin_margin")
+                    }
                 ),
             )
         )
@@ -107,6 +113,7 @@ def _persist_findings(session, scan_id: str, raw: dict) -> list[Finding]:
 
 
 def _finding_out(row: Finding) -> dict:
+    payload = json.loads(row.payload_json) if row.payload_json else {}
     return {
         "finding_id": row.id,
         "point_id": row.point_id,
@@ -119,6 +126,8 @@ def _finding_out(row: Finding) -> dict:
         "start_line": row.start_line,
         "similarity_score": row.similarity_score,
         "rerank_prob": row.rerank_prob,
+        "sim_fixed": payload.get("sim_fixed"),
+        "twin_margin": payload.get("twin_margin"),
     }
 
 

@@ -63,6 +63,10 @@ class FindingOut(BaseModel):
     start_line: int | None = None
     similarity_score: float
     rerank_prob: float
+    # Patched-twin scores (CVE matches with a stored fix only; else None):
+    # cos(code, fixed version) and cos(code, vulnerable) - that.
+    sim_fixed: float | None = None
+    twin_margin: float | None = None
 
 
 class ReportFinding(BaseModel):

@@ -4,6 +4,7 @@ The LLM returns structured JSON findings; we validate them against the allowlist
 of retrieved IDs (anti-hallucination) and render the Markdown ourselves so the
 report format is deterministic and can't inject fake CVE IDs.
 """
+import difflib
 from typing import Any
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -38,19 +39,75 @@ def severity_from_cvss(score: float | None) -> str | None:
     return "low"
 
 
+# Prompt-size caps for retrieved corpus code. Mined (OSV) entries are whole
+# functions and can run to hundreds of lines; the handwritten ones fit easily.
+PROMPT_MAX_CODE_LINES = 40
+PROMPT_MAX_DIFF_LINES = 40
+PROMPT_MAX_LINE_CHARS = 200  # guards against minified one-line JS
+
+
+def _clip_lines(lines: list[str], max_lines: int, what: str) -> list[str]:
+    clipped = [
+        ln if len(ln) <= PROMPT_MAX_LINE_CHARS else ln[:PROMPT_MAX_LINE_CHARS] + " ..."
+        for ln in lines[:max_lines]
+    ]
+    if len(lines) > max_lines:
+        clipped.append(f"... ({what} truncated, {len(lines) - max_lines} more lines)")
+    return clipped
+
+
+def fix_diff(vulnerable_code: str, fixed_code: str, max_lines: int = PROMPT_MAX_DIFF_LINES) -> str:
+    """Compact unified diff vulnerable -> fixed (file headers dropped, 1 line of
+    context, at most ``max_lines`` lines). Empty when the two don't differ."""
+    diff = list(
+        difflib.unified_diff(
+            vulnerable_code.strip().splitlines(),
+            fixed_code.strip().splitlines(),
+            lineterm="",
+            n=1,
+        )
+    )[2:]  # skip the ---/+++ header lines
+    return "\n".join(_clip_lines(diff, max_lines, "diff"))
+
+
+def _indented(text: str, prefix: str = "    ") -> list[str]:
+    return [f"{prefix}{ln}" for ln in text.splitlines()]
+
+
 def build_user_prompt(code_snippet: str, cves: list[dict], team: list[dict]) -> str:
-    """Compose the user message: the code plus compact match context."""
+    """Compose the user message: the code plus compact match context.
+
+    CVE matches with a stored patched twin also carry the fix as a diff, so the
+    model can tell code that matches the bug from code that already has the fix.
+    """
     lines = ["Developer code under review:", "```", code_snippet.strip(), "```", ""]
 
     if cves:
         lines.append("Ghost Hunter — retrieved CVE matches:")
+        any_diff = False
         for c in cves:
             lines.append(
                 f"- cve_id={c.get('cve_id')} severity={c.get('severity')} "
                 f"category={c.get('category')}: {c.get('description', '')}"
             )
-            if c.get("vulnerable_code"):
-                lines.append(f"  vulnerable pattern:\n  {c['vulnerable_code'].strip()}")
+            vulnerable = c.get("vulnerable_code") or ""
+            if vulnerable.strip():
+                lines.append("  vulnerable pattern:")
+                code_lines = _clip_lines(
+                    vulnerable.strip().splitlines(), PROMPT_MAX_CODE_LINES, "code"
+                )
+                lines.extend(_indented("\n".join(code_lines)))
+                diff = fix_diff(vulnerable, c["fixed_code"]) if c.get("fixed_code") else ""
+                if diff:
+                    any_diff = True
+                    lines.append("  how this CVE was fixed (unified diff, vulnerable -> fixed):")
+                    lines.extend(_indented(diff))
+        if any_diff:
+            lines.append(
+                "For each match that shows how it was fixed: judge whether the developer's "
+                "code looks like the pre-fix version ('-' lines) or the post-fix version "
+                "('+' lines). If it already has the fix, the match does not apply — omit it."
+            )
         lines.append("")
 
     if team:

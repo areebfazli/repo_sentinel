@@ -99,3 +99,35 @@ def test_top_k_limit(monkeypatch):
 
     results = retriever.find_vulnerabilities("code")
     assert [r["cve_id"] for r in results] == ["A", "B"]
+
+
+def test_twin_margin_gate_off_by_default(monkeypatch):
+    monkeypatch.setattr(settings, "SIM_THRESHOLD_CVE", 0.0)
+    monkeypatch.setattr(settings, "RERANK_THRESHOLD", 0.0)
+    monkeypatch.setattr(settings, "RETRIEVAL_TOP_K", 5)
+    assert settings.TWIN_MARGIN_MIN is None  # shipped default: gate off
+    store = StubVectorStore([_candidate("A", 0.9, twin_margin=-0.3, sim_fixed=0.95)])
+    retriever = CVERetriever(StubEmbedder(), store, StubReranker({"A": 0.9}))
+
+    assert [r["cve_id"] for r in retriever.find_vulnerabilities("code")] == ["A"]
+
+
+def test_twin_margin_gate_drops_fix_lookalikes_before_rerank(monkeypatch):
+    monkeypatch.setattr(settings, "SIM_THRESHOLD_CVE", 0.0)
+    monkeypatch.setattr(settings, "RERANK_THRESHOLD", 0.0)
+    monkeypatch.setattr(settings, "RETRIEVAL_TOP_K", 5)
+    monkeypatch.setattr(settings, "TWIN_MARGIN_MIN", 0.05)
+    store = StubVectorStore([
+        _candidate("VULN", 0.9, twin_margin=0.10, sim_fixed=0.80),   # more like the bug
+        _candidate("FIXED", 0.9, twin_margin=-0.02, sim_fixed=0.92),  # more like the fix
+        _candidate("EDGE", 0.9, twin_margin=0.05, sim_fixed=0.85),   # == threshold passes
+        _candidate("NOTWIN", 0.9, twin_margin=None, sim_fixed=None),  # no twin: never gated
+        _candidate("LEGACY", 0.9),  # no twin keys at all (stub / old payload)
+    ])
+    reranker = StubReranker({k: 0.9 for k in ("VULN", "FIXED", "EDGE", "NOTWIN", "LEGACY")})
+    retriever = CVERetriever(StubEmbedder(), store, reranker)
+
+    ids = {r["cve_id"] for r in retriever.find_vulnerabilities("code")}
+    assert ids == {"VULN", "EDGE", "NOTWIN", "LEGACY"}
+    # Gated before the (expensive) cross-encoder: FIXED was never reranked.
+    assert "FIXED" not in {cve_id for cve_id, _ in reranker.seen_pairs}

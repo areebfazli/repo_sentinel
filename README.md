@@ -23,7 +23,7 @@ recent it was and how senior the reviewer is.
 
 | Collection | Qdrant name | Source | What it catches |
 |------------|-------------|--------|-----------------|
-| **Ghost Hunter** | `cve_corpus` | Curated CVE vulnerable-code snippets (`data/cve_corpus/*.json`) | Known vulnerability patterns (SQLi, command injection, XSS, path traversal, …) |
+| **Ghost Hunter** | `cve_corpus` | CVE vulnerable-code snippets plus, where known, the patched version (`data/cve_corpus/*.json`) | Known vulnerability patterns (SQLi, command injection, XSS, path traversal, …) |
 | **Team Memory** | `team_history` | Closed-PR review comments crawled from GitHub | Team-specific conventions and past mistakes |
 
 ---
@@ -92,7 +92,8 @@ The API returns useful results only once **both** collections are seeded. Local 
 (`./qdrant_data`) is single-process, so **stop the API before running any ingest script.**
 
 ```bash
-# Ghost Hunter: CVE corpus (reads data/cve_corpus/*.json)
+# Ghost Hunter: CVE corpus (reads data/cve_corpus/*.json). Entries with `fixed_code`
+# also store the patched twin, and the LLM prompt shows the fix diff.
 python scripts/ingest_cve_corpus.py --recreate
 
 # Team Memory: demo data (offline)
@@ -137,6 +138,7 @@ Settings come from `.env` via Pydantic (`backend/app/config.py`). Highlights:
 | `EMBEDDING_MODEL` | `jinaai/jina-embeddings-v2-base-code` | Mean-pooled, 768-dim; needs `EMBEDDING_TRUST_REMOTE_CODE=True` |
 | `SIM_THRESHOLD_CVE` | `0.25` | Similarity gate, tuned for high recall |
 | `RERANK_THRESHOLD` | `0.0` | bge gives near-0.5 sigmoid scores on code pairs; it only provides ordering |
+| `TWIN_MARGIN_MIN` | (off) | Drop CVE matches that look at least as much like the stored fix as like the bug; calibrate with `run_eval --margin-sweep` |
 | `LLM_PROVIDER` / `LLM_FALLBACK_PROVIDER` | `groq` / `gemini` | OpenAI-compatible endpoints; primary → fallback |
 | `GROQ_API_KEY` / `GEMINI_API_KEY` | (none) | A configured provider with a missing key **hard-fails at startup** |
 | `REPOSENTINEL_API_KEY` | (none) | `X-RepoSentinel-Key` header, optional in dev, required in production |

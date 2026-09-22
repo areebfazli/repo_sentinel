@@ -2,6 +2,7 @@ const API_HOST = 'http://127.0.0.1:8000';
 const ANALYZE_URL = `${API_HOST}/api/v1/analyze/`;
 const POLL_INTERVAL_MS = 1500;
 const POLL_MAX_ATTEMPTS = 80; // ~120s
+const POLL_MAX_CONSECUTIVE_FAILURES = 3; // give up after this many transient failures in a row
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -70,17 +71,23 @@ document.addEventListener('DOMContentLoaded', () => {
         resultsState.innerHTML = `
             <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; gap:20px; color:var(--text-secondary);">
                 <div class="loader" style="width:40px; height:40px; border-width:4px; border-top-color:var(--accent-purple);"></div>
-                <p>${message}</p>
+                <p></p>
             </div>`;
+        // Message text goes through textContent, never innerHTML (it can carry
+        // server-derived status text), so it can't be interpreted as markup.
+        resultsState.querySelector('p').textContent = message;
     };
 
     const showError = (message) => {
         resultsState.innerHTML = `
             <div style="text-align:center; padding:2rem;">
                 <h3 style="color:var(--accent-red); margin-bottom:1rem;">Scan Failed</h3>
-                <p>${message}</p>
+                <p></p>
                 <p style="font-size:0.8rem; margin-top:2rem;">Is the FastAPI backend running?</p>
             </div>`;
+        // Message text goes through textContent, never innerHTML (it can carry
+        // server-derived error text), so it can't be interpreted as markup.
+        resultsState.querySelector('p').textContent = message;
     };
 
     const renderResult = (result) => {
@@ -94,10 +101,44 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const pollJob = async (jobId) => {
         const url = `${ANALYZE_URL}${jobId}`;
+        let consecutiveFailures = 0;
         for (let attempt = 0; attempt < POLL_MAX_ATTEMPTS; attempt++) {
             await sleep(POLL_INTERVAL_MS);
-            const resp = await fetch(url, { headers: apiHeaders() });
+
+            let resp;
+            try {
+                resp = await fetch(url, { headers: apiHeaders() });
+            } catch (networkErr) {
+                // Thrown fetch (offline, DNS, CORS, etc.) — transient.
+                consecutiveFailures++;
+                if (consecutiveFailures >= POLL_MAX_CONSECUTIVE_FAILURES) {
+                    throw new Error('Lost connection to the server. Please try again.');
+                }
+                showSpinner('Connection lost, retrying…');
+                continue;
+            }
+
+            // Terminal cases: stop polling immediately, don't retry.
+            if (resp.status === 401 || resp.status === 403) {
+                throw new Error('Invalid or missing API key.');
+            }
+            if (resp.status === 404) {
+                throw new Error('Job not found.');
+            }
+
+            // 5xx/429 are transient — retry up to POLL_MAX_CONSECUTIVE_FAILURES in a row.
+            if (resp.status === 429 || resp.status >= 500) {
+                consecutiveFailures++;
+                if (consecutiveFailures >= POLL_MAX_CONSECUTIVE_FAILURES) {
+                    throw new Error('Lost connection to the server. Please try again.');
+                }
+                showSpinner('Connection lost, retrying…');
+                continue;
+            }
+
             if (!resp.ok) throw new Error(`Poll error: ${resp.status}`);
+
+            consecutiveFailures = 0;
             const data = await resp.json();
             if (data.status === 'completed') return data.result;
             if (data.status === 'failed') throw new Error(data.error || 'Scan failed');
@@ -179,6 +220,14 @@ function wireFeedbackButtons(container) {
         card.querySelectorAll('button[data-vote]').forEach((btn) => {
             btn.addEventListener('click', async () => {
                 const vote = Number(btn.getAttribute('data-vote'));
+                const allButtons = card.querySelectorAll('button[data-vote]');
+                const prevOpacities = new Map();
+                allButtons.forEach((b) => prevOpacities.set(b, b.style.opacity));
+
+                // Optimistically highlight the chosen vote.
+                allButtons.forEach((b) => (b.style.opacity = '0.35'));
+                btn.style.opacity = '1';
+
                 try {
                     const resp = await fetch(`${API_HOST}/api/v1/feedback/`, {
                         method: 'POST',
@@ -186,15 +235,30 @@ function wireFeedbackButtons(container) {
                         body: JSON.stringify({ finding_id: findingId, vote }),
                     });
                     if (!resp.ok) throw new Error(`Feedback error: ${resp.status}`);
-                    // Highlight the chosen vote.
-                    card.querySelectorAll('button[data-vote]').forEach((b) => (b.style.opacity = '0.35'));
-                    btn.style.opacity = '1';
                 } catch (err) {
                     console.error('Feedback failed:', err);
+                    // Revert the optimistic highlight so the user can retry.
+                    allButtons.forEach((b) => (b.style.opacity = prevOpacities.get(b)));
+                    showVoteError(card);
                 }
             });
         });
     });
+}
+
+function showVoteError(card) {
+    const headerRow = card.querySelector('.feedback').parentElement;
+    let msg = card.querySelector('.fb-error');
+    if (!msg) {
+        msg = document.createElement('div');
+        msg.className = 'fb-error';
+        msg.style.cssText = 'font-size:0.75rem; color:var(--accent-red); margin-top:4px;';
+        headerRow.insertAdjacentElement('afterend', msg);
+    }
+    // Goes through textContent, never innerHTML.
+    msg.textContent = 'Vote failed — try again';
+    clearTimeout(msg._clearTimer);
+    msg._clearTimer = setTimeout(() => msg.remove(), 4000);
 }
 
 function escapeHtml(s) {

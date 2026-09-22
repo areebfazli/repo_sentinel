@@ -285,9 +285,7 @@ async def _run_scan_guarded(scan_id: str, merger, router) -> None:
             allowed_cves = {c.get("cve_id") for c in cves if c.get("cve_id")}
             allowed_prs = {str(t.get("pr_id")) for t in team if t.get("pr_id")}
             user_prompt = build_user_prompt(prompt_code, cves, team)
-            llm_json, provider_used = await asyncio.to_thread(
-                router.generate, SYSTEM_PROMPT, user_prompt
-            )
+            llm_json, provider_used = await router.generate(SYSTEM_PROMPT, user_prompt)
             validated = validate_findings(llm_json.get("findings", []), allowed_cves, allowed_prs)
             report_findings = _build_report_findings(validated, row_snaps)
             report_markdown = render_markdown(validated, len(cves), len(team)) + extra_note

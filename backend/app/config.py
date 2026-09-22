@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     GROQ_MODEL: str = "llama-3.3-70b-versatile"
     GEMINI_MODEL: str = "gemini-2.0-flash"
     LLM_TIMEOUT_SECONDS: int = 60
+    LLM_RETRIES: int = 1                 # same-provider retries on 429/5xx/timeout
 
     # Service URLs (for production)
     DATABASE_URL: str | None = None

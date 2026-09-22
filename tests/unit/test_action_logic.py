@@ -1,5 +1,8 @@
 """Unit tests for the GitHub Action's pure decision logic."""
+from github_action import scan_pr
 from github_action.scan_pr import (
+    _apply_comment_ops,
+    _check,
     anchor_line,
     build_comment_body,
     build_summary,
@@ -10,6 +13,15 @@ from github_action.scan_pr import (
     plan_comment_ops,
     severity_gate,
 )
+
+
+class _FakeResp:
+    """Minimal stand-in for requests.Response, enough for _check/_apply_comment_ops."""
+
+    def __init__(self, status_code, text=""):
+        self.status_code = status_code
+        self.text = text
+        self.ok = status_code < 400
 
 
 def test_parse_changed_lines_skips_headers():
@@ -145,3 +157,76 @@ def test_build_summary_wraps_report_markdown():
     empty = build_summary("", "none")
     assert "✅" in empty
     assert extract_marker(empty) == "reposentinel:summary"
+
+
+def test_check_success_and_failure(capsys):
+    assert _check(_FakeResp(200), "PATCH inline comment 1") is True
+    out = capsys.readouterr().out
+    assert out == ""  # no warning logged on success
+
+    assert _check(_FakeResp(422, "validation failed"), "PATCH inline comment 1") is False
+    out = capsys.readouterr().out
+    assert "PATCH inline comment 1" in out
+    assert "422" in out
+    assert "validation failed" in out
+
+
+def test_check_delete_404_counts_as_success(capsys):
+    # The comment is already gone — that's the desired end state, not a failure.
+    assert _check(_FakeResp(404, "Not Found"), "DELETE inline comment 5", ok_404=True) is True
+    assert capsys.readouterr().out == ""
+    # Without ok_404, a 404 is still a failure (e.g. PATCH on a vanished comment).
+    assert _check(_FakeResp(404, "Not Found"), "PATCH inline comment 5") is False
+
+
+def test_check_failure_count_with_mixed_results():
+    results = [
+        _check(_FakeResp(200), "op 1"),
+        _check(_FakeResp(500, "boom"), "op 2"),
+        _check(_FakeResp(204), "op 3"),
+        _check(_FakeResp(403, "forbidden"), "op 4"),
+    ]
+    failures = sum(1 for ok in results if not ok)
+    assert failures == 2
+
+
+def test_apply_comment_ops_continues_after_failed_patch(monkeypatch, capsys):
+    # First PATCH fails, second PATCH and the DELETE must still run afterward,
+    # and no exception should propagate out of _apply_comment_ops.
+    patch_calls, delete_calls = [], []
+
+    def fake_patch(url, **kwargs):
+        patch_calls.append(url)
+        if len(patch_calls) == 1:
+            return _FakeResp(500, "server error")
+        return _FakeResp(200)
+
+    def fake_delete(url, **kwargs):
+        delete_calls.append(url)
+        return _FakeResp(200)
+
+    monkeypatch.setattr(scan_pr.requests, "patch", fake_patch)
+    monkeypatch.setattr(scan_pr.requests, "delete", fake_delete)
+
+    ops = {
+        "create": [],
+        "update": [{"id": 1, "body": "a"}, {"id": 2, "body": "b"}],
+        "delete": [3],
+    }
+    posted, failures = _apply_comment_ops("o/r", 1, "sha", "tok", ops)
+
+    assert posted is True
+    assert len(patch_calls) == 2  # both PATCHes ran despite the first failing
+    assert len(delete_calls) == 1  # the DELETE still ran afterward
+    assert failures == 1
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_apply_comment_ops_delete_404_not_counted_as_failure(monkeypatch):
+    monkeypatch.setattr(scan_pr.requests, "delete", lambda url, **kw: _FakeResp(404, "gone"))
+
+    ops = {"create": [], "update": [], "delete": [42]}
+    posted, failures = _apply_comment_ops("o/r", 1, "sha", "tok", ops)
+
+    assert posted is True
+    assert failures == 0

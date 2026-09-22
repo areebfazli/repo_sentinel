@@ -255,8 +255,28 @@ def desired_comments(findings: list[dict], changed_by_file: dict[str, list[int]]
     return desired, unanchored
 
 
+def _check(resp, what: str, *, ok_404: bool = False) -> bool:
+    """Check a GitHub API response, logging a warning on failure. Never raises.
+
+    ok_404 marks a 404 as success too (DELETE on an already-gone comment is the
+    desired end state, not a failure). Returns whether the call succeeded, so
+    callers can tally failures and keep processing the remaining operations.
+    """
+    if resp.ok or (ok_404 and resp.status_code == 404):
+        return True
+    snippet = (resp.text or "")[:200]
+    print(f"  WARNING: {what} failed (HTTP {resp.status_code}): {snippet}")
+    return False
+
+
 def _apply_comment_ops(repo, pr_number, head_sha, token, ops):
-    """Execute create (one review) / update (PATCH) / delete (DELETE). Returns False on 403."""
+    """Execute create (one review) / update (PATCH) / delete (DELETE).
+
+    Returns (posted, failures): posted is False on 403 (fork PR — unchanged
+    fallback behavior); failures is how many PATCH/DELETE calls failed. A bad
+    update/delete is logged and skipped, not raised, so it can't abort the rest.
+    """
+    failures = 0
     try:
         if ops["create"]:
             comments = [
@@ -270,45 +290,51 @@ def _apply_comment_ops(repo, pr_number, head_sha, token, ops):
                 timeout=30,
             )
             if r.status_code == 403:
-                return False
+                return False, failures
             r.raise_for_status()
         for up in ops["update"]:
-            requests.patch(
+            r = requests.patch(
                 f"{GITHUB_API}/repos/{repo}/pulls/comments/{up['id']}",
                 headers=_gh_headers(token),
                 json={"body": up["body"]},
                 timeout=30,
             )
+            if not _check(r, f"PATCH inline comment {up['id']}"):
+                failures += 1
         for cid in ops["delete"]:
-            requests.delete(
+            r = requests.delete(
                 f"{GITHUB_API}/repos/{repo}/pulls/comments/{cid}",
                 headers=_gh_headers(token),
                 timeout=30,
             )
-        return True
+            if not _check(r, f"DELETE inline comment {cid}", ok_404=True):
+                failures += 1
+        return True, failures
     except requests.HTTPError as exc:
         if exc.response is not None and exc.response.status_code == 403:
-            return False
+            return False, failures
         raise
 
 
-def _upsert_summary(repo, pr_number, token, body):
+def _upsert_summary(repo, pr_number, token, body) -> bool:
+    """Create or update the summary comment. Returns whether it succeeded."""
     existing = _gh_paginated(f"{GITHUB_API}/repos/{repo}/issues/{pr_number}/comments", token)
     for c in existing:
         if extract_marker(c.get("body", "")) == "reposentinel:summary":
-            requests.patch(
+            r = requests.patch(
                 f"{GITHUB_API}/repos/{repo}/issues/comments/{c['id']}",
                 headers=_gh_headers(token),
                 json={"body": body},
                 timeout=30,
             )
-            return
-    requests.post(
+            return _check(r, f"PATCH summary comment {c['id']}")
+    r = requests.post(
         f"{GITHUB_API}/repos/{repo}/issues/{pr_number}/comments",
         headers=_gh_headers(token),
         json={"body": body},
         timeout=30,
     )
+    return _check(r, "POST summary comment")
 
 
 def main() -> int:
@@ -352,12 +378,15 @@ def main() -> int:
         existing = _gh_paginated(f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}/comments", token)
         existing = [c for c in existing if extract_marker(c.get("body", ""))]
         ops = plan_comment_ops(existing, desired)
-        posted = _apply_comment_ops(repo, pr_number, head_sha, token, ops)
+        posted, failures = _apply_comment_ops(repo, pr_number, head_sha, token, ops)
         if not posted:
             print("No write access (fork PR?); findings above stand in for inline comments.")
             for d in desired:
                 print(f"  {d['path']}:{d['line']} — {d['body'].splitlines()[0]}")
-        _upsert_summary(repo, pr_number, token, summary)
+        if not _upsert_summary(repo, pr_number, token, summary):
+            failures += 1
+        if failures:
+            print(f"{failures} comment operation(s) failed")
 
     exit_code = severity_gate(findings, gate)
     print(f"Severity gate ({gate}) -> exit {exit_code}")

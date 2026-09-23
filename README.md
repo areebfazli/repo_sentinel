@@ -137,7 +137,7 @@ Settings come from `.env` via Pydantic (`backend/app/config.py`). Highlights:
 | `ENVIRONMENT` | `development` | `development` = file Qdrant + SQLite (Docker-free); `production` = networked Qdrant + Postgres |
 | `EMBEDDING_MODEL` | `jinaai/jina-embeddings-v2-base-code` | Mean-pooled, 768-dim; needs `EMBEDDING_TRUST_REMOTE_CODE=True` |
 | `SIM_THRESHOLD_CVE` | `0.25` | Similarity gate, tuned for high recall |
-| `RERANK_THRESHOLD` | `0.0` | bge gives near-0.5 sigmoid scores on code pairs; it only provides ordering |
+| `RERANK_THRESHOLD` | `0.0` | Gate on `sigmoid(logit)`; keep-all until calibrated by the reranker eval (the old 0.50–0.73 range was a double-sigmoid bug) |
 | `TWIN_MARGIN_MIN` | (off) | Drop CVE matches that look at least as much like the stored fix as like the bug; calibrate with `run_eval --margin-sweep` |
 | `LLM_PROVIDER` / `LLM_FALLBACK_PROVIDER` | `groq` / `gemini` | OpenAI-compatible endpoints; primary → fallback |
 | `GROQ_API_KEY` / `GEMINI_API_KEY` | (none) | A configured provider with a missing key **hard-fails at startup** |

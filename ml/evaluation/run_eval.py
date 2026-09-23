@@ -37,7 +37,6 @@ the sample/seed, and gather() timing (embed / ANN / rerank seconds).
 import argparse
 import hashlib
 import json
-import math
 import random
 import sys
 import time
@@ -62,13 +61,6 @@ DEFAULT_RERANK_SWEEP = "0.0:0.9:0.1"
 # similarity >= 0, so rerank_t = 0.0 is a no-op rather than a second sim gate.
 NO_RERANK_THRESHOLD = 0.0
 PAIR_SUFFIXES = ("_vuln", "_safe")
-
-
-def sigmoid(x: float) -> float:
-    if x >= 0:
-        return 1.0 / (1.0 + math.exp(-x))
-    z = math.exp(x)
-    return z / (1.0 + z)
 
 
 def load_dataset(path: Path) -> list[dict]:
@@ -232,7 +224,9 @@ def gather(
                 # rerank_score is fabricated.
                 prob = sim
             else:
-                prob = sigmoid(float(c["rerank_score"])) if "rerank_score" in c else 0.0
+                # Reranker already sets rerank_prob = sigmoid(raw logit); don't
+                # re-apply sigmoid here (that double-squashed it into [0.5, 0.73]).
+                prob = float(c.get("rerank_prob", 0.0))
             scored.append(
                 {
                     "similarity_score": sim,

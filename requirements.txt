@@ -18,7 +18,7 @@ tree-sitter-java>=0.23
 # Machine Learning & Embeddings
 torch>=2.4.0
 transformers>=4.40.1,<5  # jina-embeddings-v2 remote code targets the 4.x API
-sentence-transformers>=2.7.0
+sentence-transformers>=4.0  # CrossEncoder activation_fn kwarg (reranker.py)
 
 # Vector Database
 qdrant-client>=1.10.0

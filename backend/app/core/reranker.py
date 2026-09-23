@@ -3,8 +3,19 @@ from typing import Any
 
 import torch
 from sentence_transformers import CrossEncoder
+from torch import nn
 
 from backend.app.config import settings
+
+# CrossEncoder.predict applies the model's activation_fn, which for a
+# single-label model (num_labels=1: bge-reranker-v2-m3, ms-marco) defaults to
+# nn.Sigmoid — so predict() returns probabilities, not logits. Sigmoid-ing that
+# again squashed every rerank_prob into [0.5, 0.731] (the old "bge gives ~0.5"
+# artefact). We pass nn.Identity so predict() returns the raw logit, store it as
+# rerank_score, and apply _sigmoid exactly once for rerank_prob. The identity is
+# passed both at construction and per predict() call, so a model whose saved
+# config names another activation can't reintroduce it.
+_LOGITS = nn.Identity()
 
 
 def _sigmoid(x: float) -> float:
@@ -29,7 +40,9 @@ class Reranker:
         print(f"Initializing Cross-Encoder Reranker on device: {self.device}")
 
         # We use bge-reranker-v2-m3, a general-purpose multilingual cross-encoder reranker
-        self.model = CrossEncoder(model_name, max_length=max_tokens, device=self.device)
+        self.model = CrossEncoder(
+            model_name, max_length=max_tokens, device=self.device, activation_fn=_LOGITS
+        )
 
     def rerank(
         self, query_code: str, candidates: list[dict[str, Any]], top_k: int = 1
@@ -38,8 +51,9 @@ class Reranker:
 
         Each candidate is compared using its ``rerank_text`` (e.g. the CVE's
         vulnerable code, for code-to-code matching), falling back to
-        ``description``. Attaches ``rerank_score`` (raw logit) and ``rerank_prob``
-        (sigmoid) and returns the top_k by score.
+        ``description``. Attaches ``rerank_score`` (raw logit, unbounded) and
+        ``rerank_prob`` (sigmoid of that logit, in (0, 1)) and returns the top_k
+        by score.
         """
         if not candidates:
             return []
@@ -48,7 +62,9 @@ class Reranker:
             [query_code, c.get("rerank_text") or c.get("description", "")]
             for c in candidates
         ]
-        scores = self.model.predict(pairs, batch_size=settings.RERANKER_BATCH_SIZE)
+        scores = self.model.predict(
+            pairs, batch_size=settings.RERANKER_BATCH_SIZE, activation_fn=_LOGITS
+        )
 
         for i, candidate in enumerate(candidates):
             score = float(scores[i])

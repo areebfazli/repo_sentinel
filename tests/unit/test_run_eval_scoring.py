@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from backend.app.core.reranker import _sigmoid
 from ml.evaluation import run_eval
 
 
@@ -115,7 +116,8 @@ class StubVectorStore:
 
 
 class StubReranker:
-    """Sets rerank_score (a raw logit) from a cve_id lookup, like the real one."""
+    """Sets rerank_score (a raw logit) and rerank_prob = sigmoid(logit) from a
+    cve_id lookup, like the real one."""
 
     def __init__(self, logits):
         self._logits = logits
@@ -125,6 +127,7 @@ class StubReranker:
         self.calls += 1
         for c in candidates:
             c["rerank_score"] = self._logits.get(c["cve_id"], 0.0)
+            c["rerank_prob"] = _sigmoid(c["rerank_score"])
         return sorted(candidates, key=lambda c: c["rerank_score"], reverse=True)[:top_k]
 
 
@@ -288,12 +291,43 @@ def test_gather_reports_timing(capsys):
     assert all(timing[k] >= 0 for k in timing)
     assert timing["total_seconds"] >= timing["embed_seconds"] + timing["ann_seconds"] - 1e-3
     assert reranker.calls == 1  # empty candidate list skips the reranker
-    assert gathered[0]["candidates"][0]["rerank_prob"] == run_eval.sigmoid(2.0)
+    assert gathered[0]["candidates"][0]["rerank_prob"] == _sigmoid(2.0)
     out = capsys.readouterr().out
     assert "[1/2]" in out and "[2/2]" in out
 
     _, empty = run_eval.gather([], StubEmbedder(), store, None, 10)
     assert empty["n_items"] == 0 and empty["seconds_per_item"] == 0.0
+
+
+def test_gather_does_not_double_apply_sigmoid(monkeypatch):
+    """gather() must pass the Reranker's rerank_prob through unchanged: the real
+    Reranker (stubbed CrossEncoder emitting logits) already applied sigmoid."""
+    import torch
+
+    from backend.app.core import reranker as reranker_mod
+
+    logits = {"code-CVE-1": -5.0, "code-CVE-2": 3.0}
+
+    class _CE:
+        def __init__(self, *a, **kw):
+            pass
+
+        def predict(self, pairs, batch_size=32, activation_fn=None, **kw):
+            raw = torch.tensor([logits[d] for _, d in pairs])
+            return (activation_fn or torch.nn.Sigmoid())(raw).numpy()
+
+    monkeypatch.setattr(reranker_mod, "CrossEncoder", _CE)
+    real = reranker_mod.Reranker(model_name="stub", max_tokens=8)
+    store = StubVectorStore({"a": [_raw("CVE-1", "xss", 0.9), _raw("CVE-2", "sqli", 0.8)]})
+    gathered, _ = run_eval.gather(
+        [_ds_item("a_vuln", "vulnerable", "a")], StubEmbedder(), store, real, 10
+    )
+    probs = {c["cve_id"]: c["rerank_prob"] for c in gathered[0]["candidates"]}
+    assert probs["CVE-1"] == pytest.approx(_sigmoid(-5.0))
+    assert probs["CVE-2"] == pytest.approx(_sigmoid(3.0))
+    assert probs["CVE-1"] < 0.5  # the double sigmoid floored this at 0.5
+    assert probs["CVE-2"] != pytest.approx(_sigmoid(_sigmoid(3.0)))
+    assert not hasattr(run_eval, "sigmoid")
 
 
 def _write_jsonl(path, items):

@@ -65,11 +65,13 @@ class Settings(BaseSettings):
     # for jina-embeddings-v2-base-code + bge-reranker-v2-m3 — see baseline.json).
     # 0.25 gives recall 1.0; precision is ~flat at 0.5 across thresholds (a safe
     # query and its vulnerable twin embed alike), so the LLM report is the real
-    # precision filter and we favour recall. bge's sigmoid sits at 0.50-0.73 on
-    # code pairs (raw logit near zero) — it only provides ordering, hence 0.0.
+    # precision filter and we favour recall. The earlier "bge sigmoid is
+    # 0.50-0.73 on code pairs" was a double-sigmoid bug (fixed in reranker.py);
+    # true probabilities await the reranker eval (ROADMAP 1d), so
+    # RERANK_THRESHOLD stays 0.0 (keep all) until calibrated.
     SIM_THRESHOLD_CVE: float = 0.25
     SIM_THRESHOLD_TEAM: float = 0.25
-    RERANK_THRESHOLD: float = 0.0        # gate on sigmoid(logit); 0.0 = keep all reranked
+    RERANK_THRESHOLD: float = 0.0        # gate on rerank_prob = sigmoid(logit); 0.0 = keep all
     RETRIEVAL_TOP_K: int = 3             # findings returned per collection
     ANN_CANDIDATES: int = 10             # broad ANN recall before reranking
     # Patched-twin gate (ROADMAP 1b): drop a CVE candidate whose twin_margin

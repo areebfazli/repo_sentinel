@@ -1,4 +1,6 @@
 """Unit tests for retriever filtering logic using stub components (no ML models)."""
+import math
+
 from backend.app.config import settings
 from backend.app.core.cve_retriever import CVERetriever
 
@@ -33,7 +35,9 @@ class StubReranker:
         for c in candidates:
             self.seen_pairs.append((c.get("cve_id"), c.get("rerank_text")))
             c["rerank_prob"] = self._probs.get(c["cve_id"], 0.0)
-            c["rerank_score"] = c["rerank_prob"]
+            # Real Reranker: rerank_score is the raw logit, prob = sigmoid(score).
+            p = min(max(c["rerank_prob"], 1e-9), 1 - 1e-9)
+            c["rerank_score"] = math.log(p / (1 - p))
         ranked = sorted(candidates, key=lambda c: c["rerank_prob"], reverse=True)
         return ranked[:top_k]
 

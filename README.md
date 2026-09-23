@@ -238,7 +238,7 @@ python scripts/build_corpus_from_osv.py --ecosystem PyPI --ecosystem npm --max-a
 - Writes `data/cve_corpus/osv_{pypi,npm}.json` (same shape as `sample_cves.json`, plus
   `fixed_code`/`repo`/`commit`/`file_path`/`function_name`) — feed it to
   `scripts/ingest_cve_corpus.py` like any other corpus file.
-- Writes `ml/evaluation/datasets/detection_eval_osv.jsonl` (two lines per held-out pair: one
+- Writes `ml/evaluation/datasets/detection_eval_osv_{pypi,npm}.jsonl` (two lines per held-out pair: one
   `vulnerable`, one `safe`), in the same format as `detection_eval.jsonl`.
 - Caches the OSV zip and every raw GitHub API response under `data/osv_cache/` (gitignored),
   keyed by request URL, so re-runs — especially `--resume` — make zero redundant API calls.

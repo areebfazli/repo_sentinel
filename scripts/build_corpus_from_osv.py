@@ -8,7 +8,7 @@ changed inside the commit's diff hunks. Emits:
 - ``{out-dir}/osv_{ecosystem}.json``: a corpus in the same shape as
   ``sample_cves.json`` (plus ``fixed_code``/``repo``/``commit``/... fields),
   ready for ``scripts/ingest_cve_corpus.py``.
-- ``{eval-dir}/detection_eval_osv.jsonl``: a held-out eval set (vulnerable +
+- ``{eval-dir}/detection_eval_osv_{ecosystem}.jsonl``: a held-out eval set (vulnerable +
   fixed line per pair) in the same JSONL shape as ``detection_eval.jsonl``.
 - ``{out-dir}/rejected/osv_{ecosystem}_rejected.json``: pairs dropped by the
   quality filter, each with a ``reject_reason`` (a subdirectory, because the
@@ -1235,7 +1235,6 @@ def main() -> None:
         except json.JSONDecodeError:
             processed_state = {}
 
-    all_eval_lines: list[dict] = []
     advisories_attempted = 0
     rate_limited = False
 
@@ -1413,14 +1412,15 @@ def main() -> None:
         print(f"Wrote {len(corpus_kept)} corpus entries to {out_path}")
         print(f"Wrote {len(rejected)} rejected pairs (with reject_reason) to {rej_path}")
 
-        all_eval_lines.extend(build_eval_lines(eval_kept))
-
-    if all_eval_lines:
-        eval_path = eval_dir / "detection_eval_osv.jsonl"
-        with open(eval_path, "w", encoding="utf-8") as f:
-            for line in all_eval_lines:
-                f.write(json.dumps(line) + "\n")
-        print(f"Wrote {len(all_eval_lines)} eval lines to {eval_path}")
+        # One eval file per ecosystem, like the corpus: a run for one ecosystem
+        # must not overwrite another ecosystem's held-out set.
+        eval_lines = build_eval_lines(eval_kept)
+        if eval_lines:
+            eval_path = eval_dir / f"detection_eval_osv_{ecosystem.lower()}.jsonl"
+            with open(eval_path, "w", encoding="utf-8") as f:
+                for line in eval_lines:
+                    f.write(json.dumps(line) + "\n")
+            print(f"Wrote {len(eval_lines)} eval lines to {eval_path}")
 
     print_summary(stats, rate_limited)
 

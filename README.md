@@ -246,7 +246,31 @@ python scripts/build_corpus_from_osv.py --ecosystem PyPI --ecosystem npm --max-a
   practical ceiling; the script always respects `--max-advisories` and, on hitting the rate
   limit, stops cleanly with a clear message rather than crashing or hammering the API (pass
   `--wait-on-rate-limit` to sleep until it resets instead).
-- All of the pure logic — commit-URL parsing, diff-hunk overlap, the CWE→category table,
-  whitespace-only-change detection, the advisory split, and the dedupe key — lives in
-  importable, network-free module-level functions; see
+- **Quality filter.** Fix commits also touch bystander functions, so every pair gets a
+  `quality` object (an added field; ingest ignores it): `changed_stmt_lines` (removed + added
+  lines after dropping blank, comment and docstring lines, formatter re-wraps, and consistent
+  identifier renames), `rename_only`, `renamed_identifiers`, `security_rename`,
+  `security_tokens` (hits from the per-category `SECURITY_TOKENS` keyword table in the changed
+  lines), `functions_in_commit` and `files_in_commit`. The filter flags:
+  - `--min-changed-stmt-lines 1` (default) drops rename-only and comment/format-only pairs.
+  - `--max-functions-per-commit 6` (default; `0` disables) drops every pair from a broad
+    commit.
+  - `--drop-other` (off by default) drops pairs with no or an unmapped CWE.
+  - `--keep-security-renames` (on by default; `--no-keep-security-renames` to disable) keeps rename-only pairs whose renamed
+    identifier looks security-relevant (`md5` → `sha256`, `load` → `safe_load`).
+
+  A rename counts only if it is a consistent 1:1 mapping across the whole function. A semantic
+  swap such as `url(...)` → `url_for(...)` still counts as a rename, because token shape can't
+  tell it apart from a cosmetic one. Rejected pairs, each with a `reject_reason`, go to
+  `data/cve_corpus/rejected/osv_{eco}_rejected.json`. They sit in a subdirectory because ingest
+  loads every `data/cve_corpus/*.json`. The advisory split runs before the filter, so the
+  held-out advisories don't depend on the filter flags, and a rejected pair never reaches the
+  eval set. The summary prints kept and rejected counts by reason, the kept category mix and
+  the `other` share.
+- `--offline` reads only the cache and makes no network calls. To re-filter a finished run
+  (for example after changing the flags), run
+  `python scripts/build_corpus_from_osv.py --ecosystem PyPI --resume --offline --max-advisories 100000`.
+- All of the pure logic lives in importable, network-free module-level functions. That covers
+  commit-URL parsing, diff-hunk overlap, the CWE→category table, whitespace-only-change
+  detection, the advisory split, the dedupe key, and the quality score and filter. See
   `tests/unit/test_build_corpus_from_osv.py`.

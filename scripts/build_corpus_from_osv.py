@@ -10,31 +10,45 @@ changed inside the commit's diff hunks. Emits:
   ready for ``scripts/ingest_cve_corpus.py``.
 - ``{eval-dir}/detection_eval_osv.jsonl``: a held-out eval set (vulnerable +
   fixed line per pair) in the same JSONL shape as ``detection_eval.jsonl``.
+- ``{out-dir}/rejected/osv_{ecosystem}_rejected.json``: pairs dropped by the
+  quality filter, each with a ``reject_reason`` (a subdirectory, because the
+  ingest script loads every ``{out-dir}/*.json``).
 
 The held-out split is done **by advisory**, not by individual function pair, so
 no function in the eval set shares an advisory with anything left in the
 training corpus (see ``split_by_advisory``).
 
+Fix commits also touch bystander functions (renames, docstring edits, broad
+refactors). Every pair gets a ``quality`` dict (``compute_diff_quality`` +
+per-commit counts) and is filtered by ``--min-changed-stmt-lines``,
+``--max-functions-per-commit`` and ``--drop-other`` *after* the split, so the
+held-out advisories don't depend on those flags and a rejected pair never
+reaches the eval set (see ``build_ecosystem_outputs``).
+
 All pure logic (commit-URL parsing, hunk-header parsing, overlap checks, the
-CWE->category table, whitespace-only-change detection, the advisory split, and
-the dedupe key) lives in module-level functions with no network access, so it
-can be imported and unit-tested directly. Everything that talks to the network
-(downloading the OSV zip, calling the GitHub API) is confined to ``main()`` and
-the ``GithubClient`` class below.
+CWE->category table, whitespace-only-change detection, the advisory split, the
+dedupe key, and the quality score/filter) lives in module-level functions with
+no network access, so it can be imported and unit-tested directly. Everything
+that talks to the network (downloading the OSV zip, calling the GitHub API) is
+confined to ``main()`` and the ``GithubClient`` class below.
 
 GitHub API usage is rate-limit aware: every raw API response is cached in
 ``--cache-dir`` keyed by a hash of the request URL, so a ``--resume`` run (or
 simply re-running the script) makes zero redundant calls for anything already
 fetched. Without ``--wait-on-rate-limit``, the script stops cleanly (not a
 crash) the moment the rate limit is exhausted, always honouring
-``--max-advisories`` as an upper bound on API usage.
+``--max-advisories`` as an upper bound on API usage. ``--offline`` reads the
+cache only (no network at all), which is how to re-filter a finished run.
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import bisect
+import difflib
 import hashlib
 import json
+import keyword
 import math
 import random
 import re
@@ -325,6 +339,525 @@ def parse_cvss_score(severity_list: list[dict] | None) -> float | None:
 
 
 # ---------------------------------------------------------------------------
+# Per-pair quality score (pure). Fix commits often touch bystander functions:
+# identifier renames, docstring edits, or a broad refactor around the real fix.
+# ``compute_diff_quality`` measures how much *statement-level* code a pair's
+# vulnerable -> fixed diff really changes; ``apply_quality_filter`` drops the
+# noise. None of this feeds back into the split or the ids.
+# ---------------------------------------------------------------------------
+
+# Category -> regexes counted in a pair's changed lines (case-insensitive,
+# non-overlapping; longer patterns are tried first at each position). "other"
+# (and any category missing here) counts hits across the union of all lists.
+# Deliberately loose: a rough "does this diff touch security-relevant code"
+# signal for auditing, not a filter on its own. Tune freely.
+SECURITY_TOKENS: dict[str, list[str]] = {
+    "sqli": [r"execute", r"cursor", r"query", r"SELECT", r"%s", r"format", r"\bf[\"']"],
+    "cmd_injection": [r"subprocess", r"os\.system", r"popen", r"shell=", r"exec", r"eval"],
+    "path_traversal": [r"os\.path", r"open\(", r"join", r"realpath", r"normpath", r"\.\.",
+                       r"safe_join"],
+    "xss": [r"escape", r"Markup", r"innerHTML", r"sanitize", r"html"],
+    "ssrf": [r"requests\.", r"urlopen", r"http", r"url", r"host"],
+    "deserialization": [r"pickle", r"yaml\.load", r"marshal", r"unserialize"],
+    "weak_crypto": [r"md5", r"sha1", r"random", r"\bDES\b", r"RC4", r"hashlib"],
+    "open_redirect": [r"redirect", r"next", r"url"],
+    "authz": [r"permission", r"is_authenticated", r"role", r"owner", r"user\.id", r"403"],
+    "redos": [r"\bre\.", r"regex", r"compile", r"match"],
+    "xxe": [r"etree", r"lxml", r"resolve_entities", r"XMLParser"],
+    "secrets": [r"key", r"token", r"secret", r"password"],
+    "prototype_pollution": [r"__proto__", r"prototype", r"constructor", r"hasOwnProperty",
+                            r"Object\.assign", r"merge"],
+}
+
+# A rename-only pair is flagged ``security_rename`` when a renamed identifier
+# (either side) hits the category's SECURITY_TOKENS or one of these generic
+# markers: one-identifier security fixes (md5 -> sha256, yaml.load ->
+# yaml.safe_load, innerHTML -> textContent, abspath -> realpath) are
+# indistinguishable from cosmetic renames by token shape alone.
+SECURITY_RENAME_MARKERS: list[str] = [r"safe", r"secur", r"saniti[sz]", r"escape", r"valid"]
+
+_JS_KEYWORDS = frozenset(
+    "async await break case catch class const continue debugger default delete do else "
+    "export extends false finally for function if import in instanceof let new null of "
+    "return static super switch this throw true try typeof undefined var void while with "
+    "yield".split()
+)
+_KEYWORDS: dict[str, frozenset[str]] = {
+    "python": frozenset(keyword.kwlist),
+    "javascript": _JS_KEYWORDS,
+}
+
+# Token regexes. Group order matters: strings (with an optional Python prefix)
+# before identifiers, so ``f"..."`` is one string token, not ``f`` + string.
+# Operators are single characters — only consistency between the two sides
+# matters, and whitespace is never part of a token.
+_PY_TOKEN_RE = re.compile(
+    r"(?P<cont>\\\r?\n)"
+    r"|(?P<ws>\s+)"
+    r"|(?P<comment>#[^\n]*)"
+    r"|(?P<str>[rRbBuUfF]{0,2}(?:'''(?:\\.|[^\\])*?'''|\"\"\"(?:\\.|[^\\])*?\"\"\""
+    r"|'(?:\\.|[^'\\\n])*'|\"(?:\\.|[^\"\\\n])*\"))"
+    r"|(?P<num>\d[\w.]*|\.\d\w*)"
+    r"|(?P<id>[^\W\d]\w*)"
+    r"|(?P<op>\S)",
+    re.S,
+)
+_JS_TOKEN_RE = re.compile(
+    r"(?P<cont>\\\r?\n)"
+    r"|(?P<ws>\s+)"
+    r"|(?P<comment>//[^\n]*|/\*.*?(?:\*/|\Z))"
+    r"|(?P<str>'(?:\\.|[^'\\\n])*'|\"(?:\\.|[^\"\\\n])*\"|`(?:\\.|[^`\\])*`)"
+    r"|(?P<num>\d[\w.]*|\.\d\w*)"
+    r"|(?P<id>(?:[^\W\d]|\$)[\w$]*)"
+    r"|(?P<op>\S)",
+    re.S,
+)
+_STR_HEAD_RE = re.compile(r"([A-Za-z]*)('''|\"\"\"|'|\"|`)")
+
+
+@dataclass(frozen=True)
+class _Tok:
+    kind: str  # "id" | "kw" | "str" | "num" | "op"
+    text: str  # normalised text (strings: quote style dropped)
+    line: int  # 0-based line of the token's first character
+    start: int  # offsets into the source (for reconstructing line text)
+    end: int
+
+
+def _normalize_string_literal(raw: str) -> str:
+    """``'a'``, ``"a"`` and ``'''a'''`` compare equal (quote style is cosmetic);
+    the prefix (``f``, ``b``, ...) and the body are kept."""
+    m = _STR_HEAD_RE.match(raw)
+    if not m:
+        return raw
+    prefix, quote = m.group(1).lower(), m.group(2)
+    body = raw[m.end():]
+    if body.endswith(quote):
+        body = body[: -len(quote)]
+    return f"{prefix}|{body}"
+
+
+def tokenize_code(code: str, language: str) -> list[_Tok]:
+    """Tokenise ``code`` into statement tokens: comments are dropped, and in
+    Python so are docstrings (any string literal that forms a whole statement —
+    a no-op, so dropping every such string, not just the first, is safe).
+    Multi-line strings are one token attributed to their first line."""
+    token_re = _JS_TOKEN_RE if language == "javascript" else _PY_TOKEN_RE
+    keywords = _KEYWORDS.get(language, frozenset())
+    line_starts = [0] + [m.end() for m in re.finditer(r"\n", code)]
+
+    def line_of(offset: int) -> int:
+        return bisect.bisect_right(line_starts, offset) - 1
+
+    raw: list[_Tok] = []
+    continued: set[int] = set()  # indexes of tokens preceded by a backslash-newline
+    for m in token_re.finditer(code):
+        kind = m.lastgroup
+        if kind in ("ws", "comment"):
+            continue
+        if kind == "cont":
+            continued.add(len(raw))
+            continue
+        text = m.group()
+        if kind == "id" and text in keywords:
+            kind = "kw"
+        elif kind == "str":
+            text = _normalize_string_literal(text)
+        raw.append(_Tok(kind, text, line_of(m.start()), m.start(), m.end()))
+
+    if language == "python":
+        raw = _drop_python_docstrings(raw, continued, line_of)
+    # Drop a formatter's "magic" trailing comma (a ``,`` whose closing bracket is
+    # on a later line), so re-wrapping a call one-arg-per-line is not a change.
+    return [
+        t
+        for i, t in enumerate(raw)
+        if not (
+            t.kind == "op"
+            and t.text == ","
+            and i + 1 < len(raw)
+            and raw[i + 1].kind == "op"
+            and raw[i + 1].text in ")]}"
+            and raw[i + 1].line > t.line
+        )
+    ]
+
+
+def _drop_python_docstrings(raw: list[_Tok], continued: set[int], line_of) -> list[_Tok]:
+    """Drop Python string-statement "docstrings": a run of adjacent string tokens
+    that starts a logical line (depth 0, previous token on an earlier line, no
+    backslash continuation) and is followed by a new line, a ';', or EOF."""
+    out: list[_Tok] = []
+    depth = 0
+    i = 0
+    while i < len(raw):
+        tok = raw[i]
+        starts_line = depth == 0 and i not in continued and (
+            i == 0 or line_of(raw[i - 1].end - 1) < tok.line
+        )
+        if tok.kind == "str" and starts_line:
+            j = i
+            while (
+                j + 1 < len(raw)
+                and raw[j + 1].kind == "str"
+                and raw[j + 1].line == line_of(raw[j].end - 1)
+            ):
+                j += 1
+            nxt = raw[j + 1] if j + 1 < len(raw) else None
+            if nxt is None or (
+                (j + 1) not in continued
+                and (nxt.line > line_of(raw[j].end - 1) or nxt.text == ";")
+            ):
+                i = j + 1
+                continue
+        if tok.kind == "op":
+            if tok.text in "([{":
+                depth += 1
+            elif tok.text in ")]}":
+                depth = max(depth - 1, 0)
+        out.append(tok)
+        i += 1
+    return out
+
+
+def _code_lines(code: str, language: str) -> list[list[_Tok]]:
+    """Group statement tokens by source line; lines with no statement tokens
+    (blank, comment-only, docstring, or inside a multi-line string) vanish."""
+    by_line: dict[int, list[_Tok]] = defaultdict(list)
+    for tok in tokenize_code(code, language):
+        by_line[tok.line].append(tok)
+    return [by_line[n] for n in sorted(by_line)]
+
+
+def _line_key(line: list[_Tok]) -> tuple:
+    return tuple((t.kind, t.text) for t in line)
+
+
+def _shape_key(line: list[_Tok]) -> tuple:
+    """Like ``_line_key`` but with identifiers anonymised."""
+    return tuple((t.kind, "" if t.kind == "id" else t.text) for t in line)
+
+
+def _identifier_pairs(old: list[_Tok], new: list[_Tok]) -> list[tuple[str, str]] | None:
+    """If ``old`` and ``new`` are the same token stream up to identifier names,
+    return the aligned ``(old_id, new_id)`` pairs; else ``None``."""
+    if len(old) != len(new):
+        return None
+    pairs = []
+    for a, b in zip(old, new, strict=True):
+        if a.kind != b.kind:
+            return None
+        if a.kind == "id":
+            pairs.append((a.text, b.text))
+        elif a.text != b.text:
+            return None
+    return pairs
+
+
+def _line_text(code: str, line: list[_Tok]) -> str:
+    return code[line[0].start: line[-1].end]
+
+
+def count_security_tokens(text: str, category: str) -> int:
+    """Hits of ``SECURITY_TOKENS[category]`` in ``text`` (union of every list
+    for "other" or an unlisted category)."""
+    patterns = SECURITY_TOKENS.get(category)
+    if not patterns:
+        patterns = list(dict.fromkeys(p for ps in SECURITY_TOKENS.values() for p in ps))
+    ordered = sorted(patterns, key=len, reverse=True)
+    regex = re.compile("|".join(f"(?:{p})" for p in ordered), re.I)
+    return len(regex.findall(text))
+
+
+def compute_diff_quality(
+    vulnerable_code: str, fixed_code: str, language: str, category: str
+) -> dict:
+    """Statement-level diff metrics for one vulnerable -> fixed pair.
+
+    1. Both sides are tokenised (comments, docstrings, whitespace and quote
+       style dropped) and grouped into code lines; the line lists are diffed.
+    2. Every changed block is checked for "same token stream up to identifier
+       names" — the whole block first (catches re-wrapped lines), then line by
+       line via a second diff on identifier-anonymised lines. Each match yields
+       candidate ``old_id -> new_id`` pairs.
+    3. A rename is accepted only if it is a consistent 1:1 mapping across the
+       *whole function*: unchanged lines contribute ``x -> x`` identities, and
+       an identifier mapped to two names (or two identifiers mapped to one
+       name) invalidates every candidate that uses it. Accepted candidates are
+       rename-only and don't count; everything else does.
+
+    Returns ``changed_stmt_lines`` (removed + added code lines that survive
+    the above), ``rename_only`` (nothing counted but at least one accepted
+    rename), ``renamed_identifiers`` (the accepted ``{old: new}`` map),
+    ``security_rename`` (a renamed identifier looks security-relevant, see
+    ``SECURITY_RENAME_MARKERS``), and ``security_tokens``
+    (``count_security_tokens`` over every changed code line, renamed lines
+    included).
+    """
+    old_lines = _code_lines(vulnerable_code, language)
+    new_lines = _code_lines(fixed_code, language)
+
+    forward: dict[str, set[str]] = defaultdict(set)
+    reverse: dict[str, set[str]] = defaultdict(set)
+
+    def constrain(pairs) -> None:
+        for a, b in pairs:
+            forward[a].add(b)
+            reverse[b].add(a)
+
+    candidates: list[tuple[list[int], list[int], list[tuple[str, str]]]] = []
+    real_old: list[int] = []
+    real_new: list[int] = []
+    changed_old: list[int] = []
+    changed_new: list[int] = []
+
+    outer = difflib.SequenceMatcher(
+        None, [_line_key(ln) for ln in old_lines], [_line_key(ln) for ln in new_lines],
+        autojunk=False,
+    )
+    for tag, i1, i2, j1, j2 in outer.get_opcodes():
+        if tag == "equal":
+            for ln in old_lines[i1:i2]:
+                constrain((t.text, t.text) for t in ln if t.kind == "id")
+            continue
+        changed_old.extend(range(i1, i2))
+        changed_new.extend(range(j1, j2))
+        if tag != "replace":
+            real_old.extend(range(i1, i2))
+            real_new.extend(range(j1, j2))
+            continue
+        block_pairs = _identifier_pairs(
+            [t for ln in old_lines[i1:i2] for t in ln],
+            [t for ln in new_lines[j1:j2] for t in ln],
+        )
+        if block_pairs is not None:
+            candidates.append((list(range(i1, i2)), list(range(j1, j2)), block_pairs))
+            constrain(block_pairs)
+            continue
+        inner = difflib.SequenceMatcher(
+            None,
+            [_shape_key(ln) for ln in old_lines[i1:i2]],
+            [_shape_key(ln) for ln in new_lines[j1:j2]],
+            autojunk=False,
+        )
+        for itag, a1, a2, b1, b2 in inner.get_opcodes():
+            if itag != "equal":
+                real_old.extend(range(i1 + a1, i1 + a2))
+                real_new.extend(range(j1 + b1, j1 + b2))
+                continue
+            for k in range(a2 - a1):
+                oi, ni = i1 + a1 + k, j1 + b1 + k
+                pairs = _identifier_pairs(old_lines[oi], new_lines[ni])
+                if pairs is None:  # unreachable (equal shapes), but stay safe
+                    real_old.append(oi)
+                    real_new.append(ni)
+                    continue
+                candidates.append(([oi], [ni], pairs))
+                constrain(pairs)
+
+    renamed: dict[str, str] = {}
+    for olds, news, pairs in candidates:
+        if all(len(forward[a]) == 1 and len(reverse[b]) == 1 for a, b in pairs):
+            renamed.update({a: b for a, b in pairs if a != b})
+        else:
+            real_old.extend(olds)
+            real_new.extend(news)
+
+    changed_stmt_lines = len(set(real_old)) + len(set(real_new))
+    changed_text = "\n".join(
+        [_line_text(vulnerable_code, old_lines[i]) for i in changed_old]
+        + [_line_text(fixed_code, new_lines[j]) for j in changed_new]
+    )
+    renamed_text = " ".join([*renamed, *renamed.values()])
+    security_rename = bool(renamed) and (
+        count_security_tokens(renamed_text, category) > 0
+        or re.search("|".join(SECURITY_RENAME_MARKERS), renamed_text, re.I) is not None
+    )
+    return {
+        "changed_stmt_lines": changed_stmt_lines,
+        "rename_only": changed_stmt_lines == 0 and bool(renamed),
+        "renamed_identifiers": dict(sorted(renamed.items())),
+        "security_rename": security_rename,
+        "security_tokens": count_security_tokens(changed_text, category),
+    }
+
+
+def commit_key(pair: dict) -> tuple[str, str]:
+    return pair["repo"], pair["commit"]
+
+
+def count_functions_per_commit(pairs: list[dict]) -> dict[tuple[str, str], int]:
+    """Distinct ``(file_path, function_name)`` pairs each commit produced (so a
+    commit shared by a GHSA and a PYSEC advisory is not double-counted)."""
+    seen: dict[tuple[str, str], set[tuple[str, str]]] = defaultdict(set)
+    for p in pairs:
+        seen[commit_key(p)].add((p["file_path"], p["function_name"]))
+    return {k: len(v) for k, v in seen.items()}
+
+
+def code_files_in_commit(commit_data: dict | None) -> int | None:
+    """Number of supported-language files the commit touched (any status),
+    excluding test/docs/example paths — the same files the pairing considers."""
+    if not commit_data or commit_data.get("__status__") == 404:
+        return None
+    return sum(
+        1
+        for f in commit_data.get("files") or []
+        if Path(f.get("filename", "")).suffix.lower() in SUPPORTED_EXTENSIONS
+        and not _is_skipped_path(f.get("filename", ""))
+    )
+
+
+def annotate_quality(
+    pairs: list[dict], files_in_commit: dict[tuple[str, str], int | None]
+) -> list[dict]:
+    """Return copies of ``pairs`` with a ``quality`` dict attached (the input
+    dicts, which are also the resumable cache state, are left untouched)."""
+    funcs = count_functions_per_commit(pairs)
+    out = []
+    for p in pairs:
+        q = compute_diff_quality(
+            p["vulnerable_code"], p["fixed_code"], p["language"], p["category"]
+        )
+        q["functions_in_commit"] = funcs[commit_key(p)]
+        q["files_in_commit"] = files_in_commit.get(commit_key(p))
+        out.append({**p, "quality": q})
+    return out
+
+
+def quality_reject_reasons(
+    entry: dict,
+    min_changed_stmt_lines: int,
+    max_functions_per_commit: int,
+    drop_other: bool,
+    keep_security_renames: bool = False,
+) -> list[str]:
+    """Every filter an annotated entry fails, most specific first (empty = keep).
+    ``max_functions_per_commit <= 0`` disables the broad-commit cap;
+    ``keep_security_renames`` exempts rename-only pairs flagged
+    ``security_rename`` from the changed-lines minimum."""
+    q = entry["quality"]
+    reasons = []
+    exempt = keep_security_renames and q["rename_only"] and q["security_rename"]
+    if q["changed_stmt_lines"] < min_changed_stmt_lines and not exempt:
+        if q["rename_only"]:
+            reasons.append("rename_only")
+        elif q["changed_stmt_lines"] == 0:
+            reasons.append("comment_or_format_only")
+        else:
+            reasons.append("few_changed_stmt_lines")
+    if 0 < max_functions_per_commit < q["functions_in_commit"]:
+        reasons.append("broad_commit")
+    if drop_other and entry.get("category") == "other":
+        reasons.append("other_category")
+    return reasons
+
+
+def apply_quality_filter(
+    entries: list[dict],
+    min_changed_stmt_lines: int,
+    max_functions_per_commit: int,
+    drop_other: bool,
+    keep_security_renames: bool = False,
+) -> tuple[list[dict], list[dict]]:
+    """Split annotated entries into ``(kept, rejected)``; rejected copies carry
+    ``reject_reason`` (the first failing filter) and ``reject_reasons`` (all)."""
+    kept, rejected = [], []
+    for e in entries:
+        reasons = quality_reject_reasons(
+            e, min_changed_stmt_lines, max_functions_per_commit, drop_other,
+            keep_security_renames,
+        )
+        if reasons:
+            rejected.append({**e, "reject_reason": reasons[0], "reject_reasons": reasons})
+        else:
+            kept.append(e)
+    return kept, rejected
+
+
+def build_ecosystem_outputs(
+    pairs: list[dict],
+    files_in_commit: dict[tuple[str, str], int | None],
+    *,
+    eval_fraction: float,
+    seed: int,
+    min_changed_stmt_lines: int,
+    max_functions_per_commit: int,
+    drop_other: bool,
+    keep_security_renames: bool = False,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Annotate, split by advisory, then filter each side: returns
+    ``(corpus_kept, eval_kept, rejected)``.
+
+    The split runs on the *unfiltered* deduped pairs, exactly as before the
+    filter existed, so which advisories are held out never depends on the
+    filter flags (tuning them only removes items from either side, which keeps
+    evals under different settings comparable). Rejected pairs from either
+    side go only to ``rejected`` (tagged ``held_out``), never to the eval set.
+    """
+    annotated = annotate_quality(pairs, files_in_commit)
+    corpus_side, eval_side = split_by_advisory(annotated, eval_fraction, seed)
+    flt = dict(
+        min_changed_stmt_lines=min_changed_stmt_lines,
+        max_functions_per_commit=max_functions_per_commit,
+        drop_other=drop_other,
+        keep_security_renames=keep_security_renames,
+    )
+    corpus_kept, corpus_rej = apply_quality_filter(corpus_side, **flt)
+    eval_kept, eval_rej = apply_quality_filter(eval_side, **flt)
+    rejected = [{**e, "held_out": False} for e in corpus_rej] + [
+        {**e, "held_out": True} for e in eval_rej
+    ]
+    return corpus_kept, eval_kept, rejected
+
+
+def build_eval_lines(eval_pairs: list[dict]) -> list[dict]:
+    """Two ``detection_eval.jsonl``-shaped lines (vulnerable + safe) per pair."""
+    lines = []
+    for e in eval_pairs:
+        fn_token = re.sub(r"[^A-Za-z0-9_-]+", "_", e["function_name"])
+        adv_token = re.sub(r"[^A-Za-z0-9_-]+", "_", e["cve_id"])
+        base_id = f"{adv_token}_{fn_token}"
+        for suffix, label, code in (
+            ("vuln", "vulnerable", e["vulnerable_code"]),
+            ("safe", "safe", e["fixed_code"]),
+        ):
+            lines.append(
+                {
+                    "id": f"{base_id}_{suffix}",
+                    "language": e["language"],
+                    "label": label,
+                    "category": e["category"],
+                    "expected_cve_id": e["cve_id"],
+                    "source": "osv",
+                    "code": code,
+                }
+            )
+    return lines
+
+
+def rejected_path_for(out_dir: Path, ecosystem: str) -> Path:
+    """``{out_dir}/rejected/osv_{eco}_rejected.json`` — in a subdirectory on
+    purpose: ``ingest_cve_corpus.load_cves`` ingests every ``{out_dir}/*.json``
+    (non-recursive), so a rejected file next to the corpus would be ingested."""
+    return Path(out_dir) / "rejected" / f"osv_{ecosystem.lower()}_rejected.json"
+
+
+def write_ecosystem_outputs(
+    out_dir: Path, ecosystem: str, corpus_kept: list[dict], rejected: list[dict]
+) -> tuple[Path, Path]:
+    """Write the kept corpus (``advisory_id`` stripped, as before) and the
+    rejected audit file (``advisory_id`` kept). Returns both paths."""
+    out_path = Path(out_dir) / f"osv_{ecosystem.lower()}.json"
+    corpus_out = [{k: v for k, v in e.items() if k != "advisory_id"} for e in corpus_kept]
+    out_path.write_text(json.dumps(corpus_out, indent=2), encoding="utf-8")
+    rej_path = rejected_path_for(out_dir, ecosystem)
+    rej_path.parent.mkdir(parents=True, exist_ok=True)
+    rej_path.write_text(json.dumps(rejected, indent=2), encoding="utf-8")
+    return out_path, rej_path
+
+
+# ---------------------------------------------------------------------------
 # Network / filesystem side (not unit-tested; exercised by the tiny live run).
 # ---------------------------------------------------------------------------
 
@@ -348,6 +881,11 @@ class Stats:
     by_category: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     api_calls: int = 0
     cache_hits: int = 0
+    offline_misses: int = 0
+    offline_incomplete_advisories: int = 0
+    kept: int = 0
+    rejected_by_reason: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    kept_by_category: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     rate_remaining: int | None = None
     rate_reset: int | None = None
 
@@ -355,7 +893,9 @@ class Stats:
 class GithubClient:
     """Thin GitHub REST client: caches every response by URL hash, and turns a
     used-up rate limit into either a sleep-and-retry (``wait_on_rate_limit``) or
-    a clean ``RateLimitExceeded``."""
+    a clean ``RateLimitExceeded``. With ``offline=True`` it never touches the
+    network: a cache miss returns ``None`` and is counted in
+    ``stats.offline_misses``."""
 
     def __init__(
         self,
@@ -364,6 +904,7 @@ class GithubClient:
         cache_dir: Path,
         stats: Stats,
         wait_on_rate_limit: bool = False,
+        offline: bool = False,
     ):
         self.session = session
         self.token = token
@@ -371,12 +912,26 @@ class GithubClient:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.stats = stats
         self.wait_on_rate_limit = wait_on_rate_limit
+        self.offline = offline
+
+    def _cache_file(self, url: str) -> Path:
+        return self.cache_dir / f"{hashlib.sha256(url.encode()).hexdigest()}.json"
+
+    def get_cached_json(self, url: str) -> dict | None:
+        """The cached response for ``url``, or ``None`` — never a network call."""
+        cache_file = self._cache_file(url)
+        if not cache_file.exists():
+            return None
+        return json.loads(cache_file.read_text(encoding="utf-8"))
 
     def get_json(self, url: str) -> dict | None:
-        cache_file = self.cache_dir / f"{hashlib.sha256(url.encode()).hexdigest()}.json"
+        cache_file = self._cache_file(url)
         if cache_file.exists():
             self.stats.cache_hits += 1
             return json.loads(cache_file.read_text(encoding="utf-8"))
+        if self.offline:
+            self.stats.offline_misses += 1
+            return None
 
         headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
         if self.token:
@@ -435,11 +990,15 @@ class GithubClient:
             return None
 
 
-def download_osv_zip(ecosystem: str, cache_dir: Path, session: requests.Session) -> Path:
+def download_osv_zip(
+    ecosystem: str, cache_dir: Path, session: requests.Session, offline: bool = False
+) -> Path:
     zip_path = Path(cache_dir) / f"{ecosystem}_all.zip"
     if zip_path.exists():
         print(f"Using cached {zip_path}")
         return zip_path
+    if offline:
+        sys.exit(f"--offline: {zip_path} is not cached; run once without --offline first.")
     url = OSV_ZIP_URL_TEMPLATE.format(ecosystem=ecosystem)
     print(f"Downloading {url} ...")
     resp = session.get(url, timeout=180, stream=True)
@@ -527,16 +1086,31 @@ def print_summary(stats: Stats, rate_limited: bool) -> None:
     print(f"Commits fetched:               {stats.commits_fetched}")
     print(f"Functions paired (deduped):   {stats.functions_paired}")
 
-    print("\nBy language:")
+    print("\nBy language (paired):")
     for lang, count in sorted(stats.by_language.items()):
         print(f"  {lang:12s} {count}")
 
-    print("\nBy category:")
+    print("\nBy category (paired, before the quality filter):")
     for cat, count in sorted(stats.by_category.items()):
         print(f"  {cat:20s} {count}")
 
+    rejected = sum(stats.rejected_by_reason.values())
+    print(f"\nQuality filter: kept {stats.kept}, rejected {rejected}")
+    for reason, count in sorted(stats.rejected_by_reason.items(), key=lambda kv: -kv[1]):
+        print(f"  rejected {reason:24s} {count}")
+
+    print("\nBy category (kept):")
+    for cat, count in sorted(stats.kept_by_category.items()):
+        print(f"  {cat:20s} {count}")
+    if stats.kept:
+        other = stats.kept_by_category.get("other", 0)
+        print(f"  'other' share: {other}/{stats.kept} ({other / stats.kept:.1%})")
+
     print(f"\nGitHub API calls made:         {stats.api_calls}")
     print(f"Cache hits (no network call):  {stats.cache_hits}")
+    if stats.offline_misses or stats.offline_incomplete_advisories:
+        print(f"Offline cache misses:          {stats.offline_misses}")
+        print(f"Advisories skipped (incomplete cache): {stats.offline_incomplete_advisories}")
     if stats.rate_remaining is not None:
         print(f"Rate limit remaining:          {stats.rate_remaining}")
     if stats.rate_reset is not None:
@@ -589,6 +1163,42 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Sleep until the GitHub rate limit resets instead of stopping cleanly.",
     )
+    p.add_argument(
+        "--offline",
+        action="store_true",
+        help="Never touch the network: read the OSV zip and GitHub responses from "
+        "--cache-dir only (a miss skips that advisory). With --resume, this re-filters "
+        "a previous run's pairs with zero network calls.",
+    )
+    p.add_argument(
+        "--min-changed-stmt-lines",
+        type=int,
+        default=1,
+        help="Reject pairs whose diff changes fewer statement lines than this, after "
+        "dropping blank/comment/docstring lines and consistent identifier renames "
+        "(default 1 rejects rename-only and comment/format-only pairs; 0 disables).",
+    )
+    p.add_argument(
+        "--max-functions-per-commit",
+        type=int,
+        default=6,
+        help="Reject every pair from a commit that produced more paired functions than "
+        "this (broad refactors; default 6; 0 disables).",
+    )
+    p.add_argument(
+        "--drop-other",
+        action="store_true",
+        help="Also reject pairs whose category is 'other' (no or unmapped CWE).",
+    )
+    p.add_argument(
+        "--keep-security-renames",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep rename-only pairs whose renamed identifier looks security-relevant "
+        "(quality.security_rename, e.g. md5 -> sha256, load -> safe_load) instead of "
+        "rejecting them as rename_only. On by default; --no-keep-security-renames "
+        "to reject them too.",
+    )
     return p.parse_args()
 
 
@@ -603,7 +1213,7 @@ def main() -> None:
     eval_dir.mkdir(parents=True, exist_ok=True)
 
     token = settings.GITHUB_TOKEN
-    if not token:
+    if not token and not args.offline:
         print(
             "No GITHUB_TOKEN configured — using unauthenticated GitHub API access "
             "(60 requests/hour). Set GITHUB_TOKEN in .env for a much bigger budget."
@@ -613,7 +1223,9 @@ def main() -> None:
     session = requests.Session()
     stats = Stats()
     parser = CodeParser()
-    client = GithubClient(session, token, cache_dir, stats, args.wait_on_rate_limit)
+    client = GithubClient(
+        session, token, cache_dir, stats, args.wait_on_rate_limit, offline=args.offline
+    )
 
     state_path = cache_dir / "processed_advisories.json"
     processed_state: dict[str, dict] = {}
@@ -631,8 +1243,11 @@ def main() -> None:
         if rate_limited:
             break
 
-        zip_path = download_osv_zip(ecosystem, cache_dir, session)
+        zip_path = download_osv_zip(ecosystem, cache_dir, session, offline=args.offline)
         ecosystem_pairs: list[dict] = []
+        # (repo, commit) -> code files the commit touched; from the cached commit
+        # response, so resumed advisories need no network call either.
+        files_in_commit: dict[tuple[str, str], int | None] = {}
 
         for advisory in iter_osv_advisories(zip_path):
             if advisories_attempted >= args.max_advisories:
@@ -648,6 +1263,11 @@ def main() -> None:
                 cached_pairs = processed_state[adv_id].get("pairs", [])
                 if cached_pairs:
                     stats.advisories_with_fix += 1
+                for key in {commit_key(p) for p in cached_pairs} - files_in_commit.keys():
+                    commit_url = f"https://api.github.com/repos/{key[0]}/commits/{key[1]}"
+                    files_in_commit[key] = code_files_in_commit(
+                        client.get_cached_json(commit_url)
+                    )
                 ecosystem_pairs.extend(cached_pairs)
                 continue
 
@@ -656,6 +1276,7 @@ def main() -> None:
                 continue
             owner, repo, sha = ref
             advisories_attempted += 1
+            misses_before = stats.offline_misses
 
             try:
                 commit_data = client.get_json(
@@ -674,6 +1295,7 @@ def main() -> None:
 
             stats.advisories_with_fix += 1
             stats.commits_fetched += 1
+            files_in_commit[(f"{owner}/{repo}", sha)] = code_files_in_commit(commit_data)
 
             parents = commit_data.get("parents") or []
             if not parents:
@@ -738,6 +1360,12 @@ def main() -> None:
                 rate_limited = True
                 break
 
+            if stats.offline_misses > misses_before:
+                # Some file was missing from the cache: the pairs are incomplete, so
+                # neither use them nor record the advisory as processed (an online
+                # --resume must still fetch it).
+                stats.offline_incomplete_advisories += 1
+                continue
             processed_state[adv_id] = {"pairs": advisory_pairs}
             ecosystem_pairs.extend(advisory_pairs)
 
@@ -765,39 +1393,27 @@ def main() -> None:
             print(f"No pairs produced for ecosystem {ecosystem}.")
             continue
 
-        corpus_side, eval_side = split_by_advisory(deduped_pairs, args.eval_fraction, args.seed)
+        corpus_kept, eval_kept, rejected = build_ecosystem_outputs(
+            deduped_pairs,
+            files_in_commit,
+            eval_fraction=args.eval_fraction,
+            seed=args.seed,
+            min_changed_stmt_lines=args.min_changed_stmt_lines,
+            max_functions_per_commit=args.max_functions_per_commit,
+            drop_other=args.drop_other,
+            keep_security_renames=args.keep_security_renames,
+        )
+        for e in corpus_kept + eval_kept:
+            stats.kept += 1
+            stats.kept_by_category[e["category"]] += 1
+        for e in rejected:
+            stats.rejected_by_reason[e["reject_reason"]] += 1
 
-        corpus_out = [{k: v for k, v in e.items() if k != "advisory_id"} for e in corpus_side]
-        out_path = out_dir / f"osv_{ecosystem.lower()}.json"
-        out_path.write_text(json.dumps(corpus_out, indent=2), encoding="utf-8")
-        print(f"Wrote {len(corpus_out)} corpus entries to {out_path}")
+        out_path, rej_path = write_ecosystem_outputs(out_dir, ecosystem, corpus_kept, rejected)
+        print(f"Wrote {len(corpus_kept)} corpus entries to {out_path}")
+        print(f"Wrote {len(rejected)} rejected pairs (with reject_reason) to {rej_path}")
 
-        for e in eval_side:
-            fn_token = re.sub(r"[^A-Za-z0-9_-]+", "_", e["function_name"])
-            adv_token = re.sub(r"[^A-Za-z0-9_-]+", "_", e["cve_id"])
-            base_id = f"{adv_token}_{fn_token}"
-            all_eval_lines.append(
-                {
-                    "id": f"{base_id}_vuln",
-                    "language": e["language"],
-                    "label": "vulnerable",
-                    "category": e["category"],
-                    "expected_cve_id": e["cve_id"],
-                    "source": "osv",
-                    "code": e["vulnerable_code"],
-                }
-            )
-            all_eval_lines.append(
-                {
-                    "id": f"{base_id}_safe",
-                    "language": e["language"],
-                    "label": "safe",
-                    "category": e["category"],
-                    "expected_cve_id": e["cve_id"],
-                    "source": "osv",
-                    "code": e["fixed_code"],
-                }
-            )
+        all_eval_lines.extend(build_eval_lines(eval_kept))
 
     if all_eval_lines:
         eval_path = eval_dir / "detection_eval_osv.jsonl"

@@ -31,3 +31,6 @@ REPORT.md
 
 # OSV bulk-export + GitHub API response cache for scripts/build_corpus_from_osv.py
 data/osv_cache/
+
+# Rejected OSV pairs (audit output of the quality filter; regenerate with --offline)
+data/cve_corpus/rejected/

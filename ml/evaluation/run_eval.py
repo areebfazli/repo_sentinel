@@ -11,6 +11,9 @@ Run from the project root (stop the API first — local Qdrant is single-process
         --sim-sweep 0.50:0.95:0.05 --rerank-sweep 0.0:0.9:0.1 --write-baseline
     python -m ml.evaluation.run_eval --margin-sweep -0.10:0.20:0.02 \
         --dataset ml/evaluation/datasets/detection_eval.jsonl <other.jsonl ...>
+    python -m ml.evaluation.run_eval --no-rerank --dataset <a.jsonl> <b.jsonl ...>
+    python -m ml.evaluation.run_eval --sample 150 --seed 42 \
+        --reranker-model BAAI/bge-reranker-base --out ml/evaluation/results/base.json
 
 The prediction rule at a given (sim_t, rerank_t, margin_t): keep candidates with
 similarity_score >= sim_t and (margin_t off, or no patched twin, or twin_margin
@@ -20,12 +23,24 @@ rerank_prob >= rerank_t, predict "vulnerable" with that candidate's category.
 ``twin_coverage`` is the fraction of eval items whose top candidate (best
 reranked after the similarity gate, before the margin gate) has a patched twin —
 the margin sweep only means something when it is well above zero.
+
+``--no-rerank`` skips the cross-encoder entirely (never loaded): candidates are
+ranked by similarity (rerank_prob := similarity_score) and the rerank sweep
+collapses to a no-op — fast retrieval-only metrics on the full set.
+``--sample N --seed S`` evaluates a deterministic, label-balanced subsample that
+keeps OSV ``<prefix>_vuln``/``<prefix>_safe`` pairs together — for comparing
+configs quickly; it can never be written as the baseline.
+``--reranker-model`` / ``--reranker-max-tokens`` override the settings for this
+run. Output JSON records the reranker actually used (null with --no-rerank),
+the sample/seed, and gather() timing (embed / ANN / rerank seconds).
 """
 import argparse
 import hashlib
 import json
 import math
+import random
 import sys
+import time
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -41,6 +56,12 @@ from backend.app.core.vector_store import VectorStore  # noqa: E402
 DEFAULT_DATASET = BASE_DIR / "ml" / "evaluation" / "datasets" / "detection_eval.jsonl"
 BASELINE_PATH = BASE_DIR / "ml" / "evaluation" / "baseline.json"
 RESULTS_DIR = BASE_DIR / "ml" / "evaluation" / "results"
+DEFAULT_RERANK_SWEEP = "0.0:0.9:0.1"
+# rerank_t used with --no-rerank: rerank_prob is the similarity score there, and
+# every candidate that survives the similarity gate (sim_t >= 0) already has
+# similarity >= 0, so rerank_t = 0.0 is a no-op rather than a second sim gate.
+NO_RERANK_THRESHOLD = 0.0
+PAIR_SUFFIXES = ("_vuln", "_safe")
 
 
 def sigmoid(x: float) -> float:
@@ -92,34 +113,136 @@ def frange(spec: str) -> list[float]:
     return [round(start + i * step, 6) for i in range(n + 1)]
 
 
-def build_components():
-    return Embedder(cache=EmbeddingCache()), VectorStore(), Reranker()
+def reranker_config(
+    no_rerank: bool = False, model: str | None = None, max_tokens: int | None = None
+) -> dict | None:
+    """The reranker a run uses (overrides resolved against settings), or None.
+
+    This is both what build_components() constructs and what output JSON records.
+    """
+    if no_rerank:
+        return None
+    return {
+        "model": settings.RERANKER_MODEL if model is None else model,
+        "max_tokens": settings.RERANKER_MAX_TOKENS if max_tokens is None else max_tokens,
+    }
 
 
-def gather(items, embedder, store, reranker, ann_candidates: int) -> list[dict]:
-    """Run the ANN + rerank pipeline once per item; cache scored candidates."""
+def build_components(
+    no_rerank: bool = False, reranker_model: str | None = None,
+    reranker_max_tokens: int | None = None,
+):
+    """(embedder, store, reranker). With ``no_rerank`` the reranker is None and
+    no cross-encoder is ever constructed (no model load)."""
+    cfg = reranker_config(no_rerank, reranker_model, reranker_max_tokens)
+    reranker = (
+        None if cfg is None else Reranker(model_name=cfg["model"], max_tokens=cfg["max_tokens"])
+    )
+    return Embedder(cache=EmbeddingCache()), VectorStore(), reranker
+
+
+def _pair_key(item_id: str) -> str:
+    """Shared prefix of an OSV ``<prefix>_vuln``/``<prefix>_safe`` pair; any
+    other id (e.g. handwritten ``sqli_vuln_1``) is its own group."""
+    for suffix in PAIR_SUFFIXES:
+        if item_id.endswith(suffix):
+            return item_id[: -len(suffix)]
+    return item_id
+
+
+def sample_items(items: list[dict], n: int, seed: int = 42) -> list[dict]:
+    """Deterministic, label-balanced subsample that keeps OSV pairs together.
+
+    Items are grouped by ``_pair_key`` (a vuln/safe pair is one group; ids
+    without the suffix are singletons — groups are atomic, so a pair is never
+    split). Groups are shuffled with ``random.Random(seed)`` and taken greedily
+    while (a) the total stays <= n and (b) |n_vulnerable - n_safe| stays <= 1.
+    Tie-break: with an odd n the extra item's label is whichever singleton the
+    shuffle reaches first; the result may fall short of n (by 1 when n is odd
+    and no singleton of the needed label is left, more only if the pool can't
+    supply a balanced sample). n >= len(items) returns every item unchanged.
+    Selected items keep their input order.
+    """
+    if n >= len(items):
+        return list(items)
+    groups: dict[str, list[int]] = {}
+    for idx, item in enumerate(items):
+        groups.setdefault(_pair_key(item["id"]), []).append(idx)
+    units = list(groups.values())
+    random.Random(seed).shuffle(units)
+
+    chosen: list[int] = []
+    n_vuln = n_safe = 0
+    for unit in units:
+        if len(chosen) == n:
+            break
+        dv = sum(items[i]["label"] == "vulnerable" for i in unit)
+        ds = len(unit) - dv
+        if len(chosen) + len(unit) > n or abs((n_vuln + dv) - (n_safe + ds)) > 1:
+            continue
+        chosen.extend(unit)
+        n_vuln += dv
+        n_safe += ds
+    return [items[i] for i in sorted(chosen)]
+
+
+def gather(
+    items, embedder, store, reranker, ann_candidates: int, progress: bool = False
+) -> tuple[list[dict], dict]:
+    """Run the ANN (+ rerank) pipeline once per item; cache scored candidates.
+
+    ``reranker=None`` (--no-rerank) skips the cross-encoder. Returns
+    ``(gathered, timing)``; ``timing`` keys (seconds, summed over items):
+    ``n_items``, ``total_seconds`` (wall time of the whole call),
+    ``seconds_per_item``, ``embed_seconds`` (embedder.embed_text),
+    ``ann_seconds`` (store.search_cves), ``rerank_seconds`` (reranker.rerank;
+    0 without a reranker). ``progress`` prints a line every ~5% of items.
+    """
     gathered = []
-    for item in items:
+    embed_s = ann_s = rerank_s = 0.0
+    n_total = len(items)
+    stride = max(1, n_total // 20)
+    start = time.perf_counter()
+    for done, item in enumerate(items, start=1):
         code = item["code"]
+        t0 = time.perf_counter()
         vector = embedder.embed_text(code)
+        t1 = time.perf_counter()
         candidates = store.search_cves(vector, limit=ann_candidates)
-        # Mirror the retriever: rerank code-against-code (vulnerable_code), not
-        # against the English description.
+        t2 = time.perf_counter()
+        embed_s += t1 - t0
+        ann_s += t2 - t1
+        if reranker is not None:
+            # Mirror the retriever: rerank code-against-code (vulnerable_code),
+            # not against the English description.
+            for c in candidates:
+                c["rerank_text"] = c.get("vulnerable_code") or c.get("description", "")
+            if candidates:
+                t3 = time.perf_counter()
+                reranker.rerank(code, candidates, top_k=len(candidates))
+                rerank_s += time.perf_counter() - t3
+        scored = []
         for c in candidates:
-            c["rerank_text"] = c.get("vulnerable_code") or c.get("description", "")
-        if candidates:
-            reranker.rerank(code, candidates, top_k=len(candidates))
-        scored = [
-            {
-                "similarity_score": c.get("similarity_score", 0.0),
-                "rerank_prob": sigmoid(float(c["rerank_score"])) if "rerank_score" in c else 0.0,
-                "category": c.get("category", "unknown"),
-                "cve_id": c.get("cve_id"),
-                "sim_fixed": c.get("sim_fixed"),
-                "twin_margin": c.get("twin_margin"),
-            }
-            for c in candidates
-        ]
+            sim = c.get("similarity_score", 0.0)
+            if reranker is None:
+                # No cross-encoder: rank by similarity. score() picks the best
+                # survivor via max(rerank_prob), so reusing that field keeps
+                # score() and every metric unchanged — they just order by
+                # similarity instead of cross-encoder probability. No
+                # rerank_score is fabricated.
+                prob = sim
+            else:
+                prob = sigmoid(float(c["rerank_score"])) if "rerank_score" in c else 0.0
+            scored.append(
+                {
+                    "similarity_score": sim,
+                    "rerank_prob": prob,
+                    "category": c.get("category", "unknown"),
+                    "cve_id": c.get("cve_id"),
+                    "sim_fixed": c.get("sim_fixed"),
+                    "twin_margin": c.get("twin_margin"),
+                }
+            )
         gathered.append(
             {
                 "id": item["id"],
@@ -128,7 +251,23 @@ def gather(items, embedder, store, reranker, ann_candidates: int) -> list[dict]:
                 "candidates": scored,
             }
         )
-    return gathered
+        if progress and (done % stride == 0 or done == n_total):
+            elapsed = time.perf_counter() - start
+            remaining = elapsed / done * (n_total - done)
+            print(
+                f"  [{done}/{n_total}] {elapsed:.1f}s elapsed, ~{remaining:.0f}s remaining",
+                flush=True,
+            )
+    total = time.perf_counter() - start
+    timing = {
+        "n_items": n_total,
+        "total_seconds": round(total, 4),
+        "seconds_per_item": round(total / n_total, 4) if n_total else 0.0,
+        "embed_seconds": round(embed_s, 4),
+        "ann_seconds": round(ann_s, 4),
+        "rerank_seconds": round(rerank_s, 4),
+    }
+    return gathered, timing
 
 
 def score(
@@ -194,7 +333,7 @@ def evaluate(
     rerank_t = settings.RERANK_THRESHOLD if rerank_t is None else rerank_t
     margin_t = settings.TWIN_MARGIN_MIN if margin_t is _UNSET else margin_t
     items = load_datasets(dataset_path)
-    gathered = gather(items, embedder, store, reranker, settings.ANN_CANDIDATES)
+    gathered, _timing = gather(items, embedder, store, reranker, settings.ANN_CANDIDATES)
     return score(gathered, sim_t, rerank_t, margin_t)
 
 
@@ -264,26 +403,96 @@ def _rel(path: str) -> str:
         return str(path)
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the CVE detection eval.")
     parser.add_argument(
         "--dataset", nargs="+", default=[str(DEFAULT_DATASET)],
         help="One or more JSONL eval sets (combined in order).",
     )
     parser.add_argument("--sim-sweep", default="0.50:0.95:0.05")
-    parser.add_argument("--rerank-sweep", default="0.0:0.9:0.1")
+    parser.add_argument(
+        "--rerank-sweep", default=None,
+        help=f"start:stop:step for rerank_t (default {DEFAULT_RERANK_SWEEP}). With "
+        "--no-rerank it collapses to a single no-op value; passing it is an error.",
+    )
     parser.add_argument(
         "--margin-sweep", default=None,
         help="start:stop:step for the twin-margin gate (TWIN_MARGIN_MIN semantics), "
         "e.g. -0.10:0.20:0.02 ('off' is always included). Python < 3.14's argparse "
         "needs the --margin-sweep=-0.10:... form for a negative start.",
     )
+    parser.add_argument(
+        "--no-rerank", action="store_true",
+        help="Skip the cross-encoder (never loaded); rank candidates by similarity. "
+        "Fast retrieval-only metrics.",
+    )
+    parser.add_argument(
+        "--reranker-model", default=None,
+        help="Override RERANKER_MODEL for this run (e.g. BAAI/bge-reranker-base).",
+    )
+    parser.add_argument(
+        "--reranker-max-tokens", type=int, default=None,
+        help="Override RERANKER_MAX_TOKENS for this run.",
+    )
+    parser.add_argument(
+        "--sample", type=int, default=None, metavar="N",
+        help="Evaluate a label-balanced sample of ~N items (OSV vuln/safe pairs kept "
+        "together) from the combined datasets. Not allowed with --write-baseline.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="RNG seed for --sample (default 42)."
+    )
     parser.add_argument("--write-baseline", action="store_true")
     parser.add_argument("--out", default=None, help="Write full sweep results JSON here.")
-    args = parser.parse_args()
+    return parser
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    """Parse + validate CLI args. Every refusal happens here, before any model load."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.write_baseline and args.sample is not None:
+        parser.error(
+            "--write-baseline cannot be combined with --sample: a sample must never "
+            "become the calibrated baseline (run on the full dataset instead)."
+        )
+    if args.sample is not None and args.sample <= 0:
+        parser.error("--sample must be a positive integer.")
+    if args.reranker_max_tokens is not None and args.reranker_max_tokens <= 0:
+        parser.error("--reranker-max-tokens must be a positive integer.")
+    if args.no_rerank:
+        if args.rerank_sweep is not None:
+            parser.error(
+                "--rerank-sweep requires a reranker: rerank_t is meaningless with "
+                "--no-rerank (use --sim-sweep)."
+            )
+        if args.reranker_model is not None or args.reranker_max_tokens is not None:
+            parser.error(
+                "--reranker-model/--reranker-max-tokens cannot be combined with --no-rerank."
+            )
+    elif args.rerank_sweep is None:
+        args.rerank_sweep = DEFAULT_RERANK_SWEEP
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    rr_cfg = reranker_config(args.no_rerank, args.reranker_model, args.reranker_max_tokens)
+    sample_meta = {
+        "sample": args.sample,
+        "seed": args.seed if args.sample is not None else None,
+    }
 
     print(f"Model: {settings.EMBEDDING_MODEL} (pooling={settings.EMBEDDING_POOLING})")
-    embedder, store, reranker = build_components()
+    if rr_cfg is None:
+        print("Reranker: off (--no-rerank; candidates ranked by similarity)")
+    else:
+        print(f"Reranker: {rr_cfg['model']} (max_tokens={rr_cfg['max_tokens']})")
+    if args.sample is not None:
+        print(f"Sample: {args.sample} (seed={args.seed})")
+    embedder, store, reranker = build_components(
+        args.no_rerank, args.reranker_model, args.reranker_max_tokens
+    )
 
     if store.cve_schema_error:
         print(store.cve_schema_error)
@@ -295,14 +504,34 @@ def main():
 
     items = load_datasets(args.dataset)
     print(f"Loaded {len(items)} eval snippets; corpus has {seeded} points.")
-    gathered = gather(items, embedder, store, reranker, settings.ANN_CANDIDATES)
+    if args.sample is not None:
+        pool = len(items)
+        items = sample_items(items, args.sample, args.seed)
+        n_vuln = sum(i["label"] == "vulnerable" for i in items)
+        note = " (requested >= pool: using the whole pool)" if args.sample >= pool else ""
+        print(
+            f"Sampled {len(items)}/{pool} items: {n_vuln} vulnerable, "
+            f"{len(items) - n_vuln} safe{note}."
+        )
+    gathered, timing = gather(
+        items, embedder, store, reranker, settings.ANN_CANDIDATES, progress=True
+    )
+    print(
+        f"Gathered {timing['n_items']} items in {timing['total_seconds']:.1f}s "
+        f"({timing['seconds_per_item']:.2f}s/item; embed {timing['embed_seconds']:.1f}s, "
+        f"ANN {timing['ann_seconds']:.1f}s, rerank {timing['rerank_seconds']:.1f}s)."
+    )
+    run_meta = {"reranker": rr_cfg, **sample_meta, "timing": timing}
 
     n_cands = sum(len(g["candidates"]) for g in gathered)
     n_twins = sum(c["twin_margin"] is not None for g in gathered for c in g["candidates"])
     print(f"Candidates with a patched twin: {n_twins}/{n_cands}.")
 
     sim_values = frange(args.sim_sweep)
-    rerank_values = frange(args.rerank_sweep)
+    # With --no-rerank, rerank_prob == similarity, so a rerank sweep would only
+    # re-apply the sim gate and multiply the table out: collapse it to one no-op.
+    rerank_values = [NO_RERANK_THRESHOLD] if args.no_rerank else frange(args.rerank_sweep)
+    op_rerank_t = NO_RERANK_THRESHOLD if args.no_rerank else settings.RERANK_THRESHOLD
     margin_values: list[float | None] = [None]
     if args.margin_sweep:
         margin_values += frange(args.margin_sweep)
@@ -316,19 +545,18 @@ def main():
     _print_table(sweep)
 
     operating = score(
-        gathered, settings.SIM_THRESHOLD_CVE, settings.RERANK_THRESHOLD,
-        settings.TWIN_MARGIN_MIN,
+        gathered, settings.SIM_THRESHOLD_CVE, op_rerank_t, settings.TWIN_MARGIN_MIN,
     )
     if args.margin_sweep:
         # The question the sweep answers: at today's operating point, what does
         # each margin gate buy/cost?
         print(
             f"\nTwin-margin sweep at the operating point (sim={settings.SIM_THRESHOLD_CVE}, "
-            f"rerank={settings.RERANK_THRESHOLD}):"
+            f"rerank={op_rerank_t}):"
         )
         _print_table(
             [
-                score(gathered, settings.SIM_THRESHOLD_CVE, settings.RERANK_THRESHOLD, m)
+                score(gathered, settings.SIM_THRESHOLD_CVE, op_rerank_t, m)
                 for m in margin_values
             ],
             top=None,
@@ -336,16 +564,22 @@ def main():
 
     print(
         f"\nOperating point (settings sim={settings.SIM_THRESHOLD_CVE}, "
-        f"rerank={settings.RERANK_THRESHOLD}, "
+        f"rerank={op_rerank_t}, "
         f"twin_margin={_fmt_margin(settings.TWIN_MARGIN_MIN)}): "
         f"P={operating['precision']} R={operating['recall']} F1={operating['f1']} "
         f"twin_coverage={operating['twin_coverage']}"
+    )
+    print(
+        f"Wall time: {timing['total_seconds']:.1f}s total, "
+        f"{timing['seconds_per_item']:.2f}s/item."
     )
 
     if args.out:
         out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps({"operating": operating, "sweep": sweep}, indent=2))
+        out_path.write_text(
+            json.dumps({**run_meta, "operating": operating, "sweep": sweep}, indent=2)
+        )
         print(f"Wrote sweep results -> {out_path}")
 
     if args.write_baseline:
@@ -354,7 +588,7 @@ def main():
             "pooling": settings.EMBEDDING_POOLING,
             "sim_threshold_cve": settings.SIM_THRESHOLD_CVE,
             "sim_threshold_team": settings.SIM_THRESHOLD_TEAM,
-            "rerank_threshold": settings.RERANK_THRESHOLD,
+            "rerank_threshold": op_rerank_t,
             "twin_margin_min": settings.TWIN_MARGIN_MIN,
             "precision": operating["precision"],
             "recall": operating["recall"],
@@ -368,6 +602,7 @@ def main():
                 k: sweep[0][k]
                 for k in ("sim_threshold", "rerank_threshold", "margin_threshold", "f1")
             },
+            **run_meta,
         }
         BASELINE_PATH.write_text(json.dumps(baseline, indent=2) + "\n")
         print(f"Wrote baseline -> {BASELINE_PATH}")

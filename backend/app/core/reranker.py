@@ -15,18 +15,21 @@ def _sigmoid(x: float) -> float:
 
 
 class Reranker:
-    def __init__(self):
+    def __init__(self, model_name: str | None = None, max_tokens: int | None = None):
         """
         Initialize the Cross-Encoder model.
         This model takes a pair of texts (query, document) and outputs a similarity score.
+
+        ``model_name``/``max_tokens`` default to settings.RERANKER_MODEL /
+        RERANKER_MAX_TOKENS; the eval harness overrides them to compare rerankers.
         """
+        model_name = settings.RERANKER_MODEL if model_name is None else model_name
+        max_tokens = settings.RERANKER_MAX_TOKENS if max_tokens is None else max_tokens
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Initializing Cross-Encoder Reranker on device: {self.device}")
 
         # We use bge-reranker-v2-m3, a general-purpose multilingual cross-encoder reranker
-        self.model = CrossEncoder(
-            settings.RERANKER_MODEL, max_length=settings.RERANKER_MAX_TOKENS, device=self.device
-        )
+        self.model = CrossEncoder(model_name, max_length=max_tokens, device=self.device)
 
     def rerank(
         self, query_code: str, candidates: list[dict[str, Any]], top_k: int = 1

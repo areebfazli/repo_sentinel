@@ -188,6 +188,9 @@ The eval quantifies the precision ceiling (~0.5 across thresholds, since safe an
 near-twins embed alike), which is *why* the gate favors recall and the LLM report is the real
 precision filter. **Category hit rate** (did we retrieve the right CVE?) is the meaningful
 retrieval metric; the calibrated baseline lives in `ml/evaluation/baseline.json`.
+`--no-rerank` skips the cross-encoder for fast retrieval-only metrics on the full set, and
+`--sample N --seed S` runs a label-balanced subsample for quick config comparisons (e.g. of
+`--reranker-model`/`--reranker-max-tokens`); a sample can't be written as the baseline.
 
 ---
 

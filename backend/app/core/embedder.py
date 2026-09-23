@@ -5,6 +5,12 @@ from transformers import AutoModel, AutoTokenizer
 
 from backend.app.config import settings
 
+# embed_texts: write new embeddings to the cache every N model batches (not just
+# once at the end), so an interrupted long run (e.g. ingest) keeps its progress.
+_CACHE_FLUSH_EVERY_BATCHES = 8
+# embed_texts: print progress (~every 10%) only for runs with more misses than this.
+_PROGRESS_LOG_MIN_MISSES = 200
+
 
 class Embedder:
     def __init__(self, model_name: str | None = None, pooling: str | None = None, cache=None):
@@ -62,11 +68,36 @@ class Embedder:
                 else:
                     misses.append(i)
 
-        # 2. Run the model only for misses, in batches.
+        # 2. Run the model only for misses, in length-sorted batches.
+        #
+        # _embed_batch pads every batch to its longest member, so batching in input
+        # order (short and 2000-token texts mixed) burns most of the compute on
+        # padding. Sorting misses by length first puts similar-length texts in the
+        # same batch. Each text's model input is unchanged (same tokenization and
+        # truncation); only batch *composition* changes. Padding is masked via the
+        # attention mask (and excluded from mean pooling), so a text's embedding
+        # doesn't depend on which other texts share its batch, up to float noise
+        # from different padded shapes (standard for transformers on CPU/GPU; the
+        # old input-order batching had the same property).
+        #
+        # Length proxy: len(text) (characters), not token count. Tokenizing every
+        # miss just to sort would be a second full tokenizer pass, while character
+        # length tracks token length closely enough for code; a slightly imperfect
+        # order only costs a little padding, never correctness. sorted() is stable,
+        # so equal-length texts keep input order and the result is deterministic.
+        order = sorted(misses, key=lambda i: len(texts[i]))
+
+        n_misses = len(order)
+        log_progress = n_misses > _PROGRESS_LOG_MIN_MISSES
+        log_step = max(1, n_misses // 10)
+        next_log = log_step
+        processed = 0
+
         new_records: list[dict] = []
-        for start in range(0, len(misses), batch_size):
-            batch_idx = misses[start:start + batch_size]
+        for batch_no, start in enumerate(range(0, n_misses, batch_size), start=1):
+            batch_idx = order[start:start + batch_size]
             batch_embeddings = self._embed_batch([texts[i] for i in batch_idx])
+            # Write back to each text's ORIGINAL index so output order is preserved.
             for j, i in enumerate(batch_idx):
                 results[i] = batch_embeddings[j]
                 if self.cache:
@@ -79,7 +110,22 @@ class Embedder:
                         }
                     )
 
-        # 3. Persist newly computed embeddings.
+            # 3. Persist incrementally so an interrupted run keeps its progress.
+            if self.cache and new_records and batch_no % _CACHE_FLUSH_EVERY_BATCHES == 0:
+                self.cache.put_many(new_records)
+                new_records = []
+
+            if log_progress:
+                processed += len(batch_idx)
+                if processed >= next_log or processed == n_misses:
+                    print(
+                        f"Embedder: embedded {processed}/{n_misses} texts "
+                        f"({100 * processed // n_misses}%)"
+                    )
+                    while next_log <= processed:
+                        next_log += log_step
+
+        # Flush whatever is left after the last full flush interval.
         if self.cache and new_records:
             self.cache.put_many(new_records)
 

@@ -1,0 +1,1512 @@
+{
+  "reranker": null,
+  "sample": null,
+  "sample_kinds": {
+    "vulnerable": 8,
+    "fixed_twin": 8,
+    "ordinary": 13
+  },
+  "seed": 42,
+  "sample_kinds_achieved": {
+    "vulnerable": 8,
+    "fixed_twin": 8,
+    "ordinary": 13
+  },
+  "timing": {
+    "n_items": 29,
+    "total_seconds": 0.8422,
+    "seconds_per_item": 0.029,
+    "embed_seconds": 0.0856,
+    "ann_seconds": 0.7542,
+    "rerank_seconds": 0.0
+  },
+  "operating": {
+    "sim_threshold": 0.25,
+    "rerank_threshold": 0.0,
+    "margin_threshold": null,
+    "precision": 0.2759,
+    "recall": 1.0,
+    "f1": 0.4324,
+    "category_hit_rate": 0.25,
+    "twin_coverage": 1.0,
+    "tp": 8,
+    "fp": 21,
+    "fn": 0,
+    "tn": 0,
+    "n": 29
+  },
+  "sweep": [
+    {
+      "sim_threshold": 0.45,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.3182,
+      "recall": 0.875,
+      "f1": 0.4667,
+      "category_hit_rate": 0.2857,
+      "twin_coverage": 0.7586,
+      "tp": 7,
+      "fp": 15,
+      "fn": 1,
+      "tn": 6,
+      "n": 29
+    },
+    {
+      "sim_threshold": 0.4,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.2917,
+      "recall": 0.875,
+      "f1": 0.4375,
+      "category_hit_rate": 0.2857,
+      "twin_coverage": 0.8276,
+      "tp": 7,
+      "fp": 17,
+      "fn": 1,
+      "tn": 4,
+      "n": 29
+    },
+    {
+      "sim_threshold": 0.2,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.2759,
+      "recall": 1.0,
+      "f1": 0.4324,
+      "category_hit_rate": 0.25,
+      "twin_coverage": 1.0,
+      "tp": 8,
+      "fp": 21,
+      "fn": 0,
+      "tn": 0,
+      "n": 29
+    },
+    {
+      "sim_threshold": 0.25,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.2759,
+      "recall": 1.0,
+      "f1": 0.4324,
+      "category_hit_rate": 0.25,
+      "twin_coverage": 1.0,
+      "tp": 8,
+      "fp": 21,
+      "fn": 0,
+      "tn": 0,
+      "n": 29
+    },
+    {
+      "sim_threshold": 0.3,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.2759,
+      "recall": 1.0,
+      "f1": 0.4324,
+      "category_hit_rate": 0.25,
+      "twin_coverage": 1.0,
+      "tp": 8,
+      "fp": 21,
+      "fn": 0,
+      "tn": 0,
+      "n": 29
+    },
+    {
+      "sim_threshold": 0.35,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.2759,
+      "recall": 1.0,
+      "f1": 0.4324,
+      "category_hit_rate": 0.25,
+      "twin_coverage": 1.0,
+      "tp": 8,
+      "fp": 21,
+      "fn": 0,
+      "tn": 0,
+      "n": 29
+    },
+    {
+      "sim_threshold": 0.5,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.3125,
+      "recall": 0.625,
+      "f1": 0.4167,
+      "category_hit_rate": 0.4,
+      "twin_coverage": 0.5517,
+      "tp": 5,
+      "fp": 11,
+      "fn": 3,
+      "tn": 10,
+      "n": 29
+    },
+    {
+      "sim_threshold": 0.55,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.4286,
+      "recall": 0.375,
+      "f1": 0.4,
+      "category_hit_rate": 0.3333,
+      "twin_coverage": 0.2414,
+      "tp": 3,
+      "fp": 4,
+      "fn": 5,
+      "tn": 17,
+      "n": 29
+    },
+    {
+      "sim_threshold": 0.65,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.6667,
+      "recall": 0.25,
+      "f1": 0.3636,
+      "category_hit_rate": 0.5,
+      "twin_coverage": 0.1034,
+      "tp": 2,
+      "fp": 1,
+      "fn": 6,
+      "tn": 20,
+      "n": 29
+    },
+    {
+      "sim_threshold": 0.6,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.5,
+      "recall": 0.25,
+      "f1": 0.3333,
+      "category_hit_rate": 0.5,
+      "twin_coverage": 0.1379,
+      "tp": 2,
+      "fp": 2,
+      "fn": 6,
+      "tn": 19,
+      "n": 29
+    },
+    {
+      "sim_threshold": 0.7,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.5,
+      "recall": 0.125,
+      "f1": 0.2,
+      "category_hit_rate": 1.0,
+      "twin_coverage": 0.069,
+      "tp": 1,
+      "fp": 1,
+      "fn": 7,
+      "tn": 20,
+      "n": 29
+    },
+    {
+      "sim_threshold": 0.75,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.5,
+      "recall": 0.125,
+      "f1": 0.2,
+      "category_hit_rate": 1.0,
+      "twin_coverage": 0.069,
+      "tp": 1,
+      "fp": 1,
+      "fn": 7,
+      "tn": 20,
+      "n": 29
+    },
+    {
+      "sim_threshold": 0.8,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.5,
+      "recall": 0.125,
+      "f1": 0.2,
+      "category_hit_rate": 1.0,
+      "twin_coverage": 0.069,
+      "tp": 1,
+      "fp": 1,
+      "fn": 7,
+      "tn": 20,
+      "n": 29
+    },
+    {
+      "sim_threshold": 0.85,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "category_hit_rate": 0.0,
+      "twin_coverage": 0.0345,
+      "tp": 0,
+      "fp": 1,
+      "fn": 8,
+      "tn": 20,
+      "n": 29
+    },
+    {
+      "sim_threshold": 0.9,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "category_hit_rate": 0.0,
+      "twin_coverage": 0.0345,
+      "tp": 0,
+      "fp": 1,
+      "fn": 8,
+      "tn": 20,
+      "n": 29
+    },
+    {
+      "sim_threshold": 0.95,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "category_hit_rate": 0.0,
+      "twin_coverage": 0.0345,
+      "tp": 0,
+      "fp": 1,
+      "fn": 8,
+      "tn": 20,
+      "n": 29
+    }
+  ],
+  "realistic": {
+    "n": 29,
+    "n_scored": 29,
+    "n_excluded": 0,
+    "tpr_vulnerable": {
+      "k": 8,
+      "n": 8,
+      "rate": 1.0,
+      "ci95": [
+        0.6756,
+        1.0
+      ]
+    },
+    "fpr_fixed_twin": {
+      "k": 8,
+      "n": 8,
+      "rate": 1.0,
+      "ci95": [
+        0.6756,
+        1.0
+      ]
+    },
+    "fpr_ordinary": {
+      "k": 13,
+      "n": 13,
+      "rate": 1.0,
+      "ci95": [
+        0.7719,
+        1.0
+      ]
+    },
+    "fpr_ordinary_length_matched": {
+      "k": 0,
+      "n": 0,
+      "rate": null,
+      "ci95": null
+    },
+    "fpr_handwritten_safe": {
+      "k": 0,
+      "n": 0,
+      "rate": null,
+      "ci95": null
+    },
+    "tpr_handwritten": {
+      "k": 0,
+      "n": 0,
+      "rate": null,
+      "ci95": null
+    },
+    "precision_at_base_rate": {
+      "0.01": 0.01,
+      "0.02": 0.02,
+      "0.05": 0.05
+    },
+    "precision_at_base_rate_length_matched": {
+      "0.01": null,
+      "0.02": null,
+      "0.05": null
+    },
+    "precision_balanced_vs_fixed_twin": 0.5,
+    "precision_balanced_vs_ordinary": 0.5,
+    "pairs": {
+      "n": 8,
+      "vuln_only": 0.0,
+      "n_vuln_only": 0,
+      "twin_only": 0.0,
+      "n_twin_only": 0,
+      "both": 1.0,
+      "n_both": 8,
+      "neither": 0.0,
+      "n_neither": 0
+    },
+    "observed": {
+      "tp": 8,
+      "fp": 21,
+      "fn": 0,
+      "tn": 0,
+      "precision": 0.2759,
+      "recall": 1.0
+    }
+  },
+  "llm": {
+    "config": {
+      "model": "groq:qwen/qwen3.8-27b",
+      "chain": [
+        "groq:qwen/qwen3.8-27b"
+      ],
+      "primary_only": true,
+      "max_calls": 20,
+      "sleep_s": 2.5,
+      "tpm": 8000,
+      "token_budget": 10000,
+      "cache": "ml/evaluation/results/llm_cache.jsonl",
+      "top_k": 3,
+      "prompt": "legacy",
+      "rule": "vulnerable iff >= 1 validated finding references a retrieved CVE (the old prompt; items without retrieved CVEs get no call)",
+      "cves_per_unit": null,
+      "max_prompt_tokens": null,
+      "semgrep": null,
+      "guard_diff": "not applicable: snippet mode has no previous version of the code"
+    },
+    "calls": 4,
+    "tokens_used": 6719,
+    "stopped": null,
+    "status_counts": {
+      "cached": 25,
+      "ok": 4
+    },
+    "providers": {
+      "groq:qwen/qwen3.8-27b": 29
+    },
+    "realistic": {
+      "n": 29,
+      "n_scored": 29,
+      "n_excluded": 0,
+      "tpr_vulnerable": {
+        "k": 1,
+        "n": 8,
+        "rate": 0.125,
+        "ci95": [
+          0.0224,
+          0.4709
+        ]
+      },
+      "fpr_fixed_twin": {
+        "k": 2,
+        "n": 8,
+        "rate": 0.25,
+        "ci95": [
+          0.0715,
+          0.5907
+        ]
+      },
+      "fpr_ordinary": {
+        "k": 0,
+        "n": 13,
+        "rate": 0.0,
+        "ci95": [
+          0.0,
+          0.2281
+        ]
+      },
+      "fpr_ordinary_length_matched": {
+        "k": 0,
+        "n": 7,
+        "rate": 0.0,
+        "ci95": [
+          0.0,
+          0.3543
+        ]
+      },
+      "fpr_handwritten_safe": {
+        "k": 0,
+        "n": 0,
+        "rate": null,
+        "ci95": null
+      },
+      "tpr_handwritten": {
+        "k": 0,
+        "n": 0,
+        "rate": null,
+        "ci95": null
+      },
+      "precision_at_base_rate": {
+        "0.01": 1.0,
+        "0.02": 1.0,
+        "0.05": 1.0
+      },
+      "precision_at_base_rate_length_matched": {
+        "0.01": 1.0,
+        "0.02": 1.0,
+        "0.05": 1.0
+      },
+      "precision_balanced_vs_fixed_twin": 0.3333,
+      "precision_balanced_vs_ordinary": 1.0,
+      "pairs": {
+        "n": 8,
+        "vuln_only": 0.125,
+        "n_vuln_only": 1,
+        "twin_only": 0.25,
+        "n_twin_only": 2,
+        "both": 0.0,
+        "n_both": 0,
+        "neither": 0.625,
+        "n_neither": 5
+      },
+      "observed": {
+        "tp": 1,
+        "fp": 2,
+        "fn": 7,
+        "tn": 19,
+        "precision": 0.3333,
+        "recall": 0.125
+      }
+    },
+    "realistic_any_finding": {
+      "n": 29,
+      "n_scored": 29,
+      "n_excluded": 0,
+      "tpr_vulnerable": {
+        "k": 1,
+        "n": 8,
+        "rate": 0.125,
+        "ci95": [
+          0.0224,
+          0.4709
+        ]
+      },
+      "fpr_fixed_twin": {
+        "k": 2,
+        "n": 8,
+        "rate": 0.25,
+        "ci95": [
+          0.0715,
+          0.5907
+        ]
+      },
+      "fpr_ordinary": {
+        "k": 0,
+        "n": 13,
+        "rate": 0.0,
+        "ci95": [
+          0.0,
+          0.2281
+        ]
+      },
+      "fpr_ordinary_length_matched": {
+        "k": 0,
+        "n": 7,
+        "rate": 0.0,
+        "ci95": [
+          0.0,
+          0.3543
+        ]
+      },
+      "fpr_handwritten_safe": {
+        "k": 0,
+        "n": 0,
+        "rate": null,
+        "ci95": null
+      },
+      "tpr_handwritten": {
+        "k": 0,
+        "n": 0,
+        "rate": null,
+        "ci95": null
+      },
+      "precision_at_base_rate": {
+        "0.01": 1.0,
+        "0.02": 1.0,
+        "0.05": 1.0
+      },
+      "precision_at_base_rate_length_matched": {
+        "0.01": 1.0,
+        "0.02": 1.0,
+        "0.05": 1.0
+      },
+      "precision_balanced_vs_fixed_twin": 0.3333,
+      "precision_balanced_vs_ordinary": 1.0,
+      "pairs": {
+        "n": 8,
+        "vuln_only": 0.125,
+        "n_vuln_only": 1,
+        "twin_only": 0.25,
+        "n_twin_only": 2,
+        "both": 0.0,
+        "n_both": 0,
+        "neither": 0.625,
+        "n_neither": 5
+      },
+      "observed": {
+        "tp": 1,
+        "fp": 2,
+        "fn": 7,
+        "tn": 19,
+        "precision": 0.3333,
+        "recall": 0.125
+      }
+    },
+    "realistic_retrieval_same_items": {
+      "n": 29,
+      "n_scored": 29,
+      "n_excluded": 0,
+      "tpr_vulnerable": {
+        "k": 8,
+        "n": 8,
+        "rate": 1.0,
+        "ci95": [
+          0.6756,
+          1.0
+        ]
+      },
+      "fpr_fixed_twin": {
+        "k": 8,
+        "n": 8,
+        "rate": 1.0,
+        "ci95": [
+          0.6756,
+          1.0
+        ]
+      },
+      "fpr_ordinary": {
+        "k": 13,
+        "n": 13,
+        "rate": 1.0,
+        "ci95": [
+          0.7719,
+          1.0
+        ]
+      },
+      "fpr_ordinary_length_matched": {
+        "k": 7,
+        "n": 7,
+        "rate": 1.0,
+        "ci95": [
+          0.6457,
+          1.0
+        ]
+      },
+      "fpr_handwritten_safe": {
+        "k": 0,
+        "n": 0,
+        "rate": null,
+        "ci95": null
+      },
+      "tpr_handwritten": {
+        "k": 0,
+        "n": 0,
+        "rate": null,
+        "ci95": null
+      },
+      "precision_at_base_rate": {
+        "0.01": 0.01,
+        "0.02": 0.02,
+        "0.05": 0.05
+      },
+      "precision_at_base_rate_length_matched": {
+        "0.01": 0.01,
+        "0.02": 0.02,
+        "0.05": 0.05
+      },
+      "precision_balanced_vs_fixed_twin": 0.5,
+      "precision_balanced_vs_ordinary": 0.5,
+      "pairs": {
+        "n": 8,
+        "vuln_only": 0.0,
+        "n_vuln_only": 0,
+        "twin_only": 0.0,
+        "n_twin_only": 0,
+        "both": 1.0,
+        "n_both": 8,
+        "neither": 0.0,
+        "n_neither": 0
+      },
+      "observed": {
+        "tp": 8,
+        "fp": 21,
+        "fn": 0,
+        "tn": 0,
+        "precision": 0.2759,
+        "recall": 1.0
+      }
+    },
+    "category_hit_rate": 1.0,
+    "items": [
+      {
+        "id": "CVE-2014-2573_destroy_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "other",
+        "length_matched": null,
+        "retrieved_cve_ids": [
+          "CVE-2014-8333",
+          "CVE-2015-3241",
+          "CVE-2015-3241"
+        ],
+        "prompt_sha256": "81b30f3796fde8a348e57d303dccbc6b4580ad2ccc2c63318c783706128334cf",
+        "prompt_tokens_est": 3588,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.483,
+        "usage": {
+          "prompt_tokens": 3025,
+          "completion_tokens": 7,
+          "total_tokens": 3032
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2014-2573_destroy_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "other",
+        "length_matched": null,
+        "retrieved_cve_ids": [
+          "CVE-2014-8333",
+          "CVE-2015-3241",
+          "CVE-2015-3241"
+        ],
+        "prompt_sha256": "6bf663f942c9cd0a41ec40ac2a3acb44301ad147b161e93fa9f28f4cfbf461f9",
+        "prompt_tokens_est": 2808,
+        "prediction": true,
+        "any_finding": true,
+        "validated_count": 1,
+        "raw_finding_count": 1,
+        "flagged_cve_ids": [
+          "CVE-2014-8333"
+        ],
+        "flagged_categories": [
+          "other"
+        ],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.901,
+        "usage": {
+          "prompt_tokens": 2404,
+          "completion_tokens": 235,
+          "total_tokens": 2639
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2017-1000246_encrypt_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "other",
+        "length_matched": null,
+        "retrieved_cve_ids": [
+          "CVE-2023-52323",
+          "CVE-2013-2167",
+          "CVE-2020-25659"
+        ],
+        "prompt_sha256": "b7485a2d4eebfab0a0106744d0f846e479050c42258a5c8d00cef374bb55295a",
+        "prompt_tokens_est": 2196,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.315,
+        "usage": {
+          "prompt_tokens": 2407,
+          "completion_tokens": 7,
+          "total_tokens": 2414
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2017-1000246_encrypt_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "other",
+        "length_matched": null,
+        "retrieved_cve_ids": [
+          "CVE-2023-52323",
+          "CVE-2020-25659",
+          "CVE-2013-2167"
+        ],
+        "prompt_sha256": "1fd2de8c0fae4cd3c34f2d90f5984d6085e23d6b163fc53dd3002c8df7c14570",
+        "prompt_tokens_est": 2185,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.314,
+        "usage": {
+          "prompt_tokens": 2395,
+          "completion_tokens": 7,
+          "total_tokens": 2402
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2026-23528_http_get_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "xss",
+        "length_matched": null,
+        "retrieved_cve_ids": [
+          "CVE-2026-28416",
+          "CVE-2026-48545",
+          "CVE-2023-34239"
+        ],
+        "prompt_sha256": "db2eafdf96fe5aa90a4a5e7fd397e46c8c3a264b52f436cb79c1028ec6cbbb98",
+        "prompt_tokens_est": 1630,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.268,
+        "usage": {
+          "prompt_tokens": 1612,
+          "completion_tokens": 7,
+          "total_tokens": 1619
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2026-23528_http_get_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "xss",
+        "length_matched": null,
+        "retrieved_cve_ids": [
+          "CVE-2026-28416",
+          "CVE-2026-48545",
+          "CVE-2022-21697"
+        ],
+        "prompt_sha256": "d2dfaec21562fb063e9a9c7c07b840d878540fbe40c662327453a675615bce06",
+        "prompt_tokens_est": 1831,
+        "prediction": true,
+        "any_finding": true,
+        "validated_count": 1,
+        "raw_finding_count": 1,
+        "flagged_cve_ids": [
+          "CVE-2022-21697"
+        ],
+        "flagged_categories": [
+          "ssrf"
+        ],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.783,
+        "usage": {
+          "prompt_tokens": 1817,
+          "completion_tokens": 215,
+          "total_tokens": 2032
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2026-29038_construct_tag_routes_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "xss",
+        "length_matched": null,
+        "retrieved_cve_ids": [
+          "CVE-2026-27696",
+          "CVE-2021-35936",
+          "CVE-2024-23823"
+        ],
+        "prompt_sha256": "02c8ea89105d6f593e6a22de5ba0b16114d57d0d57b14560f9f63321d3fd62e6",
+        "prompt_tokens_est": 3213,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 2.509,
+        "usage": {
+          "prompt_tokens": 2873,
+          "completion_tokens": 7,
+          "total_tokens": 2880
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2026-29038_construct_tag_routes_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "xss",
+        "length_matched": null,
+        "retrieved_cve_ids": [
+          "CVE-2026-27696",
+          "CVE-2021-35936",
+          "CVE-2024-23823"
+        ],
+        "prompt_sha256": "c4f16ab63a96eaf84e8330f7bcc227c3045bee6bc0b9f2409f8829c191a7d0c4",
+        "prompt_tokens_est": 3213,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 3.468,
+        "usage": {
+          "prompt_tokens": 2874,
+          "completion_tokens": 7,
+          "total_tokens": 2881
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2024-21642_time_dataframe_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "ssrf",
+        "length_matched": null,
+        "retrieved_cve_ids": [
+          "CVE-2018-1000559",
+          "CVE-2026-27194",
+          "CVE-2024-27133"
+        ],
+        "prompt_sha256": "b1fb8e4c71756f4bea01681b8f41e553aa4235f78a08889dc320a007fea76ce4",
+        "prompt_tokens_est": 1887,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.291,
+        "usage": {
+          "prompt_tokens": 1825,
+          "completion_tokens": 7,
+          "total_tokens": 1832
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2024-21642_time_dataframe_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "ssrf",
+        "length_matched": null,
+        "retrieved_cve_ids": [
+          "CVE-2024-27133",
+          "CVE-2024-8862",
+          "CVE-2026-27194"
+        ],
+        "prompt_sha256": "f13acb6997055d60c313774da1816a3d1809487cf44f2e5602d311ce093ce1c4",
+        "prompt_tokens_est": 2298,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.276,
+        "usage": {
+          "prompt_tokens": 2266,
+          "completion_tokens": 7,
+          "total_tokens": 2273
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2022-3456__checkpassword_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "other",
+        "length_matched": null,
+        "retrieved_cve_ids": [
+          "CVE-2022-3273",
+          "CVE-2022-4018",
+          "CVE-2021-29621"
+        ],
+        "prompt_sha256": "7382571ea26d9cc4dfbc6bb2b63fe469fb2e87c857ec270708e6e7916f4e68cf",
+        "prompt_tokens_est": 1445,
+        "prediction": true,
+        "any_finding": true,
+        "validated_count": 1,
+        "raw_finding_count": 1,
+        "flagged_cve_ids": [
+          "CVE-2021-29621"
+        ],
+        "flagged_categories": [
+          "other"
+        ],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 1.286,
+        "usage": {
+          "prompt_tokens": 1375,
+          "completion_tokens": 381,
+          "total_tokens": 1756
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2022-3456__checkpassword_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "other",
+        "length_matched": null,
+        "retrieved_cve_ids": [
+          "CVE-2022-3273",
+          "CVE-2022-4018",
+          "CVE-2021-29621"
+        ],
+        "prompt_sha256": "f121a6db4128dda3e41920b404db9b08a23647fc550d6ee98d02bb00d87f8e51",
+        "prompt_tokens_est": 1490,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.329,
+        "usage": {
+          "prompt_tokens": 1422,
+          "completion_tokens": 12,
+          "total_tokens": 1434
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2023-23930_serialize_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "deserialization",
+        "length_matched": null,
+        "retrieved_cve_ids": [
+          "CVE-2026-41486",
+          "CVE-2021-41249",
+          "CVE-2025-54413"
+        ],
+        "prompt_sha256": "0db2f648b5e1e971494e32f3fc48112cea4f68a6ada7be784e932292ccd18c22",
+        "prompt_tokens_est": 1710,
+        "latency_s": 0.447,
+        "usage": {
+          "prompt_tokens": 1700,
+          "completion_tokens": 7,
+          "total_tokens": 1707
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2023-23930_serialize_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "deserialization",
+        "length_matched": null,
+        "retrieved_cve_ids": [
+          "CVE-2025-46722",
+          "CVE-2016-3954",
+          "CVE-2013-2167"
+        ],
+        "prompt_sha256": "198d8c38d9f4b2ce97c2de23948bbe55bcbe3bcb1bdf59b7c951920bcca45ebf",
+        "prompt_tokens_est": 1349,
+        "latency_s": 0.315,
+        "usage": {
+          "prompt_tokens": 1386,
+          "completion_tokens": 7,
+          "total_tokens": 1393
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2023-23930__run_algorithm_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "deserialization",
+        "length_matched": null,
+        "retrieved_cve_ids": [
+          "CVE-2025-57815",
+          "CVE-2021-3702",
+          "CVE-2020-10685"
+        ],
+        "prompt_sha256": "bf5f19d193fbd0e1be950d0a4cb38dbde42b52e2a770316aa7842c39f5ffb205",
+        "prompt_tokens_est": 3296,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 5.537,
+        "usage": {
+          "prompt_tokens": 2920,
+          "completion_tokens": 7,
+          "total_tokens": 2927
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2023-23930__run_algorithm_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "deserialization",
+        "length_matched": null,
+        "retrieved_cve_ids": [
+          "CVE-2025-57815",
+          "CVE-2021-3702",
+          "CVE-2023-38673"
+        ],
+        "prompt_sha256": "0fd1be7a48058ee65d412a65009325ec73a8086346596e52fed4448d195e8ce9",
+        "prompt_tokens_est": 3474,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 7.38,
+        "usage": {
+          "prompt_tokens": 3112,
+          "completion_tokens": 7,
+          "total_tokens": 3119
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary__anonymous__c1840b4595",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "length_matched": true,
+        "retrieved_cve_ids": [
+          "CVE-2022-39286",
+          "CVE-2021-45848",
+          "CVE-2025-68398"
+        ],
+        "prompt_sha256": "17aef0d6c30ccd8eab52b02f87db3f97e945eeb1bdcbe96f01f96ce21d679f2d",
+        "prompt_tokens_est": 1504,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.273,
+        "usage": {
+          "prompt_tokens": 1485,
+          "completion_tokens": 7,
+          "total_tokens": 1492
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_bnpCopyTo_a519895616",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "length_matched": false,
+        "retrieved_cve_ids": [
+          "CVE-2022-24787",
+          "CVE-2021-23403",
+          "CVE-2024-21505"
+        ],
+        "prompt_sha256": "c8c03524d94215eeab0c1cf39b3abd3bbd03a1365696dca417ac9340ede08b75",
+        "prompt_tokens_est": 1367,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.287,
+        "usage": {
+          "prompt_tokens": 1446,
+          "completion_tokens": 7,
+          "total_tokens": 1453
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_baseIndexOf_78d8aa3e7d",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "length_matched": false,
+        "retrieved_cve_ids": [
+          "CVE-2022-25354",
+          "CVE-2026-26021",
+          "CVE-2023-26145"
+        ],
+        "prompt_sha256": "d8b4b198ca7b9e4670c3d86a7c3aa09499a926c4aef1c9fd9ff9b4944797cacd",
+        "prompt_tokens_est": 1459,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.293,
+        "usage": {
+          "prompt_tokens": 1578,
+          "completion_tokens": 7,
+          "total_tokens": 1585
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_sampleSize_5585721a1f",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "length_matched": false,
+        "retrieved_cve_ids": [
+          "CVE-2017-0906",
+          "CVE-2025-69229",
+          "CVE-2014-3621"
+        ],
+        "prompt_sha256": "d5c7fc887da0f8c8ed04629644337eb0ab4a4fa8f6ce1fb3e7c11ae70a41e701",
+        "prompt_tokens_est": 1189,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.234,
+        "usage": {
+          "prompt_tokens": 1210,
+          "completion_tokens": 7,
+          "total_tokens": 1217
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary__anonymous__67f8645072",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "length_matched": false,
+        "retrieved_cve_ids": [
+          "CVE-2026-63225",
+          "CVE-2020-12889",
+          "CVE-2021-23403"
+        ],
+        "prompt_sha256": "d470deb0c26aef4e7211cbaf834d5774e6fe8f79af00ada8fdfe81362c56d357",
+        "prompt_tokens_est": 2187,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.33,
+        "usage": {
+          "prompt_tokens": 1971,
+          "completion_tokens": 7,
+          "total_tokens": 1978
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary__anonymous__fc25197d14",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "length_matched": false,
+        "retrieved_cve_ids": [
+          "CVE-2020-12889",
+          "CVE-2024-3572",
+          "CVE-2014-0473"
+        ],
+        "prompt_sha256": "6187e6ba67747bb8c41cd52f35b589db58ddc0cd04f47f9dbdf17c2b8c0df907",
+        "prompt_tokens_est": 1842,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.263,
+        "usage": {
+          "prompt_tokens": 1613,
+          "completion_tokens": 7,
+          "total_tokens": 1620
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_setFollowLocationLimit_3c7f6d9560",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "length_matched": false,
+        "retrieved_cve_ids": [
+          "CVE-2012-0805",
+          "CVE-2026-27167",
+          "CVE-2025-67502"
+        ],
+        "prompt_sha256": "3c4537cb208d1beceaec5696281a002093bdf0410081edfada77194fb1d9d592",
+        "prompt_tokens_est": 883,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.299,
+        "usage": {
+          "prompt_tokens": 918,
+          "completion_tokens": 12,
+          "total_tokens": 930
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_cast_to_boolean_c9754797e9",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "length_matched": true,
+        "retrieved_cve_ids": [
+          "CVE-2024-34062",
+          "CVE-2026-81724",
+          "CVE-2019-10747"
+        ],
+        "prompt_sha256": "4ef1f819aa6be4f24da8668409d5e87b0057921909884e4ed9892e7ccd91ce78",
+        "prompt_tokens_est": 1813,
+        "latency_s": 0.313,
+        "usage": {
+          "prompt_tokens": 1923,
+          "completion_tokens": 7,
+          "total_tokens": 1930
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_path_to_uri_06489d8a38",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "length_matched": true,
+        "retrieved_cve_ids": [
+          "CVE-2026-55443",
+          "CVE-2024-22415",
+          "CVE-2026-28414"
+        ],
+        "prompt_sha256": "0c49bb3baf251b76b445323bd1f0f473bbc885527c4553acff02588097f43b18",
+        "prompt_tokens_est": 1331,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.245,
+        "usage": {
+          "prompt_tokens": 1337,
+          "completion_tokens": 7,
+          "total_tokens": 1344
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary___init___d2d38fec87",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "length_matched": true,
+        "retrieved_cve_ids": [
+          "CVE-2024-53999",
+          "CVE-2012-0215",
+          "CVE-2024-1314"
+        ],
+        "prompt_sha256": "638b1894586b85fd3fb396a6dabc2f51ffac7c08331ae039f133dfa3ca76a191",
+        "prompt_tokens_est": 1782,
+        "latency_s": 0.354,
+        "usage": {
+          "prompt_tokens": 1682,
+          "completion_tokens": 7,
+          "total_tokens": 1689
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_pop_assign_tracking_8430501da1",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "length_matched": true,
+        "retrieved_cve_ids": [
+          "CVE-2026-27578",
+          "CVE-2022-25948",
+          "CVE-2023-46247"
+        ],
+        "prompt_sha256": "6c59fa387188d9e4e2b9eba36313db43242b5f196401494bc2eb18bd5f4046d7",
+        "prompt_tokens_est": 2141,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 1.518,
+        "usage": {
+          "prompt_tokens": 2164,
+          "completion_tokens": 7,
+          "total_tokens": 2171
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_configure_631e29a21b",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "length_matched": true,
+        "retrieved_cve_ids": [
+          "CVE-2021-32798",
+          "CVE-2026-49257",
+          "CVE-2022-31605"
+        ],
+        "prompt_sha256": "cf4ac496d5a89666576b67a2b536fe090ef90db1af5421daed4084cfd46bece6",
+        "prompt_tokens_est": 2365,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 4.537,
+        "usage": {
+          "prompt_tokens": 2418,
+          "completion_tokens": 7,
+          "total_tokens": 2425
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_delete_schedule_6cebbb0d94",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "length_matched": true,
+        "retrieved_cve_ids": [
+          "CVE-2026-55228",
+          "CVE-2024-90003",
+          "CVE-2026-2635"
+        ],
+        "prompt_sha256": "ddcaf28d70fbe8bbb668864ba03b1a6d035766fe813b56840fbca1299123bc30",
+        "prompt_tokens_est": 1034,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:qwen/qwen3.8-27b",
+        "latency_s": 0.393,
+        "usage": {
+          "prompt_tokens": 1013,
+          "completion_tokens": 7,
+          "total_tokens": 1020
+        },
+        "retrieval_pred": true
+      }
+    ]
+  }
+}

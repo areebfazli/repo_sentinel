@@ -1,0 +1,2147 @@
+{
+  "reranker": null,
+  "sample": null,
+  "sample_kinds": {
+    "vulnerable": 14,
+    "fixed_twin": 14,
+    "ordinary": 22
+  },
+  "seed": 42,
+  "sample_kinds_achieved": {
+    "vulnerable": 14,
+    "fixed_twin": 14,
+    "ordinary": 22
+  },
+  "timing": {
+    "n_items": 50,
+    "total_seconds": 3.0516,
+    "seconds_per_item": 0.061,
+    "embed_seconds": 0.2873,
+    "ann_seconds": 2.7447,
+    "rerank_seconds": 0.0
+  },
+  "operating": {
+    "sim_threshold": 0.25,
+    "rerank_threshold": 0.0,
+    "margin_threshold": null,
+    "precision": 0.28,
+    "recall": 1.0,
+    "f1": 0.4375,
+    "category_hit_rate": 0.2857,
+    "twin_coverage": 1.0,
+    "tp": 14,
+    "fp": 36,
+    "fn": 0,
+    "tn": 0,
+    "n": 50
+  },
+  "sweep": [
+    {
+      "sim_threshold": 0.35,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.2857,
+      "recall": 1.0,
+      "f1": 0.4444,
+      "category_hit_rate": 0.2857,
+      "twin_coverage": 0.98,
+      "tp": 14,
+      "fp": 35,
+      "fn": 0,
+      "tn": 1,
+      "n": 50
+    },
+    {
+      "sim_threshold": 0.2,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.28,
+      "recall": 1.0,
+      "f1": 0.4375,
+      "category_hit_rate": 0.2857,
+      "twin_coverage": 1.0,
+      "tp": 14,
+      "fp": 36,
+      "fn": 0,
+      "tn": 0,
+      "n": 50
+    },
+    {
+      "sim_threshold": 0.25,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.28,
+      "recall": 1.0,
+      "f1": 0.4375,
+      "category_hit_rate": 0.2857,
+      "twin_coverage": 1.0,
+      "tp": 14,
+      "fp": 36,
+      "fn": 0,
+      "tn": 0,
+      "n": 50
+    },
+    {
+      "sim_threshold": 0.3,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.28,
+      "recall": 1.0,
+      "f1": 0.4375,
+      "category_hit_rate": 0.2857,
+      "twin_coverage": 1.0,
+      "tp": 14,
+      "fp": 36,
+      "fn": 0,
+      "tn": 0,
+      "n": 50
+    },
+    {
+      "sim_threshold": 0.4,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.2927,
+      "recall": 0.8571,
+      "f1": 0.4364,
+      "category_hit_rate": 0.25,
+      "twin_coverage": 0.82,
+      "tp": 12,
+      "fp": 29,
+      "fn": 2,
+      "tn": 7,
+      "n": 50
+    },
+    {
+      "sim_threshold": 0.45,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.2973,
+      "recall": 0.7857,
+      "f1": 0.4314,
+      "category_hit_rate": 0.2727,
+      "twin_coverage": 0.74,
+      "tp": 11,
+      "fp": 26,
+      "fn": 3,
+      "tn": 10,
+      "n": 50
+    },
+    {
+      "sim_threshold": 0.5,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.2593,
+      "recall": 0.5,
+      "f1": 0.3415,
+      "category_hit_rate": 0.2857,
+      "twin_coverage": 0.54,
+      "tp": 7,
+      "fp": 20,
+      "fn": 7,
+      "tn": 16,
+      "n": 50
+    },
+    {
+      "sim_threshold": 0.65,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.6,
+      "recall": 0.2143,
+      "f1": 0.3158,
+      "category_hit_rate": 0.3333,
+      "twin_coverage": 0.1,
+      "tp": 3,
+      "fp": 2,
+      "fn": 11,
+      "tn": 34,
+      "n": 50
+    },
+    {
+      "sim_threshold": 0.55,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.2857,
+      "recall": 0.2857,
+      "f1": 0.2857,
+      "category_hit_rate": 0.25,
+      "twin_coverage": 0.28,
+      "tp": 4,
+      "fp": 10,
+      "fn": 10,
+      "tn": 26,
+      "n": 50
+    },
+    {
+      "sim_threshold": 0.6,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.3333,
+      "recall": 0.2143,
+      "f1": 0.2609,
+      "category_hit_rate": 0.3333,
+      "twin_coverage": 0.18,
+      "tp": 3,
+      "fp": 6,
+      "fn": 11,
+      "tn": 30,
+      "n": 50
+    },
+    {
+      "sim_threshold": 0.8,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.5,
+      "recall": 0.0714,
+      "f1": 0.125,
+      "category_hit_rate": 1.0,
+      "twin_coverage": 0.04,
+      "tp": 1,
+      "fp": 1,
+      "fn": 13,
+      "tn": 35,
+      "n": 50
+    },
+    {
+      "sim_threshold": 0.7,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.3333,
+      "recall": 0.0714,
+      "f1": 0.1176,
+      "category_hit_rate": 1.0,
+      "twin_coverage": 0.06,
+      "tp": 1,
+      "fp": 2,
+      "fn": 13,
+      "tn": 34,
+      "n": 50
+    },
+    {
+      "sim_threshold": 0.75,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.3333,
+      "recall": 0.0714,
+      "f1": 0.1176,
+      "category_hit_rate": 1.0,
+      "twin_coverage": 0.06,
+      "tp": 1,
+      "fp": 2,
+      "fn": 13,
+      "tn": 34,
+      "n": 50
+    },
+    {
+      "sim_threshold": 0.85,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "category_hit_rate": 0.0,
+      "twin_coverage": 0.02,
+      "tp": 0,
+      "fp": 1,
+      "fn": 14,
+      "tn": 35,
+      "n": 50
+    },
+    {
+      "sim_threshold": 0.9,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "category_hit_rate": 0.0,
+      "twin_coverage": 0.02,
+      "tp": 0,
+      "fp": 1,
+      "fn": 14,
+      "tn": 35,
+      "n": 50
+    },
+    {
+      "sim_threshold": 0.95,
+      "rerank_threshold": 0.0,
+      "margin_threshold": null,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "category_hit_rate": 0.0,
+      "twin_coverage": 0.02,
+      "tp": 0,
+      "fp": 1,
+      "fn": 14,
+      "tn": 35,
+      "n": 50
+    }
+  ],
+  "realistic": {
+    "n": 50,
+    "n_scored": 50,
+    "n_excluded": 0,
+    "tpr_vulnerable": {
+      "k": 14,
+      "n": 14,
+      "rate": 1.0,
+      "ci95": [
+        0.7847,
+        1.0
+      ]
+    },
+    "fpr_fixed_twin": {
+      "k": 14,
+      "n": 14,
+      "rate": 1.0,
+      "ci95": [
+        0.7847,
+        1.0
+      ]
+    },
+    "fpr_ordinary": {
+      "k": 22,
+      "n": 22,
+      "rate": 1.0,
+      "ci95": [
+        0.8513,
+        1.0
+      ]
+    },
+    "fpr_handwritten_safe": {
+      "k": 0,
+      "n": 0,
+      "rate": null,
+      "ci95": null
+    },
+    "tpr_handwritten": {
+      "k": 0,
+      "n": 0,
+      "rate": null,
+      "ci95": null
+    },
+    "precision_at_base_rate": {
+      "0.01": 0.01,
+      "0.02": 0.02,
+      "0.05": 0.05
+    },
+    "precision_balanced_vs_fixed_twin": 0.5,
+    "precision_balanced_vs_ordinary": 0.5,
+    "pairs": {
+      "n": 13,
+      "vuln_only": 0.0,
+      "n_vuln_only": 0,
+      "twin_only": 0.0,
+      "n_twin_only": 0,
+      "both": 1.0,
+      "n_both": 13,
+      "neither": 0.0,
+      "n_neither": 0
+    },
+    "observed": {
+      "tp": 14,
+      "fp": 36,
+      "fn": 0,
+      "tn": 0,
+      "precision": 0.28,
+      "recall": 1.0
+    }
+  },
+  "llm": {
+    "config": {
+      "model": "groq:openai/gpt-oss-120b",
+      "chain": [
+        "groq:openai/gpt-oss-120b"
+      ],
+      "primary_only": true,
+      "max_calls": 60,
+      "sleep_s": 2.5,
+      "tpm": 8000,
+      "token_budget": 150000,
+      "cache": "ml/evaluation/results/llm_cache.jsonl",
+      "top_k": 3,
+      "rule": "vulnerable iff >= 1 validated finding references a retrieved CVE"
+    },
+    "calls": 48,
+    "tokens_used": 113916,
+    "stopped": null,
+    "status_counts": {
+      "cached": 2,
+      "ok": 48
+    },
+    "providers": {
+      "groq:openai/gpt-oss-120b": 50
+    },
+    "realistic": {
+      "n": 50,
+      "n_scored": 50,
+      "n_excluded": 0,
+      "tpr_vulnerable": {
+        "k": 1,
+        "n": 14,
+        "rate": 0.0714,
+        "ci95": [
+          0.0127,
+          0.3147
+        ]
+      },
+      "fpr_fixed_twin": {
+        "k": 1,
+        "n": 14,
+        "rate": 0.0714,
+        "ci95": [
+          0.0127,
+          0.3147
+        ]
+      },
+      "fpr_ordinary": {
+        "k": 1,
+        "n": 22,
+        "rate": 0.0455,
+        "ci95": [
+          0.0081,
+          0.218
+        ]
+      },
+      "fpr_handwritten_safe": {
+        "k": 0,
+        "n": 0,
+        "rate": null,
+        "ci95": null
+      },
+      "tpr_handwritten": {
+        "k": 0,
+        "n": 0,
+        "rate": null,
+        "ci95": null
+      },
+      "precision_at_base_rate": {
+        "0.01": 0.0156,
+        "0.02": 0.031,
+        "0.05": 0.0763
+      },
+      "precision_balanced_vs_fixed_twin": 0.5,
+      "precision_balanced_vs_ordinary": 0.6108,
+      "pairs": {
+        "n": 13,
+        "vuln_only": 0.0769,
+        "n_vuln_only": 1,
+        "twin_only": 0.0769,
+        "n_twin_only": 1,
+        "both": 0.0,
+        "n_both": 0,
+        "neither": 0.8462,
+        "n_neither": 11
+      },
+      "observed": {
+        "tp": 1,
+        "fp": 2,
+        "fn": 13,
+        "tn": 34,
+        "precision": 0.3333,
+        "recall": 0.0714
+      }
+    },
+    "realistic_any_finding": {
+      "n": 50,
+      "n_scored": 50,
+      "n_excluded": 0,
+      "tpr_vulnerable": {
+        "k": 1,
+        "n": 14,
+        "rate": 0.0714,
+        "ci95": [
+          0.0127,
+          0.3147
+        ]
+      },
+      "fpr_fixed_twin": {
+        "k": 1,
+        "n": 14,
+        "rate": 0.0714,
+        "ci95": [
+          0.0127,
+          0.3147
+        ]
+      },
+      "fpr_ordinary": {
+        "k": 1,
+        "n": 22,
+        "rate": 0.0455,
+        "ci95": [
+          0.0081,
+          0.218
+        ]
+      },
+      "fpr_handwritten_safe": {
+        "k": 0,
+        "n": 0,
+        "rate": null,
+        "ci95": null
+      },
+      "tpr_handwritten": {
+        "k": 0,
+        "n": 0,
+        "rate": null,
+        "ci95": null
+      },
+      "precision_at_base_rate": {
+        "0.01": 0.0156,
+        "0.02": 0.031,
+        "0.05": 0.0763
+      },
+      "precision_balanced_vs_fixed_twin": 0.5,
+      "precision_balanced_vs_ordinary": 0.6108,
+      "pairs": {
+        "n": 13,
+        "vuln_only": 0.0769,
+        "n_vuln_only": 1,
+        "twin_only": 0.0769,
+        "n_twin_only": 1,
+        "both": 0.0,
+        "n_both": 0,
+        "neither": 0.8462,
+        "n_neither": 11
+      },
+      "observed": {
+        "tp": 1,
+        "fp": 2,
+        "fn": 13,
+        "tn": 34,
+        "precision": 0.3333,
+        "recall": 0.0714
+      }
+    },
+    "realistic_retrieval_same_items": {
+      "n": 50,
+      "n_scored": 50,
+      "n_excluded": 0,
+      "tpr_vulnerable": {
+        "k": 14,
+        "n": 14,
+        "rate": 1.0,
+        "ci95": [
+          0.7847,
+          1.0
+        ]
+      },
+      "fpr_fixed_twin": {
+        "k": 14,
+        "n": 14,
+        "rate": 1.0,
+        "ci95": [
+          0.7847,
+          1.0
+        ]
+      },
+      "fpr_ordinary": {
+        "k": 22,
+        "n": 22,
+        "rate": 1.0,
+        "ci95": [
+          0.8513,
+          1.0
+        ]
+      },
+      "fpr_handwritten_safe": {
+        "k": 0,
+        "n": 0,
+        "rate": null,
+        "ci95": null
+      },
+      "tpr_handwritten": {
+        "k": 0,
+        "n": 0,
+        "rate": null,
+        "ci95": null
+      },
+      "precision_at_base_rate": {
+        "0.01": 0.01,
+        "0.02": 0.02,
+        "0.05": 0.05
+      },
+      "precision_balanced_vs_fixed_twin": 0.5,
+      "precision_balanced_vs_ordinary": 0.5,
+      "pairs": {
+        "n": 13,
+        "vuln_only": 0.0,
+        "n_vuln_only": 0,
+        "twin_only": 0.0,
+        "n_twin_only": 0,
+        "both": 1.0,
+        "n_both": 13,
+        "neither": 0.0,
+        "n_neither": 0
+      },
+      "observed": {
+        "tp": 14,
+        "fp": 36,
+        "fn": 0,
+        "tn": 0,
+        "precision": 0.28,
+        "recall": 1.0
+      }
+    },
+    "category_hit_rate": 1.0,
+    "items": [
+      {
+        "id": "GHSA-22wc-c9wj-6q2v_parse_List_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "other",
+        "retrieved_cve_ids": [
+          "CVE-2025-22151",
+          "CVE-2026-55228",
+          "CVE-2018-25082"
+        ],
+        "prompt_sha256": "d8dbb83ae09d4ca41b65b887071f3cada6445923ccc1df32a827590c53fb4534",
+        "prompt_tokens_est": 1979,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "latency_s": 0.954,
+        "usage": {
+          "prompt_tokens": 1790,
+          "completion_tokens": 174,
+          "total_tokens": 1964
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "GHSA-22wc-c9wj-6q2v_parse_List_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "other",
+        "retrieved_cve_ids": [
+          "CVE-2025-22151",
+          "CVE-2026-71433",
+          "CVE-2026-76098"
+        ],
+        "prompt_sha256": "eb74ddba794c05690a721d57f617c96fa2d6aee33e62fc0d0896177ec87f1f06",
+        "prompt_tokens_est": 2898,
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "cached",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "latency_s": 1.061,
+        "usage": {
+          "prompt_tokens": 2442,
+          "completion_tokens": 346,
+          "total_tokens": 2788
+        },
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2014-2573_destroy_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "other",
+        "retrieved_cve_ids": [
+          "CVE-2014-8333",
+          "CVE-2015-3241",
+          "CVE-2015-3241"
+        ],
+        "prompt_sha256": "81b30f3796fde8a348e57d303dccbc6b4580ad2ccc2c63318c783706128334cf",
+        "prompt_tokens_est": 3588,
+        "latency_s": 2.096,
+        "usage": {
+          "prompt_tokens": 2894,
+          "completion_tokens": 574,
+          "total_tokens": 3468
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2014-2573_destroy_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "other",
+        "retrieved_cve_ids": [
+          "CVE-2014-8333",
+          "CVE-2015-3241",
+          "CVE-2015-3241"
+        ],
+        "prompt_sha256": "6bf663f942c9cd0a41ec40ac2a3acb44301ad147b161e93fa9f28f4cfbf461f9",
+        "prompt_tokens_est": 2808,
+        "latency_s": 2.226,
+        "usage": {
+          "prompt_tokens": 2326,
+          "completion_tokens": 689,
+          "total_tokens": 3015
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": true,
+        "any_finding": true,
+        "validated_count": 1,
+        "raw_finding_count": 1,
+        "flagged_cve_ids": [
+          "CVE-2014-8333"
+        ],
+        "flagged_categories": [
+          "other"
+        ],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2017-1000246_encrypt_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "other",
+        "retrieved_cve_ids": [
+          "CVE-2023-52323",
+          "CVE-2013-2167",
+          "CVE-2020-25659"
+        ],
+        "prompt_sha256": "b7485a2d4eebfab0a0106744d0f846e479050c42258a5c8d00cef374bb55295a",
+        "prompt_tokens_est": 2196,
+        "latency_s": 1.222,
+        "usage": {
+          "prompt_tokens": 2365,
+          "completion_tokens": 263,
+          "total_tokens": 2628
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2017-1000246_encrypt_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "other",
+        "retrieved_cve_ids": [
+          "CVE-2023-52323",
+          "CVE-2020-25659",
+          "CVE-2013-2167"
+        ],
+        "prompt_sha256": "1fd2de8c0fae4cd3c34f2d90f5984d6085e23d6b163fc53dd3002c8df7c14570",
+        "prompt_tokens_est": 2185,
+        "latency_s": 1.875,
+        "usage": {
+          "prompt_tokens": 2353,
+          "completion_tokens": 483,
+          "total_tokens": 2836
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2026-23528_http_get_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "xss",
+        "retrieved_cve_ids": [
+          "CVE-2026-28416",
+          "CVE-2026-48545",
+          "CVE-2023-34239"
+        ],
+        "prompt_sha256": "db2eafdf96fe5aa90a4a5e7fd397e46c8c3a264b52f436cb79c1028ec6cbbb98",
+        "prompt_tokens_est": 1630,
+        "latency_s": 0.607,
+        "usage": {
+          "prompt_tokens": 1591,
+          "completion_tokens": 123,
+          "total_tokens": 1714
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2026-23528_http_get_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "xss",
+        "retrieved_cve_ids": [
+          "CVE-2026-28416",
+          "CVE-2026-48545",
+          "CVE-2022-21697"
+        ],
+        "prompt_sha256": "d2dfaec21562fb063e9a9c7c07b840d878540fbe40c662327453a675615bce06",
+        "prompt_tokens_est": 1831,
+        "latency_s": 1.427,
+        "usage": {
+          "prompt_tokens": 1782,
+          "completion_tokens": 463,
+          "total_tokens": 2245
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2026-29038_construct_tag_routes_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "xss",
+        "retrieved_cve_ids": [
+          "CVE-2026-27696",
+          "CVE-2021-35936",
+          "CVE-2024-23823"
+        ],
+        "prompt_sha256": "02c8ea89105d6f593e6a22de5ba0b16114d57d0d57b14560f9f63321d3fd62e6",
+        "prompt_tokens_est": 3213,
+        "latency_s": 0.914,
+        "usage": {
+          "prompt_tokens": 2758,
+          "completion_tokens": 229,
+          "total_tokens": 2987
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2026-29038_construct_tag_routes_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "xss",
+        "retrieved_cve_ids": [
+          "CVE-2026-27696",
+          "CVE-2021-35936",
+          "CVE-2024-23823"
+        ],
+        "prompt_sha256": "c4f16ab63a96eaf84e8330f7bcc227c3045bee6bc0b9f2409f8829c191a7d0c4",
+        "prompt_tokens_est": 3213,
+        "latency_s": 0.806,
+        "usage": {
+          "prompt_tokens": 2759,
+          "completion_tokens": 253,
+          "total_tokens": 3012
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2021-4118_load_hparams_from_yaml_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "deserialization",
+        "retrieved_cve_ids": [
+          "CVE-2017-16618",
+          "CVE-2019-3830",
+          "CVE-2017-16764"
+        ],
+        "prompt_sha256": "6d885f596cd57b7146c6df78e1f139f2319e2ca13a166279f63b6e0a0aae52cc",
+        "prompt_tokens_est": 1076,
+        "latency_s": 1.626,
+        "usage": {
+          "prompt_tokens": 1147,
+          "completion_tokens": 685,
+          "total_tokens": 1832
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": true,
+        "any_finding": true,
+        "validated_count": 2,
+        "raw_finding_count": 2,
+        "flagged_cve_ids": [
+          "CVE-2017-16618",
+          "CVE-2017-16764"
+        ],
+        "flagged_categories": [
+          "cmd_injection",
+          "deserialization"
+        ],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2021-4118_load_hparams_from_yaml_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "deserialization",
+        "retrieved_cve_ids": [
+          "CVE-2017-16618",
+          "CVE-2019-3830",
+          "CVE-2017-16764"
+        ],
+        "prompt_sha256": "b6b56bf090048fee90379d0b4de7e24d64b99d4a2235994ecf9be02cb2a48f05",
+        "prompt_tokens_est": 1071,
+        "latency_s": 0.76,
+        "usage": {
+          "prompt_tokens": 1141,
+          "completion_tokens": 235,
+          "total_tokens": 1376
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2026-79675__validate_java_options_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "other",
+        "retrieved_cve_ids": [
+          "CVE-2026-67325",
+          "CVE-2026-78679",
+          "CVE-2025-14279"
+        ],
+        "prompt_sha256": "3b8aa6d74d4a10920fa2d5edb5693bfc856feff8defc2f63df738ee99ce2e9d2",
+        "prompt_tokens_est": 3502,
+        "latency_s": 0.601,
+        "usage": {
+          "prompt_tokens": 3244,
+          "completion_tokens": 127,
+          "total_tokens": 3371
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2026-79675__validate_java_options_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "other",
+        "retrieved_cve_ids": [
+          "CVE-2026-78679",
+          "CVE-2026-67325",
+          "CVE-2025-14279"
+        ],
+        "prompt_sha256": "930ba9103387b54cf164dc9993e3773a61532d01d86eb09a0edfae0c7dd084a0",
+        "prompt_tokens_est": 3998,
+        "latency_s": 0.878,
+        "usage": {
+          "prompt_tokens": 3761,
+          "completion_tokens": 202,
+          "total_tokens": 3963
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2024-21642_time_dataframe_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "ssrf",
+        "retrieved_cve_ids": [
+          "CVE-2018-1000559",
+          "CVE-2026-27194",
+          "CVE-2024-27133"
+        ],
+        "prompt_sha256": "b1fb8e4c71756f4bea01681b8f41e553aa4235f78a08889dc320a007fea76ce4",
+        "prompt_tokens_est": 1887,
+        "latency_s": 0.83,
+        "usage": {
+          "prompt_tokens": 1783,
+          "completion_tokens": 163,
+          "total_tokens": 1946
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2024-21642_time_dataframe_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "ssrf",
+        "retrieved_cve_ids": [
+          "CVE-2024-27133",
+          "CVE-2024-8862",
+          "CVE-2026-27194"
+        ],
+        "prompt_sha256": "f13acb6997055d60c313774da1816a3d1809487cf44f2e5602d311ce093ce1c4",
+        "prompt_tokens_est": 2298,
+        "latency_s": 1.161,
+        "usage": {
+          "prompt_tokens": 2194,
+          "completion_tokens": 276,
+          "total_tokens": 2470
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2022-3456__checkpassword_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "other",
+        "retrieved_cve_ids": [
+          "CVE-2022-3273",
+          "CVE-2022-4018",
+          "CVE-2021-29621"
+        ],
+        "prompt_sha256": "7382571ea26d9cc4dfbc6bb2b63fe469fb2e87c857ec270708e6e7916f4e68cf",
+        "prompt_tokens_est": 1445,
+        "latency_s": 1.498,
+        "usage": {
+          "prompt_tokens": 1345,
+          "completion_tokens": 487,
+          "total_tokens": 1832
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2022-3456__checkpassword_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "other",
+        "retrieved_cve_ids": [
+          "CVE-2022-3273",
+          "CVE-2022-4018",
+          "CVE-2021-29621"
+        ],
+        "prompt_sha256": "f121a6db4128dda3e41920b404db9b08a23647fc550d6ee98d02bb00d87f8e51",
+        "prompt_tokens_est": 1490,
+        "latency_s": 1.685,
+        "usage": {
+          "prompt_tokens": 1388,
+          "completion_tokens": 617,
+          "total_tokens": 2005
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2023-42453_on_POST_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "other",
+        "retrieved_cve_ids": [
+          "CVE-2020-26257",
+          "CVE-2025-53365",
+          "CVE-2025-53366"
+        ],
+        "prompt_sha256": "953adf2e94a49903c0b4bc36072fc46efe23880e6c10a93201fec1c05208eee5",
+        "prompt_tokens_est": 3598,
+        "latency_s": 1.012,
+        "usage": {
+          "prompt_tokens": 2652,
+          "completion_tokens": 98,
+          "total_tokens": 2750
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2023-42453_on_POST_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "other",
+        "retrieved_cve_ids": [
+          "CVE-2020-26257",
+          "CVE-2025-53365",
+          "CVE-2025-53366"
+        ],
+        "prompt_sha256": "31d81182a41913eeff3bf63de78b60fdc8fe015e723f5632a659b88557cf0464",
+        "prompt_tokens_est": 3595,
+        "latency_s": 4.612,
+        "usage": {
+          "prompt_tokens": 2650,
+          "completion_tokens": 239,
+          "total_tokens": 2889
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2023-42453_on_POST_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "other",
+        "retrieved_cve_ids": [
+          "CVE-2026-44797",
+          "CVE-2023-45129",
+          "CVE-2025-53365"
+        ],
+        "prompt_sha256": "1c287e74735ad5d52e5e6562849c06dfcde1c48878bbf4aa671db7124a634a2d",
+        "prompt_tokens_est": 3763,
+        "latency_s": 1.312,
+        "usage": {
+          "prompt_tokens": 3047,
+          "completion_tokens": 331,
+          "total_tokens": 3378
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2023-42453_on_POST_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "other",
+        "retrieved_cve_ids": [
+          "CVE-2026-44797",
+          "CVE-2023-45129",
+          "CVE-2025-53365"
+        ],
+        "prompt_sha256": "751d10a3095baeb2f42b64570fee3d52b223c547424dacf3c1f6e2296d2f92db",
+        "prompt_tokens_est": 3760,
+        "latency_s": 3.197,
+        "usage": {
+          "prompt_tokens": 3045,
+          "completion_tokens": 266,
+          "total_tokens": 3311
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2023-23930_serialize_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "deserialization",
+        "retrieved_cve_ids": [
+          "CVE-2026-41486",
+          "CVE-2021-41249",
+          "CVE-2025-54413"
+        ],
+        "prompt_sha256": "0db2f648b5e1e971494e32f3fc48112cea4f68a6ada7be784e932292ccd18c22",
+        "prompt_tokens_est": 1710,
+        "latency_s": 0.715,
+        "usage": {
+          "prompt_tokens": 1659,
+          "completion_tokens": 224,
+          "total_tokens": 1883
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2023-23930_serialize_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "deserialization",
+        "retrieved_cve_ids": [
+          "CVE-2025-46722",
+          "CVE-2016-3954",
+          "CVE-2013-2167"
+        ],
+        "prompt_sha256": "198d8c38d9f4b2ce97c2de23948bbe55bcbe3bcb1bdf59b7c951920bcca45ebf",
+        "prompt_tokens_est": 1349,
+        "latency_s": 1.395,
+        "usage": {
+          "prompt_tokens": 1371,
+          "completion_tokens": 431,
+          "total_tokens": 1802
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2023-23930__run_algorithm_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "deserialization",
+        "retrieved_cve_ids": [
+          "CVE-2025-57815",
+          "CVE-2021-3702",
+          "CVE-2020-10685"
+        ],
+        "prompt_sha256": "bf5f19d193fbd0e1be950d0a4cb38dbde42b52e2a770316aa7842c39f5ffb205",
+        "prompt_tokens_est": 3296,
+        "latency_s": 1.049,
+        "usage": {
+          "prompt_tokens": 2809,
+          "completion_tokens": 247,
+          "total_tokens": 3056
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2023-23930__run_algorithm_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "deserialization",
+        "retrieved_cve_ids": [
+          "CVE-2025-57815",
+          "CVE-2021-3702",
+          "CVE-2023-38673"
+        ],
+        "prompt_sha256": "0fd1be7a48058ee65d412a65009325ec73a8086346596e52fed4448d195e8ce9",
+        "prompt_tokens_est": 3474,
+        "latency_s": 1.003,
+        "usage": {
+          "prompt_tokens": 2994,
+          "completion_tokens": 286,
+          "total_tokens": 3280
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2026-58484_walk_vuln",
+        "kind": "vulnerable",
+        "label": "vulnerable",
+        "category": "path_traversal",
+        "retrieved_cve_ids": [
+          "CVE-2026-77415",
+          "CVE-2026-54574",
+          "CVE-2025-6210"
+        ],
+        "prompt_sha256": "961e1c8bd97f01ece65de4d281c31fa1322cecfe34cca5cf584d9fbe7dfd24fc",
+        "prompt_tokens_est": 1858,
+        "latency_s": 1.008,
+        "usage": {
+          "prompt_tokens": 1666,
+          "completion_tokens": 245,
+          "total_tokens": 1911
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "CVE-2026-58484_walk_safe",
+        "kind": "fixed_twin",
+        "label": "safe",
+        "category": "path_traversal",
+        "retrieved_cve_ids": [
+          "CVE-2021-4287",
+          "CVE-2025-6210",
+          "CVE-2025-27145"
+        ],
+        "prompt_sha256": "323ac65bc4c24ec9591a630992b5d1728cb689c1eaa7d2feb6f7a981d9d107ad",
+        "prompt_tokens_est": 3015,
+        "latency_s": 1.496,
+        "usage": {
+          "prompt_tokens": 2435,
+          "completion_tokens": 298,
+          "total_tokens": 2733
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary__anonymous__c1840b4595",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2022-39286",
+          "CVE-2021-45848",
+          "CVE-2025-68398"
+        ],
+        "prompt_sha256": "17aef0d6c30ccd8eab52b02f87db3f97e945eeb1bdcbe96f01f96ce21d679f2d",
+        "prompt_tokens_est": 1504,
+        "latency_s": 1.086,
+        "usage": {
+          "prompt_tokens": 1467,
+          "completion_tokens": 245,
+          "total_tokens": 1712
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_bnpCopyTo_a519895616",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2022-24787",
+          "CVE-2021-23403",
+          "CVE-2024-21505"
+        ],
+        "prompt_sha256": "c8c03524d94215eeab0c1cf39b3abd3bbd03a1365696dca417ac9340ede08b75",
+        "prompt_tokens_est": 1367,
+        "latency_s": 0.965,
+        "usage": {
+          "prompt_tokens": 1453,
+          "completion_tokens": 180,
+          "total_tokens": 1633
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary__anonymous__74e5a7367c",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2023-45139",
+          "CVE-2026-31899",
+          "CVE-2026-55379"
+        ],
+        "prompt_sha256": "bf196c02fa5da9542b4f94c3ba7220e4ecb9a6b2ea22e9151bdb36bb11172fa0",
+        "prompt_tokens_est": 2648,
+        "latency_s": 0.749,
+        "usage": {
+          "prompt_tokens": 2878,
+          "completion_tokens": 111,
+          "total_tokens": 2989
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_baseIndexOf_78d8aa3e7d",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2022-25354",
+          "CVE-2026-26021",
+          "CVE-2023-26145"
+        ],
+        "prompt_sha256": "d8b4b198ca7b9e4670c3d86a7c3aa09499a926c4aef1c9fd9ff9b4944797cacd",
+        "prompt_tokens_est": 1459,
+        "latency_s": 1.82,
+        "usage": {
+          "prompt_tokens": 1546,
+          "completion_tokens": 242,
+          "total_tokens": 1788
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_sampleSize_5585721a1f",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2017-0906",
+          "CVE-2025-69229",
+          "CVE-2014-3621"
+        ],
+        "prompt_sha256": "d5c7fc887da0f8c8ed04629644337eb0ab4a4fa8f6ce1fb3e7c11ae70a41e701",
+        "prompt_tokens_est": 1189,
+        "latency_s": 0.818,
+        "usage": {
+          "prompt_tokens": 1231,
+          "completion_tokens": 204,
+          "total_tokens": 1435
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary__anonymous__67f8645072",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2026-63225",
+          "CVE-2020-12889",
+          "CVE-2021-23403"
+        ],
+        "prompt_sha256": "d470deb0c26aef4e7211cbaf834d5774e6fe8f79af00ada8fdfe81362c56d357",
+        "prompt_tokens_est": 2187,
+        "latency_s": 2.433,
+        "usage": {
+          "prompt_tokens": 1939,
+          "completion_tokens": 438,
+          "total_tokens": 2377
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary__anonymous__fc25197d14",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2020-12889",
+          "CVE-2024-3572",
+          "CVE-2014-0473"
+        ],
+        "prompt_sha256": "6187e6ba67747bb8c41cd52f35b589db58ddc0cd04f47f9dbdf17c2b8c0df907",
+        "prompt_tokens_est": 1842,
+        "latency_s": 1.507,
+        "usage": {
+          "prompt_tokens": 1574,
+          "completion_tokens": 275,
+          "total_tokens": 1849
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary__start_trace_43d45be035",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2025-65944",
+          "CVE-2021-37705",
+          "CVE-2026-44504"
+        ],
+        "prompt_sha256": "1dca7928d8ccbc0468b5ac8d647fe3de037a665a73dc104b1b1ffe7e7e04f4ae",
+        "prompt_tokens_est": 1964,
+        "latency_s": 1.104,
+        "usage": {
+          "prompt_tokens": 1810,
+          "completion_tokens": 285,
+          "total_tokens": 2095
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_setFollowLocationLimit_3c7f6d9560",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2012-0805",
+          "CVE-2026-27167",
+          "CVE-2025-67502"
+        ],
+        "prompt_sha256": "3c4537cb208d1beceaec5696281a002093bdf0410081edfada77194fb1d9d592",
+        "prompt_tokens_est": 883,
+        "latency_s": 1.274,
+        "usage": {
+          "prompt_tokens": 953,
+          "completion_tokens": 444,
+          "total_tokens": 1397
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary___init___c9b3e4556f",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2018-10874",
+          "CVE-2021-42134",
+          "CVE-2018-14505"
+        ],
+        "prompt_sha256": "4bf74dbc02c691903e365d8904912dc7b73224587929e5f1ca8eb9afeb92c469",
+        "prompt_tokens_est": 2085,
+        "latency_s": 2.144,
+        "usage": {
+          "prompt_tokens": 2152,
+          "completion_tokens": 353,
+          "total_tokens": 2505
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_cast_to_boolean_c9754797e9",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2024-34062",
+          "CVE-2026-81724",
+          "CVE-2019-10747"
+        ],
+        "prompt_sha256": "4ef1f819aa6be4f24da8668409d5e87b0057921909884e4ed9892e7ccd91ce78",
+        "prompt_tokens_est": 1813,
+        "latency_s": 1.112,
+        "usage": {
+          "prompt_tokens": 1890,
+          "completion_tokens": 405,
+          "total_tokens": 2295
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_path_to_uri_06489d8a38",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2026-55443",
+          "CVE-2024-22415",
+          "CVE-2026-28414"
+        ],
+        "prompt_sha256": "0c49bb3baf251b76b445323bd1f0f473bbc885527c4553acff02588097f43b18",
+        "prompt_tokens_est": 1331,
+        "latency_s": 1.518,
+        "usage": {
+          "prompt_tokens": 1337,
+          "completion_tokens": 543,
+          "total_tokens": 1880
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary___init___d2d38fec87",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2024-53999",
+          "CVE-2012-0215",
+          "CVE-2024-1314"
+        ],
+        "prompt_sha256": "638b1894586b85fd3fb396a6dabc2f51ffac7c08331ae039f133dfa3ca76a191",
+        "prompt_tokens_est": 1782,
+        "latency_s": 3.725,
+        "usage": {
+          "prompt_tokens": 1636,
+          "completion_tokens": 390,
+          "total_tokens": 2026
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary__request_auth_afaeff805b",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2019-19687",
+          "CVE-2015-8747",
+          "CVE-2008-1475"
+        ],
+        "prompt_sha256": "772ad3761756ac8f64261b64e646573fdb88cfbd6dcc813eb9dadc38afde94d8",
+        "prompt_tokens_est": 2442,
+        "latency_s": 1.135,
+        "usage": {
+          "prompt_tokens": 2207,
+          "completion_tokens": 364,
+          "total_tokens": 2571
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_cleanup_b7ff971e4f",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2014-8333",
+          "CVE-2015-3241",
+          "CVE-2015-3241"
+        ],
+        "prompt_sha256": "f298d8a31f25a1d579315fb750f0be089d70c263a6463781dbded646882499b7",
+        "prompt_tokens_est": 3700,
+        "latency_s": 0.96,
+        "usage": {
+          "prompt_tokens": 2948,
+          "completion_tokens": 234,
+          "total_tokens": 3182
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_pop_assign_tracking_8430501da1",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2026-27578",
+          "CVE-2022-25948",
+          "CVE-2023-46247"
+        ],
+        "prompt_sha256": "6c59fa387188d9e4e2b9eba36313db43242b5f196401494bc2eb18bd5f4046d7",
+        "prompt_tokens_est": 2141,
+        "latency_s": 0.762,
+        "usage": {
+          "prompt_tokens": 2119,
+          "completion_tokens": 151,
+          "total_tokens": 2270
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_visit_Import_5536220455",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2026-22609",
+          "CVE-2026-22607",
+          "CVE-2026-22608"
+        ],
+        "prompt_sha256": "9b936bf725d90e83cf3c528e797fd6cd9e80dabe808e8240de237a0c97388d9a",
+        "prompt_tokens_est": 1229,
+        "latency_s": 0.794,
+        "usage": {
+          "prompt_tokens": 1120,
+          "completion_tokens": 146,
+          "total_tokens": 1266
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_configure_631e29a21b",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2021-32798",
+          "CVE-2026-49257",
+          "CVE-2022-31605"
+        ],
+        "prompt_sha256": "cf4ac496d5a89666576b67a2b536fe090ef90db1af5421daed4084cfd46bece6",
+        "prompt_tokens_est": 2365,
+        "latency_s": 1.425,
+        "usage": {
+          "prompt_tokens": 2327,
+          "completion_tokens": 192,
+          "total_tokens": 2519
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary__fetch_76ed05476a",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2022-23915",
+          "CVE-2025-24794",
+          "CVE-2026-59960"
+        ],
+        "prompt_sha256": "00fb03f600bc1c8b6e42c368d62b94c6bf660b277b009bbf11543f40383893dc",
+        "prompt_tokens_est": 1421,
+        "latency_s": 3.342,
+        "usage": {
+          "prompt_tokens": 1376,
+          "completion_tokens": 438,
+          "total_tokens": 1814
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_handleStatus_301_a8bf6ea727",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2026-42874",
+          "CVE-2015-2296",
+          "CVE-2026-21441"
+        ],
+        "prompt_sha256": "4ced6dffffeff7801322fd6ca0011ec9ed4f6149aab43898b879e2b02a49abed",
+        "prompt_tokens_est": 1687,
+        "latency_s": 2.799,
+        "usage": {
+          "prompt_tokens": 1533,
+          "completion_tokens": 781,
+          "total_tokens": 2314
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": true,
+        "any_finding": true,
+        "validated_count": 1,
+        "raw_finding_count": 1,
+        "flagged_cve_ids": [
+          "CVE-2026-42874"
+        ],
+        "flagged_categories": [
+          "other"
+        ],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_delete_schedule_6cebbb0d94",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2026-55228",
+          "CVE-2024-90003",
+          "CVE-2026-2635"
+        ],
+        "prompt_sha256": "ddcaf28d70fbe8bbb668864ba03b1a6d035766fe813b56840fbca1299123bc30",
+        "prompt_tokens_est": 1034,
+        "latency_s": 1.318,
+        "usage": {
+          "prompt_tokens": 1030,
+          "completion_tokens": 524,
+          "total_tokens": 1554
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      },
+      {
+        "id": "ordinary_verify_service_connector_d9ae5b4780",
+        "kind": "ordinary",
+        "label": "safe",
+        "category": "none",
+        "retrieved_cve_ids": [
+          "CVE-2026-11529",
+          "CVE-2019-19687",
+          "CVE-2026-59212"
+        ],
+        "prompt_sha256": "5a3d380a7a4782c10744f630bc6a6504998638e67b1027e562c8367e8e9922d6",
+        "prompt_tokens_est": 3080,
+        "latency_s": 1.234,
+        "usage": {
+          "prompt_tokens": 2675,
+          "completion_tokens": 77,
+          "total_tokens": 2752
+        },
+        "http_statuses": [
+          200
+        ],
+        "prediction": false,
+        "any_finding": false,
+        "validated_count": 0,
+        "raw_finding_count": 0,
+        "flagged_cve_ids": [],
+        "flagged_categories": [],
+        "status": "ok",
+        "provider_used": "groq:openai/gpt-oss-120b",
+        "retrieval_pred": true
+      }
+    ]
+  }
+}

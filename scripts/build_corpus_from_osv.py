@@ -811,13 +811,34 @@ def build_ecosystem_outputs(
     return corpus_kept, eval_kept, rejected
 
 
+def eval_pair_base_id(adv_id: str, function_name: str, vulnerable_code: str,
+                      fixed_code: str) -> str:
+    """``<advisory>_<function>_<hash8>``: the advisory and function name alone
+    are not unique (the same function name in several files of one fix commit,
+    or several overloads), so a short hash of the pair's code is appended.
+    Identical pairs get the same id (and are emitted once)."""
+    fn_token = re.sub(r"[^A-Za-z0-9_-]+", "_", function_name)
+    adv_token = re.sub(r"[^A-Za-z0-9_-]+", "_", adv_id)
+    return f"{adv_token}_{fn_token}_{pair_code_hash(vulnerable_code, fixed_code)}"
+
+
+def pair_code_hash(vulnerable_code: str, fixed_code: str) -> str:
+    return hashlib.sha1(f"{vulnerable_code}\0{fixed_code}".encode()).hexdigest()[:8]
+
+
 def build_eval_lines(eval_pairs: list[dict]) -> list[dict]:
-    """Two ``detection_eval.jsonl``-shaped lines (vulnerable + safe) per pair."""
+    """Two ``detection_eval.jsonl``-shaped lines (vulnerable + safe) per pair,
+    ids ``eval_pair_base_id`` + ``_vuln`` / ``_safe`` (unique; an exact
+    duplicate pair, e.g. the same function copied into two files of one fix
+    commit, is emitted once)."""
     lines = []
+    seen: set[str] = set()
     for e in eval_pairs:
-        fn_token = re.sub(r"[^A-Za-z0-9_-]+", "_", e["function_name"])
-        adv_token = re.sub(r"[^A-Za-z0-9_-]+", "_", e["cve_id"])
-        base_id = f"{adv_token}_{fn_token}"
+        base_id = eval_pair_base_id(e["cve_id"], e["function_name"], e["vulnerable_code"],
+                                    e["fixed_code"])
+        if base_id in seen:
+            continue
+        seen.add(base_id)
         for suffix, label, code in (
             ("vuln", "vulnerable", e["vulnerable_code"]),
             ("safe", "safe", e["fixed_code"]),

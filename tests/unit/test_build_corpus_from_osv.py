@@ -603,3 +603,24 @@ def test_write_ecosystem_outputs_writes_rejected_file_outside_ingest_glob(tmp_pa
     from scripts.ingest_cve_corpus import load_cves
 
     assert len(load_cves(tmp_path)) == len(corpus)
+
+
+def test_eval_ids_are_unique_and_match_the_offline_migration():
+    from scripts.migrate_eval_ids import migrate_lines
+
+    base = {"cve_id": "CVE-1", "function_name": "parse", "language": "python",
+            "category": "other"}
+    pairs = [{**base, "vulnerable_code": "def parse(a): v1", "fixed_code": "def parse(a): f1"},
+             {**base, "vulnerable_code": "def parse(b): v2", "fixed_code": "def parse(b): f2"},
+             {**base, "vulnerable_code": "def parse(a): v1", "fixed_code": "def parse(a): f1"}]
+    lines = build_eval_lines(pairs)
+    ids = [ln["id"] for ln in lines]
+    assert len(ids) == 4 == len(set(ids))  # exact duplicate pair emitted once
+    assert ids[0].startswith("CVE-1_parse_") and ids[0].endswith("_vuln")
+    assert ids[1] == ids[0][:-5] + "_safe"
+    # Old-style ids (<advisory>_<function>), migrated offline, give the same ids.
+    old = [{**ln, "id": "CVE-1_parse_" + ln["id"].rsplit("_", 1)[1]}
+           for ln in build_eval_lines(pairs[:2]) + build_eval_lines(pairs[2:])]
+    migrated, stats = migrate_lines(old)
+    assert migrated == lines and stats["duplicates_dropped"] == 1
+    assert migrate_lines(migrated)[0] == migrated  # idempotent

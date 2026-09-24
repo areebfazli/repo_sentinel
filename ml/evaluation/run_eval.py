@@ -169,10 +169,16 @@ def _as_paths(dataset_path) -> list[Path]:
 
 
 def load_datasets(dataset_path) -> list[dict]:
-    """Concatenate one or more JSONL eval sets, in the order given."""
+    """Concatenate one or more JSONL eval sets, in the order given. Warns on
+    duplicate ids (per-id dicts would merge them; pairing copes, see
+    ``pair_group_keys``)."""
     items: list[dict] = []
     for path in _as_paths(dataset_path):
         items.extend(load_dataset(path))
+    dupes = [k for k, n in Counter(i["id"] for i in items).items() if n > 1]
+    if dupes:
+        print(f"WARNING: {len(dupes)} eval item id(s) occur more than once (e.g. {dupes[0]!r}); "
+              "run scripts/migrate_eval_ids.py", file=sys.stderr)
     return items
 
 
@@ -257,19 +263,31 @@ def item_kind(item: dict) -> str:
     return KIND_HANDWRITTEN
 
 
-def _group_key(item: dict) -> str:
-    """Sampling/pairing group: the pair prefix for vulnerable/fixed-twin items,
-    the item's own id otherwise (an ordinary item is never paired, whatever
-    its id looks like). Identical to ``_pair_key`` for items without ``kind``."""
-    if item_kind(item) in PAIR_KINDS:
-        return _pair_key(item["id"])
-    return item["id"]
+def pair_group_keys(items: list[dict]) -> list[str]:
+    """Sampling / pairing group per item, robust to reused ids.
+
+    A vulnerable / fixed-twin item's group is its pair prefix (``_pair_key``),
+    anything else (an ordinary item is never paired, whatever its id looks
+    like) its own id. If a (prefix, kind) repeats - ids that aren't unique, as
+    in eval files built before ids carried a code hash - the n-th occurrence
+    gets ``<prefix>#<n>``, pairing the n-th vulnerable item with the n-th
+    fixed twin (file order) instead of merging several pairs into one group.
+    """
+    seen: Counter = Counter()
+    keys = []
+    for item in items:
+        kind = item_kind(item)
+        base = _pair_key(item["id"]) if kind in PAIR_KINDS else item["id"]
+        seen[(base, kind)] += 1
+        n = seen[(base, kind)]
+        keys.append(base if n == 1 else f"{base}#{n}")
+    return keys
 
 
 def sample_items(items: list[dict], n: int, seed: int = 42) -> list[dict]:
     """Deterministic, label-balanced subsample that keeps OSV pairs together.
 
-    Items are grouped by ``_pair_key`` (a vuln/safe pair is one group; ids
+    Items are grouped by ``pair_group_keys`` (a vuln/safe pair is one group; ids
     without the suffix are singletons — groups are atomic, so a pair is never
     split). Groups are shuffled with ``random.Random(seed)`` and taken greedily
     while (a) the total stays <= n and (b) |n_vulnerable - n_safe| stays <= 1.
@@ -282,8 +300,8 @@ def sample_items(items: list[dict], n: int, seed: int = 42) -> list[dict]:
     if n >= len(items):
         return list(items)
     groups: dict[str, list[int]] = {}
-    for idx, item in enumerate(items):
-        groups.setdefault(_group_key(item), []).append(idx)
+    for idx, key in enumerate(pair_group_keys(items)):
+        groups.setdefault(key, []).append(idx)
     units = list(groups.values())
     random.Random(seed).shuffle(units)
 
@@ -341,9 +359,9 @@ def sample_items_by_kind(items: list[dict], quotas: dict[str, int], seed: int = 
     of a quota when the pool runs out. Selected items keep their input order.
     """
     groups: dict[str, list[int]] = {}
-    for idx, item in enumerate(items):
+    for idx, (item, key) in enumerate(zip(items, pair_group_keys(items), strict=True)):
         if item_kind(item) in quotas:
-            groups.setdefault(_group_key(item), []).append(idx)
+            groups.setdefault(key, []).append(idx)
     pairs, others = [], []
     for unit in groups.values():
         kinds = {item_kind(items[i]) for i in unit}
@@ -595,9 +613,9 @@ def realistic_metrics(records: list[dict], base_rates=BASE_RATES) -> dict:
     tpr_hw = _rate(preds(lambda r: r["kind"] == KIND_HANDWRITTEN and r["label"] == "vulnerable"))
 
     by_pair: dict[str, dict[str, bool]] = {}
-    for r in scored:
-        if r["kind"] in PAIR_KINDS:
-            by_pair.setdefault(_pair_key(r["id"]), {})[r["kind"]] = bool(r["pred"])
+    pair_records = [r for r in scored if r["kind"] in PAIR_KINDS]
+    for r, key in zip(pair_records, pair_group_keys(pair_records), strict=True):
+        by_pair.setdefault(key, {})[r["kind"]] = bool(r["pred"])
     complete = [p for p in by_pair.values() if len(p) == 2]
     n_pairs = len(complete)
     counts = Counter(

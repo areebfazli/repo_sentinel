@@ -459,3 +459,28 @@ def test_main_out_json_without_sample_records_null(tmp_path, monkeypatch):
     run_eval.main(["--dataset", str(ds), "--out", str(out), "--no-rerank"])
     data = json.loads(out.read_text())
     assert data["sample"] is None and data["seed"] is None
+
+
+def test_pair_group_keys_never_merge_pairs_that_share_an_id():
+    items = [{"id": "A_f_vuln", "label": "vulnerable"}, {"id": "A_f_safe", "label": "safe"},
+             {"id": "A_f_vuln", "label": "vulnerable"}, {"id": "A_f_safe", "label": "safe"},
+             {"id": "ord_1", "label": "safe", "kind": "ordinary"}]
+    assert run_eval.pair_group_keys(items) == ["A_f", "A_f", "A_f#2", "A_f#2", "ord_1"]
+    recs = [{"id": i["id"], "kind": run_eval.item_kind(i), "label": i["label"], "pred": p}
+            for i, p in zip(items[:4], [True, False, False, True], strict=True)]
+    pairs = run_eval.realistic_metrics(recs)["pairs"]
+    assert pairs["n"] == 2 and pairs["n_vuln_only"] == 1 and pairs["n_twin_only"] == 1
+    # Sampling keeps each pair whole and never glues two of them together.
+    picked = run_eval.sample_items(items[:4], 2, seed=0)
+    assert [i["label"] for i in picked] == ["vulnerable", "safe"]
+
+
+def test_eval_dataset_ids_are_unique():
+    from pathlib import Path
+
+    for name in ("detection_eval_osv_pypi.jsonl", "detection_eval_osv_npm.jsonl"):
+        items = run_eval.load_dataset(Path(run_eval.__file__).parent / "datasets" / name)
+        ids = [i["id"] for i in items]
+        assert len(ids) == len(set(ids)), name
+        keys = run_eval.pair_group_keys(items)
+        assert all(keys.count(k) == 2 for k in keys), name  # every item in exactly one pair

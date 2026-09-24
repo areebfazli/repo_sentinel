@@ -34,3 +34,9 @@ data/osv_cache/
 
 # Rejected OSV pairs (audit output of the quality filter; regenerate with --offline)
 data/cve_corpus/rejected/
+
+# Eval outputs too big / too volatile to version (the small result summaries
+# the ROADMAP cites are committed): the LLM response cache and guard_diff's
+# per-pair rows (2.3 MB; regenerate with python -m ml.evaluation.eval_guard_diff).
+ml/evaluation/results/llm_cache.jsonl
+ml/evaluation/results/guard_diff_eval.json

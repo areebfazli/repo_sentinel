@@ -200,6 +200,42 @@ default `--sim-sweep` (0.20–0.95) always includes the 0.25 operating point.
 `--sample N --seed S` runs a label-balanced subsample for quick config comparisons (e.g. of
 `--reranker-model`/`--reranker-max-tokens`); a sample can't be written as the baseline.
 
+**Realistic metrics.** Every run also reports metrics by item `kind` (an explicit `kind`
+field, else from the id: `<p>_vuln` = vulnerable, `<p>_safe` = its fixed twin, anything else
+= handwritten; `detection_eval_ordinary.jsonl` holds ordinary, non-security functions with
+`kind: "ordinary"`). These are TPR on vulnerable items and FPR on fixed twins, ordinary and
+handwritten-safe items (each with a Wilson 95% interval). They also include precision at
+realistic base rates, `TPR·π / (TPR·π + FPR_ordinary·(1−π))` for π = 0.01/0.02/0.05, the
+balanced 50/50 precision, and pairwise discrimination: the share of vuln/twin pairs where
+only the vulnerable one is flagged, and the reverse. `--sample-kinds
+vulnerable=40,fixed_twin=40,ordinary=80 --seed S` draws a stratified sample that keeps
+pairs together. With the same kinds and seed, raising the quotas gives a superset.
+
+**LLM report stage (`--llm`).** This measures the real precision filter end to end. For
+every item with retrieved CVEs, the eval builds the production prompt (the top
+`RETRIEVAL_TOP_K` matches, including the fix diff) and calls the configured `LLMRouter`. It
+then validates the findings against the retrieved-ID allowlist exactly as the API does. An
+item counts as vulnerable when a validated finding references a retrieved CVE.
+`realistic_any_finding` also scores the API's `is_vulnerable`, which is true for any
+validated finding. The run makes real provider calls, so it has several limits:
+- `--llm-max-calls N` is required and capped at 200.
+- Calls are paced by `--llm-sleep` (2.5 s) and `--llm-tpm` (8000 tokens/min).
+- `--llm-token-budget T` sets a hard token stop.
+- The run stops cleanly on a daily-limit error or on repeated rate limits.
+- Results are cached in `ml/evaluation/results/llm_cache.jsonl` by (item id, prompt
+  sha256, model), so re-running the same command resumes without re-calling.
+- `--llm-primary-only` keeps every answer on one model.
+
+Results go to `--out` only, never to the baseline:
+
+```bash
+python -m ml.evaluation.run_eval --no-rerank --sample-kinds vulnerable=14,fixed_twin=14,ordinary=22 \
+    --seed 42 --llm --llm-primary-only --llm-max-calls 60 --llm-token-budget 150000 \
+    --out ml/evaluation/results/llm_run.json \
+    --dataset ml/evaluation/datasets/detection_eval_osv_pypi.jsonl \
+    ml/evaluation/datasets/detection_eval_osv_npm.jsonl ml/evaluation/datasets/detection_eval_ordinary.jsonl
+```
+
 ---
 
 ## Project layout

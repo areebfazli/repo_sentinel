@@ -37,14 +37,45 @@ configs quickly; it can never be written as the baseline.
 run. Output JSON (and baseline.json) records the reranker actually used (null
 when off), the sample/seed, and gather() timing (embed / ANN / rerank seconds).
 The sim sweep always includes the operating point (SIM_THRESHOLD_CVE).
+
+Realistic metrics (``realistic`` in --out) split the items by ``kind``: an
+item's explicit ``kind`` field, else derived from its id — ``<p>_vuln`` ->
+``vulnerable``, ``<p>_safe`` -> ``fixed_twin`` (OSV pairs), anything else ->
+``handwritten``; ordinary (non-security) negatives carry ``kind: "ordinary"``.
+They report TPR on vulnerable, FPR on fixed twins / ordinary / handwritten-safe
+items (Wilson 95% intervals), precision at realistic base rates
+pi in {0.01, 0.02, 0.05} — TPR*pi / (TPR*pi + FPR_ordinary*(1-pi)) — plus the
+balanced 50/50 precision, and pairwise vuln-vs-twin discrimination. The
+retrieval-only prediction is "at least one CVE match survives the operating
+point" (exactly what score() counts at SIM_THRESHOLD_CVE).
+``--sample-kinds vulnerable=40,fixed_twin=40,ordinary=80 --seed S`` draws a
+deterministic stratified sample (vuln/twin pairs kept together).
+
+``--llm`` adds the report stage: for every item with retrieved CVEs it builds
+the production prompt (``build_user_prompt(code, top-K CVE matches, [])``, as
+scan_runner does in snippet mode), calls ``LLMRouter.generate``, validates the
+findings against the retrieved-id allowlist and predicts "vulnerable" iff a
+validated finding references a retrieved CVE (``realistic_any_finding`` also
+scores production's ``is_vulnerable`` = any validated finding). Items without
+retrieved CVEs are "safe" without a call (production skips the LLM there too).
+Calls are capped (``--llm-max-calls``, <= 200 per run), paced
+(``--llm-sleep``, ``--llm-tpm``), stop cleanly on repeated rate limits or a
+daily limit, and are cached in a JSONL file keyed by (item id, prompt sha256,
+model) so a re-run resumes without re-calling. LLM results are recorded in
+``--out`` only, never in the baseline.
 """
 import argparse
+import asyncio
 import hashlib
 import json
+import math
 import random
 import sys
 import time
+from collections import Counter
 from pathlib import Path
+
+import httpx
 
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(_ROOT))
@@ -53,6 +84,12 @@ from backend.app.config import BASE_DIR, settings  # noqa: E402
 from backend.app.core.cve_retriever import passes_twin_margin  # noqa: E402
 from backend.app.core.embedder import Embedder  # noqa: E402
 from backend.app.core.embedding_cache import EmbeddingCache  # noqa: E402
+from backend.app.core.llm_client import LLMRouter  # noqa: E402
+from backend.app.core.markdown_renderer import (  # noqa: E402
+    SYSTEM_PROMPT,
+    build_user_prompt,
+    validate_findings,
+)
 from backend.app.core.reranker import Reranker  # noqa: E402
 from backend.app.core.vector_store import VectorStore  # noqa: E402
 
@@ -67,6 +104,32 @@ DEFAULT_SIM_SWEEP = "0.20:0.95:0.05"
 # similarity >= 0, so rerank_t = 0.0 is a no-op rather than a second sim gate.
 NO_RERANK_THRESHOLD = 0.0
 PAIR_SUFFIXES = ("_vuln", "_safe")
+
+KIND_VULNERABLE = "vulnerable"
+KIND_FIXED_TWIN = "fixed_twin"
+KIND_ORDINARY = "ordinary"
+KIND_HANDWRITTEN = "handwritten"
+KINDS = (KIND_VULNERABLE, KIND_FIXED_TWIN, KIND_ORDINARY, KIND_HANDWRITTEN)
+PAIR_KINDS = (KIND_VULNERABLE, KIND_FIXED_TWIN)
+BASE_RATES = (0.01, 0.02, 0.05)
+
+# Candidate payload fields kept by gather() so the LLM stage can rebuild the
+# production prompt (build_user_prompt reads cve_id/severity/category/
+# description/vulnerable_code/fixed_code).
+PROMPT_FIELDS = (
+    "cve_id", "severity", "category", "description", "vulnerable_code", "fixed_code",
+    "point_id", "language",
+)
+
+LLM_MAX_CALLS_CAP = 200
+DEFAULT_LLM_SLEEP = 2.5
+DEFAULT_LLM_TPM = 8000  # Groq free tier tokens/minute per model
+DEFAULT_LLM_MAX_RATE_LIMIT_ERRORS = 3
+DEFAULT_LLM_CACHE = RESULTS_DIR / "llm_cache.jsonl"
+# Groq names the exhausted window in its 429 body ("... tokens per day (TPD)").
+DAILY_LIMIT_MARKERS = ("per day", "(TPD)", "(RPD)")
+# A Retry-After this long only happens once a daily (not per-minute) window is spent.
+DAILY_LIMIT_RETRY_AFTER_S = 300.0
 
 
 def load_dataset(path: Path) -> list[dict]:
@@ -161,6 +224,29 @@ def _pair_key(item_id: str) -> str:
     return item_id
 
 
+def item_kind(item: dict) -> str:
+    """The item's ``kind``: its explicit field when valid, else from its id —
+    ``_vuln`` -> vulnerable, ``_safe`` -> fixed_twin, others -> handwritten."""
+    kind = item.get("kind")
+    if kind in KINDS:
+        return kind
+    item_id = item["id"]
+    if item_id.endswith("_vuln"):
+        return KIND_VULNERABLE
+    if item_id.endswith("_safe"):
+        return KIND_FIXED_TWIN
+    return KIND_HANDWRITTEN
+
+
+def _group_key(item: dict) -> str:
+    """Sampling/pairing group: the pair prefix for vulnerable/fixed-twin items,
+    the item's own id otherwise (an ordinary item is never paired, whatever
+    its id looks like). Identical to ``_pair_key`` for items without ``kind``."""
+    if item_kind(item) in PAIR_KINDS:
+        return _pair_key(item["id"])
+    return item["id"]
+
+
 def sample_items(items: list[dict], n: int, seed: int = 42) -> list[dict]:
     """Deterministic, label-balanced subsample that keeps OSV pairs together.
 
@@ -178,7 +264,7 @@ def sample_items(items: list[dict], n: int, seed: int = 42) -> list[dict]:
         return list(items)
     groups: dict[str, list[int]] = {}
     for idx, item in enumerate(items):
-        groups.setdefault(_pair_key(item["id"]), []).append(idx)
+        groups.setdefault(_group_key(item), []).append(idx)
     units = list(groups.values())
     random.Random(seed).shuffle(units)
 
@@ -194,6 +280,66 @@ def sample_items(items: list[dict], n: int, seed: int = 42) -> list[dict]:
         chosen.extend(unit)
         n_vuln += dv
         n_safe += ds
+    return [items[i] for i in sorted(chosen)]
+
+
+def parse_sample_kinds(spec: str) -> dict[str, int]:
+    """'vulnerable=40,fixed_twin=40,ordinary=80' -> {kind: quota}. Raises
+    ValueError on an unknown kind, a duplicate, or a non-positive quota."""
+    quotas: dict[str, int] = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        kind, sep, value = part.partition("=")
+        kind = kind.strip()
+        if not sep or kind not in KINDS:
+            raise ValueError(f"expected <kind>=<n> with kind in {', '.join(KINDS)}; got {part!r}")
+        if kind in quotas:
+            raise ValueError(f"kind {kind!r} given twice")
+        try:
+            n = int(value)
+        except ValueError:
+            raise ValueError(f"quota for {kind!r} is not an integer: {value!r}") from None
+        if n <= 0:
+            raise ValueError(f"quota for {kind!r} must be positive")
+        quotas[kind] = n
+    if not quotas:
+        raise ValueError("no <kind>=<n> quotas given")
+    return quotas
+
+
+def sample_items_by_kind(items: list[dict], quotas: dict[str, int], seed: int = 42) -> list[dict]:
+    """Deterministic stratified sample: at most ``quotas[kind]`` items per kind.
+
+    Kinds not in ``quotas`` are left out. Items are grouped as in
+    ``sample_items`` (a vulnerable/fixed-twin pair is one atomic group, so it is
+    never split when both kinds are requested; with only one of them requested
+    the other half is simply not in the pool). Complete pairs are drawn first
+    (shuffled with ``random.Random(seed)``) so the pairwise metrics get as many
+    pairs as the quotas allow, then everything else (shuffled with the same
+    RNG); a group is taken if every kind stays within its quota. May fall short
+    of a quota when the pool runs out. Selected items keep their input order.
+    """
+    groups: dict[str, list[int]] = {}
+    for idx, item in enumerate(items):
+        if item_kind(item) in quotas:
+            groups.setdefault(_group_key(item), []).append(idx)
+    pairs, others = [], []
+    for unit in groups.values():
+        kinds = {item_kind(items[i]) for i in unit}
+        (pairs if set(PAIR_KINDS) <= kinds else others).append(unit)
+    rng = random.Random(seed)
+    rng.shuffle(pairs)
+    rng.shuffle(others)
+
+    counts: Counter = Counter()
+    chosen: list[int] = []
+    for unit in pairs + others:
+        need = Counter(item_kind(items[i]) for i in unit)
+        if all(counts[k] + v <= quotas[k] for k, v in need.items()):
+            chosen.extend(unit)
+            counts.update(need)
     return [items[i] for i in sorted(chosen)]
 
 
@@ -248,6 +394,9 @@ def gather(
                 prob = float(c.get("rerank_prob", 0.0))
             scored.append(
                 {
+                    # Untouched payload values: the LLM stage hands these to
+                    # build_user_prompt exactly as the retriever's match dicts.
+                    "payload": {k: c.get(k) for k in PROMPT_FIELDS},
                     "similarity_score": sim,
                     "rerank_prob": prob,
                     "category": c.get("category", "unknown"),
@@ -261,6 +410,9 @@ def gather(
                 "id": item["id"],
                 "is_vulnerable": item["label"] == "vulnerable",
                 "category": item.get("category"),
+                "kind": item_kind(item),
+                "label": item["label"],
+                "code": code,
                 "candidates": scored,
             }
         )
@@ -327,6 +479,513 @@ def score(
         "fn": fn,
         "tn": tn,
         "n": len(gathered),
+    }
+
+
+# --- operating-point CVE matches (what the real pipeline hands the LLM) ------
+
+
+def operating_cves(
+    g: dict, sim_t: float, rerank_t: float, margin_t: float | None, top_k: int
+) -> list[dict]:
+    """The CVE matches CVERetriever.find_vulnerabilities would return for this
+    item: similarity gate -> twin-margin gate -> rerank_prob gate -> ordered by
+    relevance (rerank_prob; the similarity without a reranker, see gather) ->
+    top ``top_k``. Returns the candidates' raw payload dicts, best first.
+
+    Without a reranker ``rerank_t`` is NO_RERANK_THRESHOLD (a no-op, like the
+    API ignoring RERANK_THRESHOLD). Feedback votes are not applied (the eval has
+    none), and gather() searches without a language filter (a known deviation
+    from the API, which filters by the request's language).
+    """
+    passing = [
+        c for c in g["candidates"]
+        if c["similarity_score"] >= sim_t
+        and passes_twin_margin(c, margin_t)
+        and c["rerank_prob"] >= rerank_t
+    ]
+    # Stable sort from ANN order, like rank_candidates + finalize_matches.
+    passing.sort(key=lambda c: c["rerank_prob"], reverse=True)
+    return [c["payload"] for c in passing[:top_k]]
+
+
+# --- realistic metrics ------------------------------------------------------
+
+
+def wilson_interval(k: int, n: int, z: float = 1.96) -> list[float] | None:
+    """Wilson score interval for k successes out of n (None when n == 0)."""
+    if n == 0:
+        return None
+    p = k / n
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return [round(max(0.0, center - half), 4), round(min(1.0, center + half), 4)]
+
+
+def _rate(preds: list[bool]) -> dict:
+    k, n = sum(preds), len(preds)
+    return {
+        "k": k, "n": n,
+        "rate": round(k / n, 4) if n else None,
+        "ci95": wilson_interval(k, n),
+    }
+
+
+def precision_at_base_rate(tpr: float | None, fpr: float | None, pi: float) -> float | None:
+    """Expected precision when a fraction ``pi`` of scanned functions is
+    vulnerable: TPR*pi / (TPR*pi + FPR*(1-pi)). None if undefined."""
+    if tpr is None or fpr is None:
+        return None
+    denom = tpr * pi + fpr * (1 - pi)
+    return round(tpr * pi / denom, 4) if denom else None
+
+
+def realistic_metrics(records: list[dict], base_rates=BASE_RATES) -> dict:
+    """Per-kind metrics from ``records`` ({id, kind, label, pred}); items with
+    ``pred`` None (LLM error / not run) are excluded and counted.
+
+    - tpr_vulnerable: flagged fraction of kind "vulnerable" (recall);
+      fpr_fixed_twin / fpr_ordinary / fpr_handwritten_safe: flagged fraction of
+      fixed twins, ordinary functions, handwritten safe items (tpr_handwritten
+      for handwritten vulnerable ones). Each with a Wilson 95% interval.
+    - precision_at_base_rate[pi] = TPR*pi / (TPR*pi + FPR_ordinary*(1-pi)).
+    - precision_balanced_vs_{fixed_twin,ordinary}: the same at pi = 0.5.
+    - pairs: over (vuln, fixed twin) pairs with both scored, the fraction with
+      only the vuln flagged (vuln_only — the discrimination we want), only the
+      twin flagged (twin_only), both, and neither.
+    - observed: label-based confusion over every scored item (the old metric).
+    """
+    scored = [r for r in records if r["pred"] is not None]
+
+    def preds(pred_filter) -> list[bool]:
+        return [bool(r["pred"]) for r in scored if pred_filter(r)]
+
+    tpr = _rate(preds(lambda r: r["kind"] == KIND_VULNERABLE))
+    fpr_twin = _rate(preds(lambda r: r["kind"] == KIND_FIXED_TWIN))
+    fpr_ord = _rate(preds(lambda r: r["kind"] == KIND_ORDINARY))
+    fpr_hw = _rate(preds(lambda r: r["kind"] == KIND_HANDWRITTEN and r["label"] != "vulnerable"))
+    tpr_hw = _rate(preds(lambda r: r["kind"] == KIND_HANDWRITTEN and r["label"] == "vulnerable"))
+
+    by_pair: dict[str, dict[str, bool]] = {}
+    for r in scored:
+        if r["kind"] in PAIR_KINDS:
+            by_pair.setdefault(_pair_key(r["id"]), {})[r["kind"]] = bool(r["pred"])
+    complete = [p for p in by_pair.values() if len(p) == 2]
+    n_pairs = len(complete)
+    counts = Counter(
+        ("vuln_only" if p[KIND_VULNERABLE] and not p[KIND_FIXED_TWIN]
+         else "twin_only" if p[KIND_FIXED_TWIN] and not p[KIND_VULNERABLE]
+         else "both" if p[KIND_VULNERABLE] else "neither")
+        for p in complete
+    )
+    pairs = {"n": n_pairs}
+    for key in ("vuln_only", "twin_only", "both", "neither"):
+        pairs[key] = round(counts[key] / n_pairs, 4) if n_pairs else None
+        pairs[f"n_{key}"] = counts[key]
+
+    tp = sum(1 for r in scored if r["pred"] and r["label"] == "vulnerable")
+    fp = sum(1 for r in scored if r["pred"] and r["label"] != "vulnerable")
+    fn = sum(1 for r in scored if not r["pred"] and r["label"] == "vulnerable")
+    tn = len(scored) - tp - fp - fn
+    return {
+        "n": len(records),
+        "n_scored": len(scored),
+        "n_excluded": len(records) - len(scored),
+        "tpr_vulnerable": tpr,
+        "fpr_fixed_twin": fpr_twin,
+        "fpr_ordinary": fpr_ord,
+        "fpr_handwritten_safe": fpr_hw,
+        "tpr_handwritten": tpr_hw,
+        "precision_at_base_rate": {
+            str(pi): precision_at_base_rate(tpr["rate"], fpr_ord["rate"], pi)
+            for pi in base_rates
+        },
+        "precision_balanced_vs_fixed_twin": precision_at_base_rate(
+            tpr["rate"], fpr_twin["rate"], 0.5
+        ),
+        "precision_balanced_vs_ordinary": precision_at_base_rate(
+            tpr["rate"], fpr_ord["rate"], 0.5
+        ),
+        "pairs": pairs,
+        "observed": {
+            "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+            "precision": round(tp / (tp + fp), 4) if tp + fp else None,
+            "recall": round(tp / (tp + fn), 4) if tp + fn else None,
+        },
+    }
+
+
+def _fmt_rate(r: dict) -> str:
+    if r["rate"] is None:
+        return "n/a (n=0)"
+    lo, hi = r["ci95"]
+    return f"{r['rate']:.3f} [{lo:.3f}, {hi:.3f}] ({r['k']}/{r['n']})"
+
+
+def print_realistic(title: str, m: dict) -> None:
+    print(f"\n{title} (n={m['n_scored']}, excluded={m['n_excluded']}):")
+    print(f"  TPR vulnerable        {_fmt_rate(m['tpr_vulnerable'])}")
+    print(f"  FPR fixed twin        {_fmt_rate(m['fpr_fixed_twin'])}")
+    print(f"  FPR ordinary          {_fmt_rate(m['fpr_ordinary'])}")
+    print(f"  FPR handwritten safe  {_fmt_rate(m['fpr_handwritten_safe'])}")
+    print(f"  TPR handwritten       {_fmt_rate(m['tpr_handwritten'])}")
+    prec = ", ".join(
+        f"pi={pi}: {'n/a' if v is None else f'{v:.3f}'}"
+        for pi, v in m["precision_at_base_rate"].items()
+    )
+    print(f"  precision @ base rate {prec}")
+    print(
+        f"  balanced precision    vs twin {m['precision_balanced_vs_fixed_twin']}, "
+        f"vs ordinary {m['precision_balanced_vs_ordinary']}"
+    )
+    p = m["pairs"]
+    if p["n"]:
+        print(
+            f"  pairs (n={p['n']})         vuln only {p['vuln_only']:.3f}, twin only "
+            f"{p['twin_only']:.3f}, both {p['both']:.3f}, neither {p['neither']:.3f}"
+        )
+
+
+# --- LLM report stage -------------------------------------------------------
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token count (~4 chars/token) — used for budgeting only when the
+    provider response carries no ``usage``."""
+    return math.ceil(len(text) / 4)
+
+
+def prompt_sha256(user_prompt: str) -> str:
+    """Cache key part: covers the system prompt too, so editing it invalidates."""
+    return hashlib.sha256(f"{SYSTEM_PROMPT}\x00{user_prompt}".encode()).hexdigest()
+
+
+def llm_decision(llm_json, cves: list[dict]) -> dict:
+    """Validate an LLM response exactly as scan_runner does and derive the
+    prediction. ``prediction`` = a validated finding references a retrieved CVE
+    (a CVE finding in the report); ``any_finding`` = any validated finding
+    (production's ``is_vulnerable``). Raises ValueError on a response shape the
+    production pipeline would fail the scan on."""
+    if not isinstance(llm_json, dict):
+        raise ValueError(f"LLM returned a JSON {type(llm_json).__name__}, not an object")
+    raw = llm_json.get("findings", [])
+    if not isinstance(raw, list):
+        raise ValueError(f"'findings' is a {type(raw).__name__}, not a list")
+    allowed_cves = {c.get("cve_id") for c in cves if c.get("cve_id")}
+    validated = validate_findings(raw, allowed_cves, set())
+    flagged = [f["cve_id"] for f in validated if f.get("cve_id")]
+    categories = {c.get("cve_id"): c.get("category") for c in cves}
+    return {
+        "prediction": bool(flagged),
+        "any_finding": bool(validated),
+        "validated_count": len(validated),
+        "raw_finding_count": len(raw),
+        "flagged_cve_ids": flagged,
+        "flagged_categories": sorted({str(categories.get(c)) for c in flagged}),
+    }
+
+
+class LLMCache:
+    """Append-only JSONL of successful LLM results keyed by (item id, prompt
+    sha256, model). Errors are never cached, so a re-run retries them."""
+
+    def __init__(self, path: Path | str):
+        self.path = Path(path)
+        self._entries: dict[tuple[str, str, str], dict] = {}
+        if self.path.exists():
+            with open(self.path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                        self._entries[(rec["id"], rec["prompt_sha256"], rec["model"])] = rec
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        continue  # a torn last line from an interrupted run
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def get(self, item_id: str, sha: str, model: str) -> dict | None:
+        return self._entries.get((item_id, sha, model))
+
+    def put(self, rec: dict) -> None:
+        self._entries[(rec["id"], rec["prompt_sha256"], rec["model"])] = rec
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+            f.flush()
+
+
+def _http_event(resp: httpx.Response) -> dict:
+    event = {"status": resp.status_code, "usage": None, "retry_after": None, "daily_limit": False}
+    if resp.status_code == 200:
+        try:
+            usage = resp.json().get("usage")
+            event["usage"] = usage if isinstance(usage, dict) else None
+        except (ValueError, AttributeError):
+            pass
+    else:
+        try:
+            event["retry_after"] = float(resp.headers.get("Retry-After"))
+        except (TypeError, ValueError):
+            pass
+        if resp.status_code == 429:
+            body = resp.text
+            event["daily_limit"] = any(m in body for m in DAILY_LIMIT_MARKERS) or (
+                event["retry_after"] is not None
+                and event["retry_after"] >= DAILY_LIMIT_RETRY_AFTER_S
+            )
+    return event
+
+
+class HttpUsageTap:
+    """While active, records every httpx.AsyncClient.post response's token
+    ``usage`` and rate-limit signals. LLMClient returns only the message text and
+    folds a 429 into "HTTP 429", so this is how the eval sees real token counts
+    (including reasoning tokens) and tells a daily limit from a per-minute one.
+    Only the LLM stage runs inside it (no other httpx traffic in the eval)."""
+
+    def __init__(self):
+        self.events: list[dict] = []
+        self._orig = None
+
+    def __enter__(self):
+        self._orig = orig = httpx.AsyncClient.post
+        tap = self
+
+        async def post(client, *args, **kwargs):
+            resp = await orig(client, *args, **kwargs)
+            tap.events.append(_http_event(resp))
+            return resp
+
+        httpx.AsyncClient.post = post
+        return self
+
+    def __exit__(self, *exc):
+        httpx.AsyncClient.post = self._orig
+        return False
+
+    def take(self) -> list[dict]:
+        events, self.events = self.events, []
+        return events
+
+
+def _usage_totals(events: list[dict]) -> dict | None:
+    usages = [e["usage"] for e in events if e.get("usage")]
+    if not usages:
+        return None
+    return {
+        k: sum(int(u.get(k) or 0) for u in usages)
+        for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+    }
+
+
+def classify_llm_error(exc: BaseException, events: list[dict]) -> str:
+    """'daily_limit' | 'rate_limit' | 'other' for a failed router.generate."""
+    text = str(exc)
+    if any(e.get("daily_limit") for e in events) or any(m in text for m in DAILY_LIMIT_MARKERS):
+        return "daily_limit"
+    if any(e.get("status") == 429 for e in events) or "HTTP 429" in text:
+        return "rate_limit"
+    return "other"
+
+
+def llm_model_key(router) -> str:
+    """Cache/model key: the router's primary "<provider>:<model>" (or "mock")."""
+    return "mock" if getattr(router, "mock", False) else router.clients[0].label
+
+
+def build_llm_entries(
+    gathered: list[dict], sim_t: float, rerank_t: float, margin_t: float | None, top_k: int
+) -> list[dict]:
+    """Per item: what the LLM stage (and the retrieval-only prediction) needs."""
+    return [
+        {
+            "id": g["id"],
+            "kind": g["kind"],
+            "label": g["label"],
+            "category": g["category"],
+            "code": g["code"],
+            "cves": operating_cves(g, sim_t, rerank_t, margin_t, top_k),
+        }
+        for g in gathered
+    ]
+
+
+async def run_llm_stage(
+    entries: list[dict],
+    router,
+    *,
+    cache: LLMCache | None,
+    max_calls: int,
+    sleep_s: float = DEFAULT_LLM_SLEEP,
+    tpm: int | None = DEFAULT_LLM_TPM,
+    max_rate_limit_errors: int = DEFAULT_LLM_MAX_RATE_LIMIT_ERRORS,
+    token_budget: int | None = None,
+    tap: HttpUsageTap | None = None,
+    sleep=asyncio.sleep,
+    progress: bool = True,
+) -> dict:
+    """Run the report stage over ``entries`` (see ``build_llm_entries``).
+
+    Per item ``status``: ``no_candidates`` (no retrieved CVE -> "safe", no call,
+    as in production), ``ok`` / ``cached`` (scored), ``error`` (the call failed —
+    excluded from metrics), ``not_run`` (a stop condition hit first — excluded).
+    Stops calling (remaining items -> not_run) after ``max_calls`` real calls,
+    when the next call would exceed ``token_budget``, on a daily-limit error, or
+    after ``max_rate_limit_errors`` consecutive rate-limited failures. Between
+    real calls it waits max(``sleep_s``, 60 * last call's tokens / ``tpm``).
+    Cached items cost no call, no wait and no budget.
+    """
+    model = llm_model_key(router)
+    n = len(entries)
+    records: list[dict] = []
+    calls = tokens_used = consecutive_rl = 0
+    last_tokens = 0
+    stopped: str | None = None
+    for idx, e in enumerate(entries, start=1):
+        rec = {
+            "id": e["id"], "kind": e["kind"], "label": e["label"], "category": e["category"],
+            "retrieved_cve_ids": [c.get("cve_id") for c in e["cves"]],
+        }
+        records.append(rec)
+        if not e["cves"]:
+            rec.update(status="no_candidates", prediction=False, any_finding=False,
+                       validated_count=0)
+            continue
+        prompt = build_user_prompt(e["code"], e["cves"], [])
+        sha = prompt_sha256(prompt)
+        rec["prompt_sha256"] = sha
+        rec["prompt_tokens_est"] = estimate_tokens(SYSTEM_PROMPT) + estimate_tokens(prompt)
+
+        cached = cache.get(e["id"], sha, model) if cache is not None else None
+        if cached is not None:
+            try:
+                rec.update(llm_decision(cached["llm_json"], e["cves"]))
+                rec.update(status="cached", provider_used=cached.get("provider_used"),
+                           latency_s=cached.get("latency_s"), usage=cached.get("usage"))
+                continue
+            except (ValueError, KeyError):
+                pass  # unusable cache entry: call again
+
+        if stopped is None:
+            if calls >= max_calls:
+                stopped = "max_calls"
+            elif token_budget is not None and tokens_used + rec["prompt_tokens_est"] > token_budget:
+                stopped = "token_budget"
+        if stopped is not None:
+            rec.update(status="not_run", prediction=None, any_finding=None)
+            continue
+
+        if calls:
+            wait = max(sleep_s, 60.0 * last_tokens / tpm if tpm else 0.0)
+            if wait > 0:
+                await sleep(wait)
+        calls += 1
+        if tap is not None:
+            tap.take()  # drop anything not from this call
+        t0 = time.perf_counter()
+        error: BaseException | None = None
+        try:
+            llm_json, provider = await router.generate(SYSTEM_PROMPT, prompt)
+        except asyncio.CancelledError:
+            # Ctrl-C under asyncio.run: keep what we have (the cache already
+            # holds every finished item) and let main() write the partial --out.
+            rec.update(status="not_run", prediction=None, any_finding=None)
+            stopped = "interrupted"
+            continue
+        except Exception as exc:  # noqa: BLE001 — any failure is one errored item
+            error = exc
+        latency = round(time.perf_counter() - t0, 3)
+        events = tap.take() if tap is not None else []
+        usage = _usage_totals(events)
+        rec.update(latency_s=latency, usage=usage,
+                   http_statuses=[ev["status"] for ev in events] or None)
+
+        if error is None:
+            try:
+                rec.update(llm_decision(llm_json, e["cves"]))
+            except ValueError as exc:
+                error = exc
+            else:
+                rec.update(status="ok", provider_used=provider)
+                consecutive_rl = 0
+                if cache is not None:
+                    cache.put({
+                        "id": e["id"], "prompt_sha256": sha, "model": model,
+                        "provider_used": provider, "llm_json": llm_json,
+                        "latency_s": latency, "usage": usage,
+                        "prompt_tokens_est": rec["prompt_tokens_est"],
+                    })
+        if error is not None:
+            kind = classify_llm_error(error, events)
+            rec.update(status="error", prediction=None, any_finding=None,
+                       error=f"{type(error).__name__}: {str(error)[:500]}", error_kind=kind)
+            if kind == "daily_limit":
+                stopped = "daily_limit"
+            elif kind == "rate_limit":
+                consecutive_rl += 1
+                if consecutive_rl >= max_rate_limit_errors:
+                    stopped = "rate_limit"
+            else:
+                consecutive_rl = 0
+
+        last_tokens = usage["total_tokens"] if usage else (
+            rec["prompt_tokens_est"] if error is None else 0
+        )
+        tokens_used += last_tokens
+        if progress:
+            pred = {True: "VULN", False: "safe", None: "-"}[rec.get("prediction")]
+            detail = (
+                f"{rec.get('error_kind')} error" if rec["status"] == "error"
+                else f"pred={pred} findings={rec.get('validated_count')} "
+                f"via {rec.get('provider_used')}"
+            )
+            print(
+                f"  [LLM {idx}/{n}] {e['id']} ({e['kind']}): {detail}, {latency:.1f}s | "
+                f"calls {calls}/{max_calls}, tokens so far {tokens_used}",
+                flush=True,
+            )
+            if stopped in ("daily_limit", "rate_limit"):
+                print(f"  Stopping LLM calls: {stopped}. Re-run later to resume from the cache.")
+
+    status_counts = Counter(r["status"] for r in records)
+    return {
+        "model": model,
+        "records": records,
+        "calls": calls,
+        "tokens_used": tokens_used,
+        "stopped": stopped,
+        "status_counts": dict(status_counts),
+        "providers": dict(Counter(r["provider_used"] for r in records if r.get("provider_used"))),
+    }
+
+
+def summarize_llm(stage: dict, retrieval_preds: dict[str, bool]) -> dict:
+    """Metrics for the LLM stage: the CVE-finding rule (``realistic``), the
+    any-finding rule (``realistic_any_finding``), retrieval-only on the same
+    scored items (``realistic_retrieval_same_items``), and the category hit rate
+    among true positives."""
+    recs = stage["records"]
+
+    def rows(key: str) -> list[dict]:
+        return [
+            {"id": r["id"], "kind": r["kind"], "label": r["label"], "pred": r.get(key)}
+            for r in recs
+        ]
+
+    same_items = [
+        {"id": r["id"], "kind": r["kind"], "label": r["label"],
+         "pred": retrieval_preds[r["id"]] if r.get("prediction") is not None else None}
+        for r in recs
+    ]
+    tps = [r for r in recs if r.get("prediction") and r["label"] == "vulnerable"]
+    hits = sum(str(r.get("category")) in r.get("flagged_categories", []) for r in tps)
+    return {
+        "realistic": realistic_metrics(rows("prediction")),
+        "realistic_any_finding": realistic_metrics(rows("any_finding")),
+        "realistic_retrieval_same_items": realistic_metrics(same_items),
+        "category_hit_rate": round(hits / len(tps), 4) if tps else None,
     }
 
 
@@ -466,10 +1125,63 @@ def build_parser() -> argparse.ArgumentParser:
         "together) from the combined datasets. Not allowed with --write-baseline.",
     )
     parser.add_argument(
-        "--seed", type=int, default=42, help="RNG seed for --sample (default 42)."
+        "--sample-kinds", default=None, metavar="KIND=N,...",
+        help="Stratified sample with per-kind quotas, e.g. "
+        "vulnerable=40,fixed_twin=40,ordinary=80 (kinds: " + ", ".join(KINDS) + "; "
+        "unlisted kinds are left out; vuln/twin pairs kept together). Deterministic "
+        "with --seed. Not allowed with --sample or --write-baseline.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="RNG seed for --sample / --sample-kinds (default 42).",
     )
     parser.add_argument("--write-baseline", action="store_true")
     parser.add_argument("--out", default=None, help="Write full sweep results JSON here.")
+
+    llm = parser.add_argument_group(
+        "LLM report stage (real provider calls; results go to --out only)"
+    )
+    llm.add_argument(
+        "--llm", action="store_true",
+        help="Also run the production LLM report stage on every item with retrieved "
+        "CVEs. Requires --llm-max-calls and --out.",
+    )
+    llm.add_argument(
+        "--llm-max-calls", type=int, default=None, metavar="N",
+        help=f"Hard cap on real LLM calls this run (1..{LLM_MAX_CALLS_CAP}; cached items "
+        "don't count). Required with --llm.",
+    )
+    llm.add_argument(
+        "--llm-sleep", type=float, default=DEFAULT_LLM_SLEEP, metavar="S",
+        help=f"Minimum seconds between real calls (default {DEFAULT_LLM_SLEEP}; Groq "
+        "free tier is ~30 requests/min).",
+    )
+    llm.add_argument(
+        "--llm-tpm", type=int, default=DEFAULT_LLM_TPM, metavar="T",
+        help=f"Pace calls to stay under T tokens/minute: wait at least 60*tokens/T s "
+        f"after each call (default {DEFAULT_LLM_TPM}, Groq free tier; 0 = off).",
+    )
+    llm.add_argument(
+        "--llm-token-budget", type=int, default=None, metavar="T",
+        help="Stop calling before total tokens this run would exceed T (Groq free "
+        "tier: 200K tokens/day per model).",
+    )
+    llm.add_argument(
+        "--llm-max-rate-limit-errors", type=int, default=DEFAULT_LLM_MAX_RATE_LIMIT_ERRORS,
+        metavar="K",
+        help="Stop after K consecutive rate-limited failures (default "
+        f"{DEFAULT_LLM_MAX_RATE_LIMIT_ERRORS}); a daily-limit error stops at once.",
+    )
+    llm.add_argument(
+        "--llm-cache", default=str(DEFAULT_LLM_CACHE), metavar="PATH",
+        help="JSONL cache of LLM results keyed by (item id, prompt sha256, model); "
+        "a re-run resumes from it (default ml/evaluation/results/llm_cache.jsonl).",
+    )
+    llm.add_argument(
+        "--llm-primary-only", action="store_true",
+        help="Use only the primary provider/model (no GROQ_FALLBACK_MODEL / "
+        "LLM_FALLBACK_PROVIDER), so every scored item comes from one model.",
+    )
     return parser
 
 
@@ -488,6 +1200,46 @@ def parse_args(argv=None) -> argparse.Namespace:
         )
     if args.sample is not None and args.sample <= 0:
         parser.error("--sample must be a positive integer.")
+    if args.sample_kinds is not None:
+        if args.sample is not None:
+            parser.error("--sample and --sample-kinds are mutually exclusive.")
+        if args.write_baseline:
+            parser.error(
+                "--write-baseline cannot be combined with --sample-kinds: a sample must "
+                "never become the calibrated baseline."
+            )
+        try:
+            args.sample_kinds = parse_sample_kinds(args.sample_kinds)
+        except ValueError as exc:
+            parser.error(f"--sample-kinds: {exc}")
+    if args.llm:
+        if args.write_baseline:
+            parser.error(
+                "--write-baseline cannot be combined with --llm: LLM results vary across "
+                "model versions; they are recorded in --out only."
+            )
+        if args.llm_max_calls is None:
+            parser.error("--llm requires --llm-max-calls N (a hard cap on real calls).")
+        if not 1 <= args.llm_max_calls <= LLM_MAX_CALLS_CAP:
+            parser.error(f"--llm-max-calls must be between 1 and {LLM_MAX_CALLS_CAP}.")
+        if args.out is None:
+            parser.error("--llm requires --out (where the LLM results are recorded).")
+        if args.llm_sleep < 0 or args.llm_tpm < 0:
+            parser.error("--llm-sleep and --llm-tpm must be >= 0.")
+        if args.llm_token_budget is not None and args.llm_token_budget <= 0:
+            parser.error("--llm-token-budget must be a positive integer.")
+        if args.llm_max_rate_limit_errors < 1:
+            parser.error("--llm-max-rate-limit-errors must be >= 1.")
+    else:
+        given = [
+            flag for flag, value, default in (
+                ("--llm-max-calls", args.llm_max_calls, None),
+                ("--llm-token-budget", args.llm_token_budget, None),
+                ("--llm-primary-only", args.llm_primary_only, False),
+            ) if value != default
+        ]
+        if given:
+            parser.error(f"{', '.join(given)} requires --llm.")
     if args.reranker_max_tokens is not None and args.reranker_max_tokens <= 0:
         parser.error("--reranker-max-tokens must be a positive integer.")
     if args.no_rerank:
@@ -515,13 +1267,86 @@ def parse_args(argv=None) -> argparse.Namespace:
     return args
 
 
+def build_llm_router(primary_only: bool = False) -> LLMRouter:
+    """The production router (fails fast on a missing key), optionally trimmed
+    to its primary client."""
+    router = LLMRouter()
+    if primary_only and not router.mock:
+        router.clients = router.clients[:1]
+    return router
+
+
+def run_llm(args, entries: list[dict], router, retrieval_preds: dict[str, bool]) -> dict:
+    """Run + summarize the LLM stage for main(); returns the ``llm`` out-JSON block."""
+    cache = LLMCache(args.llm_cache)
+    chain = ["mock"] if router.mock else [c.label for c in router.clients]
+    n_need = sum(bool(e["cves"]) for e in entries)
+    print(
+        f"\nLLM stage: {n_need}/{len(entries)} items have retrieved CVEs; chain "
+        f"{' -> '.join(chain)}; max {args.llm_max_calls} calls; cache {args.llm_cache} "
+        f"({len(cache)} entries)."
+    )
+
+    async def _run():
+        with HttpUsageTap() as tap:
+            return await run_llm_stage(
+                entries, router, cache=cache, max_calls=args.llm_max_calls,
+                sleep_s=args.llm_sleep, tpm=args.llm_tpm,
+                max_rate_limit_errors=args.llm_max_rate_limit_errors,
+                token_budget=args.llm_token_budget, tap=tap,
+            )
+
+    stage = asyncio.run(_run())
+    summary = summarize_llm(stage, retrieval_preds)
+    counts = stage["status_counts"]
+    print(
+        f"LLM stage done: {stage['calls']} calls, {stage['tokens_used']} tokens; statuses "
+        f"{counts}; providers {stage['providers']}"
+        + (f"; stopped early: {stage['stopped']}" if stage["stopped"] else "")
+    )
+    if counts.get("not_run"):
+        print(f"  {counts['not_run']} items not run — re-run the same command to resume.")
+    print_realistic("LLM report stage (prediction = a validated CVE finding)", summary["realistic"])
+    print_realistic("LLM report stage, any validated finding", summary["realistic_any_finding"])
+    print_realistic(
+        "Retrieval-only on the same scored items", summary["realistic_retrieval_same_items"]
+    )
+    return {
+        "config": {
+            "model": stage["model"],
+            "chain": chain,
+            "primary_only": args.llm_primary_only,
+            "max_calls": args.llm_max_calls,
+            "sleep_s": args.llm_sleep,
+            "tpm": args.llm_tpm,
+            "token_budget": args.llm_token_budget,
+            "cache": _rel(args.llm_cache),
+            "top_k": settings.RETRIEVAL_TOP_K,
+            "rule": "vulnerable iff >= 1 validated finding references a retrieved CVE",
+        },
+        "calls": stage["calls"],
+        "tokens_used": stage["tokens_used"],
+        "stopped": stage["stopped"],
+        "status_counts": counts,
+        "providers": stage["providers"],
+        **summary,
+        "items": [
+            {**r, "retrieval_pred": retrieval_preds[r["id"]]} for r in stage["records"]
+        ],
+    }
+
+
 def main(argv=None):
     args = parse_args(argv)
     rr_cfg = reranker_config(args.no_rerank, args.reranker_model, args.reranker_max_tokens)
+    sampled = args.sample is not None or args.sample_kinds is not None
     sample_meta = {
         "sample": args.sample,
-        "seed": args.seed if args.sample is not None else None,
+        "sample_kinds": args.sample_kinds,
+        "seed": args.seed if sampled else None,
     }
+    # Before any model load: a missing LLM key fails here, not after the gather.
+    router = build_llm_router(args.llm_primary_only) if args.llm else None
 
     print(f"Model: {settings.EMBEDDING_MODEL} (pooling={settings.EMBEDDING_POOLING})")
     if rr_cfg is None:
@@ -530,6 +1355,8 @@ def main(argv=None):
         print(f"Reranker: {rr_cfg['model']} (max_tokens={rr_cfg['max_tokens']})")
     if args.sample is not None:
         print(f"Sample: {args.sample} (seed={args.seed})")
+    if args.sample_kinds is not None:
+        print(f"Stratified sample: {args.sample_kinds} (seed={args.seed})")
     embedder, store, reranker = build_components(
         args.no_rerank, args.reranker_model, args.reranker_max_tokens
     )
@@ -553,6 +1380,17 @@ def main(argv=None):
             f"Sampled {len(items)}/{pool} items: {n_vuln} vulnerable, "
             f"{len(items) - n_vuln} safe{note}."
         )
+    if args.sample_kinds is not None:
+        pool = len(items)
+        items = sample_items_by_kind(items, args.sample_kinds, args.seed)
+        got = Counter(item_kind(i) for i in items)
+        sample_meta["sample_kinds_achieved"] = {k: got[k] for k in args.sample_kinds}
+        short = {k: f"{got[k]}/{q}" for k, q in args.sample_kinds.items() if got[k] < q}
+        print(
+            f"Sampled {len(items)}/{pool} items by kind: {dict(got)}"
+            + (f" (short of quota: {short})" if short else "") + "."
+        )
+    print(f"Items by kind: {dict(Counter(item_kind(i) for i in items))}")
     gathered, timing = gather(
         items, embedder, store, reranker, settings.ANN_CANDIDATES, progress=True
     )
@@ -615,12 +1453,28 @@ def main(argv=None):
         f"{timing['seconds_per_item']:.2f}s/item."
     )
 
+    # Realistic metrics at the operating point: retrieval-only prediction =
+    # "at least one CVE match survives" (what the API would send to the LLM).
+    entries = build_llm_entries(
+        gathered, settings.SIM_THRESHOLD_CVE, op_rerank_t, settings.TWIN_MARGIN_MIN,
+        settings.RETRIEVAL_TOP_K,
+    )
+    retrieval_preds = {e["id"]: bool(e["cves"]) for e in entries}
+    realistic = realistic_metrics(
+        [{"id": e["id"], "kind": e["kind"], "label": e["label"],
+          "pred": retrieval_preds[e["id"]]} for e in entries]
+    )
+    print_realistic("Realistic metrics, retrieval only (operating point)", realistic)
+
+    llm_block = run_llm(args, entries, router, retrieval_preds) if router is not None else None
+
     if args.out:
         out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(
-            json.dumps({**run_meta, "operating": operating, "sweep": sweep}, indent=2)
-        )
+        out = {**run_meta, "operating": operating, "sweep": sweep, "realistic": realistic}
+        if llm_block is not None:
+            out["llm"] = llm_block
+        out_path.write_text(json.dumps(out, indent=2))
         print(f"Wrote sweep results -> {out_path}")
 
     if args.write_baseline:

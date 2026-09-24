@@ -242,6 +242,26 @@ python -m ml.evaluation.run_eval --no-rerank --sample-kinds vulnerable=14,fixed_
 
 ---
 
+## Static-analysis evidence (Semgrep)
+
+`backend/app/core/semgrep_scanner.py` runs Semgrep CE (`semgrep` in `requirements.txt`,
+LGPL-2.1 engine; Opengrep's binary works too) with a vendored, permissively licensed rule set
+(`backend/app/rules/semgrep/`, GitLab `sast-rules`: MIT / Apache-2.0 / LGPL-3.0 — see its
+README for why the Semgrep Registry rules are not used). `SemgrepScanner().scan_units(units,
+sources=None)` scans all units in one engine run and returns `{(file_path, function_name,
+start_line): [hit, ...]}`, each hit `rule_id, message, severity, cwe, line, end_line, snippet`.
+Pass `sources={file_path: full_text}` when you have the files: they are scanned whole (imports
+in context) and hits are assigned to units by line. Engine missing / timeout / crash logs a
+warning and returns `{}`. It is blocking; call it with `asyncio.to_thread`. Not yet wired into
+the scan pipeline.
+
+Measured on the eval sets (snippet mode, no imports), a hit is weak evidence, not a gate: with
+Bandit's `assert` rule excluded, 4.3% of vulnerable functions vs 2.2% of their fixed twins and
+1.7% of ordinary functions have a hit (high/critical severity only: 3.2% / 1.4% / 0.5%). The
+engine costs ~7 s fixed per run (Python rules; ~13 s with JS as well), then ~0.05 s per unit.
+
+---
+
 ## Project layout
 
 ```

@@ -30,6 +30,11 @@ SQLAlchemy>=2.0.30
 httpx>=0.27.0
 requests>=2.31.0
 
+# Static-analysis evidence (core/semgrep_scanner.py). Semgrep CE engine, LGPL-2.1;
+# the rules are vendored separately (backend/app/rules/semgrep/README.md).
+# Note: it pins protobuf<7 (qdrant-client's gRPC stubs work with 6.x).
+semgrep>=1.178,<2
+
 # Utilities
 python-dotenv>=1.0.1
 loguru>=0.7.2

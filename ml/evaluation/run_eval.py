@@ -69,15 +69,50 @@ deterministic stratified sample (vuln/twin pairs kept together).
 Calls are capped (``--llm-max-calls``, <= 200 per run), paced
 (``--llm-sleep``, ``--llm-tpm``), stop cleanly on repeated rate limits or a
 daily limit, and are cached in a JSONL file keyed by (item id, prompt sha256,
-model) so a re-run resumes without re-calling. LLM results are recorded in
-``--out`` only, never in the baseline.
+model, temperature, repeat index) so a re-run resumes without re-calling
+(entries written before temperature / repeat were recorded count as 0.2 /
+repeat 0). LLM results are recorded in ``--out`` only, never in the baseline.
+
+Localised scoring (the primary LLM metric). "Any validated finding" counts a
+vulnerable item as detected even when the finding is about a different line or
+bug. For a ``_vuln`` item whose ``_safe`` twin is in the loaded datasets, the
+fix lines are the vulnerable version's lines the fix deleted or modified
+(difflib over stripped lines; a hunk that only inserts lines contributes the
+``INSERTION_CONTEXT`` = 2 lines on each side of the insertion point; hunks of
+blank lines are ignored). A vulnerable item is a *localised TP* iff a validated
+finding's line range (``line``/``end_line``; else its ``quoted_code`` located in
+the item's code with ``markdown_renderer.locate_quote``) overlaps the fix lines
+within ``--localise-tolerance`` (2) lines, or the finding's CWE is one of the
+item's expected CWEs (an item ``cwe`` / ``cwes`` / ``cwe_ids`` field; none of
+the current eval sets carries one, so today it is line overlap only). FPR on
+fixed twins and ordinary items stays "any validated finding" (conservative);
+``fpr_fixed_twin_localised`` also reports twins flagged on the lines the fix
+added or changed (the model thinks the fix is still vulnerable). The legacy
+prompt's findings carry no quote or line, so it has no localised numbers.
+Every per-item record stores its findings (quoted_code, line, end_line, cwe),
+``fix_lines`` and ``localised``, so ``--rescore RESULT.json`` recomputes all
+metrics offline (no LLM call). Results written before this existed are
+backfilled from the LLM cache (raw responses) and ``--dataset`` (item code);
+the rescore says which metrics could not be recomputed and why.
+
+Other LLM-stage options: ``--llm-temperature`` (eval default 0.0; production
+keeps LLM_TEMPERATURE), ``--llm-repeat K`` (each item K times, flip rate across
+repeats with a Wilson CI), ``--llm-model PROVIDER:MODEL`` with
+``--llm-primary-only`` (exactly that model; on OpenRouter every request sends
+``provider: {"allow_fallbacks": false}`` and each item records the upstream
+``provider`` the response names), ``--split PATH --split-name dev|test``
+(restrict to a split manifest's ids; the test split needs
+``--i-know-this-is-the-test-set``) and ``--compare A.json B.json`` (paired exact
+McNemar tests and exact binomial CIs between two result files, offline).
 """
 import argparse
 import asyncio
+import difflib
 import hashlib
 import json
 import math
 import random
+import re
 import sys
 import time
 from collections import Counter
@@ -94,7 +129,12 @@ from backend.app.core.cve_retriever import passes_twin_margin  # noqa: E402
 from backend.app.core.embedder import Embedder  # noqa: E402
 from backend.app.core.embedding_cache import EmbeddingCache  # noqa: E402
 from backend.app.core.evidence import semgrep_evidence  # noqa: E402
-from backend.app.core.llm_client import LLMRouter, TokenPacer  # noqa: E402
+from backend.app.core.llm_client import (  # noqa: E402
+    PROVIDERS,
+    LLMClient,
+    LLMRouter,
+    TokenPacer,
+)
 from backend.app.core.reranker import Reranker  # noqa: E402
 from backend.app.core.review_plan import (  # noqa: E402
     assign_uids,
@@ -149,6 +189,31 @@ DEFAULT_LLM_CACHE = RESULTS_DIR / "llm_cache.jsonl"
 DAILY_LIMIT_MARKERS = ("per day", "(TPD)", "(RPD)", "free-models-per-day")
 # A Retry-After this long only happens once a daily (not per-minute) window is spent.
 DAILY_LIMIT_RETRY_AFTER_S = 300.0
+# Eval calls default to greedy decoding; production keeps settings.LLM_TEMPERATURE.
+DEFAULT_EVAL_TEMPERATURE = 0.0
+# Every LLM cache entry written before the temperature was recorded used this.
+LEGACY_CACHE_TEMPERATURE = 0.2
+
+# Localised scoring (see the module docstring).
+DEFAULT_LOCALISE_TOLERANCE = 2
+INSERTION_CONTEXT = 2
+LOCALISED_RULE = (
+    "vulnerable item: a validated finding's line range overlaps the lines the fix deleted or "
+    "modified (insert-only hunks: the insertion point +/- {ctx} lines) within +/- {tol} lines, "
+    "or its CWE is one of the item's expected CWEs; fixed twin (localised FP): a finding "
+    "overlapping the lines the fix added or modified in the twin; FPR otherwise stays "
+    "'any validated finding'"
+)
+LEGACY_NOT_LOCALISABLE = (
+    "legacy prompt: its findings carry no quoted code or line, so localised TPR / localised "
+    "twin FPR cannot be computed (any-finding metrics only)"
+)
+
+SPLIT_NAMES = ("dev", "test")
+TEST_SPLIT_FLAG = "--i-know-this-is-the-test-set"
+# OSV eval ids since 01905e8 carry a code hash: "<prefix>_<hash8>_{vuln,safe}";
+# results written before that name the pair "<prefix>_{vuln,safe}".
+_HASHED_PAIR_ID = re.compile(r"^(.*)_([0-9a-f]{8})_(vuln|safe)$")
 
 
 def load_dataset(path: Path) -> list[dict]:
@@ -380,6 +445,186 @@ def sample_items_by_kind(items: list[dict], quotas: dict[str, int], seed: int = 
     return [items[i] for i in sorted(chosen)]
 
 
+# --- split manifests --------------------------------------------------------
+
+
+def load_split(path, name: str) -> tuple[set[str], dict]:
+    """(ids, meta) of split ``name`` in a manifest
+    ``{"version": 1, "seed": ..., "dev": {"ids": [...]}, "test": {"ids": [...]}, "meta": {...}}``.
+    Raises ValueError on another version, a missing / malformed split, or ids
+    shared by dev and test (a leaking split)."""
+    raw = Path(path).read_bytes()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"not JSON: {exc}") from None
+    if not isinstance(data, dict) or data.get("version") != 1:
+        raise ValueError("expected a split manifest with \"version\": 1")
+
+    def ids_of(split: str) -> list[str]:
+        part = data.get(split)
+        ids = part.get("ids") if isinstance(part, dict) else None
+        if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
+            raise ValueError(f"split {split!r} has no list of string \"ids\"")
+        return ids
+
+    ids = ids_of(name)
+    others = [s for s in SPLIT_NAMES if s != name and s in data]
+    for other in others:
+        shared = set(ids) & set(ids_of(other))
+        if shared:
+            raise ValueError(f"{len(shared)} id(s) are in both {name!r} and {other!r} "
+                             f"(e.g. {sorted(shared)[0]!r})")
+    meta = {
+        "path": _rel(str(path)),
+        "name": name,
+        "version": data["version"],
+        "seed": data.get("seed"),
+        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "n_ids": len(set(ids)),
+    }
+    return set(ids), meta
+
+
+def apply_split(items: list[dict], ids: set[str]) -> tuple[list[dict], int]:
+    """Items whose id is in ``ids`` (input order) and how many ids matched none."""
+    kept = [i for i in items if i["id"] in ids]
+    return kept, len(ids - {i["id"] for i in kept})
+
+
+# --- localised scoring ------------------------------------------------------
+
+
+def _norm_cwe(value) -> str | None:
+    m = re.search(r"CWE-?\s*(\d+)", str(value or ""), re.IGNORECASE)
+    return f"CWE-{m.group(1)}" if m else None
+
+
+def item_expected_cwes(item: dict) -> list[str]:
+    """The item's expected CWEs (a ``cwe`` / ``cwes`` / ``cwe_ids`` field,
+    string or list), normalised to "CWE-<n>". Empty for every current eval set."""
+    raw = item.get("cwe_ids") or item.get("cwes") or item.get("cwe") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    return sorted({c for c in (_norm_cwe(x) for x in raw) if c})
+
+
+def fix_changed_lines(
+    code: str, other: str, context: int = INSERTION_CONTEXT
+) -> list[int] | None:
+    """1-based lines of ``code`` that the change ``code`` -> ``other`` touches.
+
+    For a vulnerable item and its fixed twin as ``other``: the lines the fix
+    deleted or modified. A hunk that only inserts lines (a new check) has no
+    line of its own in ``code``: it contributes ``context`` lines on each side
+    of the insertion point (between lines i and i+1: lines i-context+1 ..
+    i+context, clipped to the code). The other way round (twin -> vulnerable)
+    it gives the lines the fix added or modified in the twin. Lines are compared
+    stripped, so re-indenting a block under a new ``if`` is not a change of the
+    block; hunks touching only blank lines are ignored. None if nothing differs.
+    """
+    a = [ln.strip() for ln in code.splitlines()]
+    b = [ln.strip() for ln in other.splitlines()]
+    lines: set[int] = set()
+    matcher = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal" or (not any(a[i1:i2]) and not any(b[j1:j2])):
+            continue
+        if tag in ("replace", "delete"):
+            lines.update(range(i1 + 1, i2 + 1))
+        else:  # insert before a[i1]: the gap between 1-based lines i1 and i1 + 1
+            lines.update(range(max(1, i1 - context + 1), min(len(a), i1 + context) + 1))
+    return sorted(lines) or None
+
+
+def annotate_fix_targets(items: list[dict], context: int = INSERTION_CONTEXT) -> dict:
+    """Set ``item["fix_lines"]`` on every vulnerable / fixed-twin item (paired
+    with ``pair_group_keys``): ``fix_changed_lines`` against its twin, None when
+    the twin isn't loaded or the two don't differ. Run on the full datasets
+    before splitting / sampling, so a sampled item keeps its twin's diff.
+    Returns counts."""
+    groups: dict[str, dict[str, dict]] = {}
+    for item, key in zip(items, pair_group_keys(items), strict=True):
+        kind = item_kind(item)
+        if kind in PAIR_KINDS:
+            groups.setdefault(key, {})[kind] = item
+    stats = Counter()
+    for group in groups.values():
+        vuln, twin = group.get(KIND_VULNERABLE), group.get(KIND_FIXED_TWIN)
+        if vuln is None or twin is None:
+            for item in group.values():
+                item["fix_lines"] = None
+            stats["unpaired"] += len(group)
+            continue
+        vuln["fix_lines"] = fix_changed_lines(vuln["code"], twin["code"], context)
+        twin["fix_lines"] = fix_changed_lines(twin["code"], vuln["code"], context)
+        stats["pairs"] += 1
+        stats["pairs_with_fix_lines"] += vuln["fix_lines"] is not None
+    return {"pairs": stats["pairs"], "pairs_with_fix_lines": stats["pairs_with_fix_lines"],
+            "unpaired_items": stats["unpaired"], "insertion_context": context}
+
+
+def finding_span(finding: dict, code: str | None = None) -> tuple[int, int] | None:
+    """1-based (first, last) line of a finding: its ``line`` / ``end_line``,
+    else its ``quoted_code`` located in ``code`` (``locate_quote``)."""
+    line = finding.get("line")
+    if isinstance(line, int) and not isinstance(line, bool):
+        end = finding.get("end_line")
+        end = end if isinstance(end, int) and not isinstance(end, bool) else line
+        return min(line, end), max(line, end)
+    quote = finding.get("quoted_code")
+    if quote and code:
+        span = review_prompt.locate_quote(quote, code)
+        if span is not None:
+            return span[0] + 1, span[1] + 1
+    return None
+
+
+def localised_hit(
+    findings: list[dict], target_lines, tolerance: int = DEFAULT_LOCALISE_TOLERANCE,
+    expected_cwes=(), code: str | None = None,
+) -> bool | None:
+    """True iff a finding's span overlaps ``target_lines`` within
+    ``tolerance`` lines, or its CWE is in ``expected_cwes``. None when it can't
+    be decided: no target lines (and no CWE matched), or nothing matched and a
+    finding couldn't be anchored."""
+    expected = set(expected_cwes or ())
+    if expected and any(_norm_cwe(f.get("cwe")) in expected for f in findings):
+        return True
+    if not target_lines:
+        return None
+    unanchored = False
+    for f in findings:
+        span = finding_span(f, code)
+        if span is None:
+            unanchored = True
+            continue
+        lo, hi = span[0] - tolerance, span[1] + tolerance
+        if any(lo <= ln <= hi for ln in target_lines):
+            return True
+    return None if unanchored else False
+
+
+def record_localised(
+    rec: dict, tolerance: int = DEFAULT_LOCALISE_TOLERANCE, anchored: bool = True
+) -> bool | None:
+    """A per-item record's localised outcome: for a vulnerable item, a
+    localised TP; for a fixed twin, a localised FP (a finding on the lines the
+    fix added / changed; CWEs don't count there). None for other kinds, an
+    unscored item, an arm whose findings carry no anchor (``anchored`` False:
+    legacy), a record without stored findings, or no fix lines."""
+    kind = rec.get("kind")
+    if kind not in PAIR_KINDS or rec.get("any_finding") is None or not anchored:
+        return None
+    findings = rec.get("findings")
+    if findings is None:
+        if rec["any_finding"]:
+            return None  # flagged, but where is unknown (an old record)
+        findings = []
+    expected = rec.get("expected_cwes") if kind == KIND_VULNERABLE else ()
+    return localised_hit(findings, rec.get("fix_lines"), tolerance, expected)
+
+
 def gather(
     items, embedder, store, reranker, ann_candidates: int, progress: bool = False
 ) -> tuple[list[dict], dict]:
@@ -452,6 +697,8 @@ def gather(
                 "language": item.get("language"),
                 "length_matched": item.get("length_matched"),
                 "code": code,
+                "fix_lines": item.get("fix_lines"),
+                "expected_cwes": item_expected_cwes(item),
                 "candidates": scored,
             }
         )
@@ -698,6 +945,235 @@ def print_realistic(title: str, m: dict) -> None:
         )
 
 
+def _row(r: dict, pred) -> dict:
+    return {"id": r["id"], "kind": r["kind"], "label": r["label"],
+            "length_matched": r.get("length_matched"), "pred": pred}
+
+
+def localised_metrics(recs: list[dict]) -> dict:
+    """``realistic_metrics`` with the localised rule: a vulnerable item counts
+    iff ``localised`` (unlocalisable ones - no twin / fix lines, unanchored
+    findings - are excluded and counted); every other kind keeps
+    ``any_finding`` (FPR stays "any validated finding"). Adds
+    ``fpr_fixed_twin_localised`` (twins flagged on the lines the fix changed),
+    ``tpr_vulnerable_any_finding_same_items`` (the any-finding TPR on exactly
+    the localisable vulnerable items) and ``n_vulnerable_unlocalisable``."""
+    m = realistic_metrics([
+        _row(r, r.get("localised") if r["kind"] == KIND_VULNERABLE else r.get("any_finding"))
+        for r in recs
+    ])
+    vuln = [r for r in recs if r["kind"] == KIND_VULNERABLE and r.get("any_finding") is not None]
+    loc = [r for r in vuln if r.get("localised") is not None]
+    m["tpr_vulnerable_any_finding_same_items"] = _rate([bool(r["any_finding"]) for r in loc])
+    m["n_vulnerable_unlocalisable"] = len(vuln) - len(loc)
+    m["fpr_fixed_twin_localised"] = _rate([
+        bool(r["localised"]) for r in recs
+        if r["kind"] == KIND_FIXED_TWIN and r.get("localised") is not None
+    ])
+    return m
+
+
+def llm_headline(any_finding: dict, localised: dict | None, note: str | None = None) -> dict:
+    """The numbers to quote: localised TPR (primary) next to the any-finding
+    TPR, any-finding FPR on twins / ordinary code, and the localised twin FPR."""
+    return {
+        "primary": "tpr_localised" if localised is not None else "tpr_any_finding",
+        "tpr_localised": localised["tpr_vulnerable"] if localised else None,
+        "tpr_any_finding": any_finding["tpr_vulnerable"],
+        "tpr_any_finding_localisable_items": (
+            localised["tpr_vulnerable_any_finding_same_items"] if localised else None),
+        "fpr_fixed_twin": any_finding["fpr_fixed_twin"],
+        "fpr_fixed_twin_localised": localised["fpr_fixed_twin_localised"] if localised else None,
+        "fpr_ordinary": any_finding["fpr_ordinary"],
+        "n_vulnerable_unlocalisable": (
+            localised["n_vulnerable_unlocalisable"] if localised else None),
+        "note": note,
+    }
+
+
+def print_headline(title: str, h: dict) -> None:
+    print(f"\n{title}:")
+    if h["tpr_localised"] is not None:
+        print(f"  TPR vulnerable, localised (primary)  {_fmt_rate(h['tpr_localised'])}")
+        print(f"  TPR vulnerable, any finding          {_fmt_rate(h['tpr_any_finding'])}"
+              f"  (same items: {_fmt_rate(h['tpr_any_finding_localisable_items'])}; "
+              f"{h['n_vulnerable_unlocalisable']} unlocalisable)")
+    else:
+        print(f"  TPR vulnerable, any finding          {_fmt_rate(h['tpr_any_finding'])}")
+    print(f"  FPR fixed twin, any finding          {_fmt_rate(h['fpr_fixed_twin'])}")
+    if h["fpr_fixed_twin_localised"] is not None:
+        print(f"  FPR fixed twin, localised            {_fmt_rate(h['fpr_fixed_twin_localised'])}")
+    print(f"  FPR ordinary, any finding            {_fmt_rate(h['fpr_ordinary'])}")
+    if h.get("note"):
+        print(f"  note: {h['note']}")
+
+
+def flip_rate(runs: list[list[dict]], key: str, kinds=None) -> dict:
+    """Over items scored (``key`` not None) in every repeat, the fraction
+    whose ``key`` differs between repeats; ``runs[r][i]`` is item i's record
+    in repeat r. Wilson 95% interval."""
+    flips = []
+    for recs in zip(*runs, strict=True):
+        if kinds is not None and recs[0]["kind"] not in kinds:
+            continue
+        values = [r.get(key) for r in recs]
+        if any(v is None for v in values):
+            continue
+        flips.append(len({bool(v) for v in values}) > 1)
+    return _rate(flips)
+
+
+def repeat_summary(runs: list[list[dict]], localisable: bool) -> dict:
+    """Run-to-run noise over K repeats of the same items."""
+    per_repeat = []
+    for recs in runs:
+        anyf = realistic_metrics([_row(r, r.get("any_finding")) for r in recs])
+        loc = localised_metrics(recs) if localisable else None
+        per_repeat.append({
+            "tpr_localised": loc["tpr_vulnerable"]["rate"] if loc else None,
+            "tpr_any_finding": anyf["tpr_vulnerable"]["rate"],
+            "fpr_fixed_twin": anyf["fpr_fixed_twin"]["rate"],
+            "fpr_ordinary": anyf["fpr_ordinary"]["rate"],
+        })
+    return {
+        "k": len(runs),
+        "flip_rate_prediction": flip_rate(runs, "prediction"),
+        "flip_rate_prediction_by_kind": {
+            kind: flip_rate(runs, "prediction", {kind}) for kind in KINDS
+        },
+        "flip_rate_localised": flip_rate(runs, "localised", PAIR_KINDS) if localisable else None,
+        "per_repeat": per_repeat,
+    }
+
+
+# --- exact paired statistics (offline --compare) ------------------------------
+
+
+def mcnemar_exact(b: int, c: int) -> float:
+    """Two-sided exact McNemar p-value from the discordant counts ``b`` (only A
+    positive) and ``c`` (only B positive): 2 * P(X <= min(b, c)), X ~
+    Binomial(b + c, 1/2), capped at 1. 1.0 when there is no discordant pair."""
+    n = b + c
+    if n == 0:
+        return 1.0
+    tail = sum(math.comb(n, i) for i in range(min(b, c) + 1))
+    return min(1.0, 2 * tail / 2**n)
+
+
+def _binom_cdf(k: int, n: int, p: float) -> float:
+    """P(X <= k), X ~ Binomial(n, p), summed in log space (no overflow)."""
+    if k < 0:
+        return 0.0
+    if k >= n or p <= 0.0:
+        return 1.0
+    if p >= 1.0:
+        return 0.0
+    lp, lq, lg = math.log(p), math.log1p(-p), math.lgamma(n + 1)
+    return min(1.0, sum(
+        math.exp(lg - math.lgamma(i + 1) - math.lgamma(n - i + 1) + i * lp + (n - i) * lq)
+        for i in range(k + 1)
+    ))
+
+
+def clopper_pearson(k: int, n: int, alpha: float = 0.05) -> list[float] | None:
+    """Exact (Clopper-Pearson) 1 - ``alpha`` interval for k of n (None if n == 0),
+    by bisection on the binomial CDF."""
+    if n == 0:
+        return None
+
+    def solve(f) -> float:  # f increasing in p, f(0) < 0 < f(1)
+        lo, hi = 0.0, 1.0
+        for _ in range(100):
+            mid = (lo + hi) / 2
+            lo, hi = (mid, hi) if f(mid) < 0 else (lo, mid)
+        return (lo + hi) / 2
+
+    lower = 0.0 if k == 0 else solve(lambda p: (1 - _binom_cdf(k - 1, n, p)) - alpha / 2)
+    upper = 1.0 if k == n else solve(lambda p: alpha / 2 - _binom_cdf(k, n, p))
+    return [round(lower, 4), round(upper, 4)]
+
+
+def _exact_rate(preds: list[bool]) -> dict:
+    k, n = sum(preds), len(preds)
+    return {"k": k, "n": n, "rate": round(k / n, 4) if n else None,
+            "ci95_exact": clopper_pearson(k, n)}
+
+
+def paired_outcomes(a_recs: list[dict], b_recs: list[dict], kind: str, key: str) -> dict:
+    """Paired 2x2 of ``key`` over items of ``kind`` scored (``key`` not None)
+    in both A and B (matched by id), with the exact McNemar p-value."""
+    b_by_id = {r["id"]: r for r in b_recs}
+    pairs = [
+        (bool(a[key]), bool(b_by_id[a["id"]][key])) for a in a_recs
+        if a["kind"] == kind and a["id"] in b_by_id and a.get(key) is not None
+        and b_by_id[a["id"]].get(key) is not None
+    ]
+    counts = Counter(pairs)
+    a_only, b_only = counts[(True, False)], counts[(False, True)]
+    return {
+        "kind": kind, "key": key, "n": len(pairs),
+        "a": _exact_rate([x for x, _ in pairs]),
+        "b": _exact_rate([y for _, y in pairs]),
+        "both": counts[(True, True)], "a_only": a_only, "b_only": b_only,
+        "neither": counts[(False, False)],
+        "p_mcnemar_exact": round(mcnemar_exact(a_only, b_only), 6),
+    }
+
+
+def compare_items(a_recs: list[dict], b_recs: list[dict]) -> dict:
+    """Paired comparison of two runs' per-item records (matched by id).
+
+    McNemar (exact) on vulnerable localised TP (and any-finding TP), on
+    fixed-twin FP (any finding, and localised); exact binomial CIs plus the
+    paired table on ordinary FPR."""
+    a_ids, b_ids = {r["id"] for r in a_recs}, {r["id"] for r in b_recs}
+    ordinary = paired_outcomes(a_recs, b_recs, KIND_ORDINARY, "any_finding")
+    return {
+        "n_common_ids": len(a_ids & b_ids),
+        "n_only_in_a": len(a_ids - b_ids),
+        "n_only_in_b": len(b_ids - a_ids),
+        "vulnerable_localised_tp": paired_outcomes(a_recs, b_recs, KIND_VULNERABLE, "localised"),
+        "vulnerable_any_finding_tp": paired_outcomes(
+            a_recs, b_recs, KIND_VULNERABLE, "any_finding"),
+        "fixed_twin_fp": paired_outcomes(a_recs, b_recs, KIND_FIXED_TWIN, "any_finding"),
+        "fixed_twin_localised_fp": paired_outcomes(a_recs, b_recs, KIND_FIXED_TWIN, "localised"),
+        "ordinary_fpr": {
+            "a": _exact_rate([bool(r["any_finding"]) for r in a_recs
+                              if r["kind"] == KIND_ORDINARY and r.get("any_finding") is not None]),
+            "b": _exact_rate([bool(r["any_finding"]) for r in b_recs
+                              if r["kind"] == KIND_ORDINARY and r.get("any_finding") is not None]),
+            "paired": ordinary,
+        },
+    }
+
+
+def _fmt_exact(r: dict) -> str:
+    if r["rate"] is None:
+        return "n/a (n=0)"
+    lo, hi = r["ci95_exact"]
+    return f"{r['rate']:.3f} [{lo:.3f}, {hi:.3f}] ({r['k']}/{r['n']})"
+
+
+def print_comparison(label_a: str, label_b: str, cmp: dict) -> None:
+    print(f"\nPaired comparison  A = {label_a}\n                   B = {label_b}")
+    print(f"  common ids {cmp['n_common_ids']} (only in A {cmp['n_only_in_a']}, "
+          f"only in B {cmp['n_only_in_b']})")
+    for title, key in (
+        ("Vulnerable, localised TP (primary)", "vulnerable_localised_tp"),
+        ("Vulnerable, any-finding TP", "vulnerable_any_finding_tp"),
+        ("Fixed twin, any-finding FP", "fixed_twin_fp"),
+        ("Fixed twin, localised FP", "fixed_twin_localised_fp"),
+        ("Ordinary, any-finding FP (paired)", None),
+    ):
+        t = cmp[key] if key else cmp["ordinary_fpr"]["paired"]
+        print(f"  {title} (n={t['n']} paired): A {_fmt_exact(t['a'])} | B {_fmt_exact(t['b'])}")
+        print(f"    discordant: A only {t['a_only']}, B only {t['b_only']} (both {t['both']}, "
+              f"neither {t['neither']}); exact McNemar p = {t['p_mcnemar_exact']:.4g}")
+    o = cmp["ordinary_fpr"]
+    print(f"  Ordinary FPR, exact 95% CI (all scored): A {_fmt_exact(o['a'])} | "
+          f"B {_fmt_exact(o['b'])}")
+
+
 # --- LLM report stage -------------------------------------------------------
 
 
@@ -734,7 +1210,13 @@ def llm_decision(llm_json, cves: list[dict]) -> dict:
         "raw_finding_count": len(raw),
         "flagged_cve_ids": flagged,
         "flagged_categories": sorted({str(categories.get(c)) for c in flagged}),
+        # The legacy schema has no quote / line / CWE: not localisable.
+        "findings": [{k: f.get(k) for k in ("severity", "cve_id", "title")} for f in validated],
     }
+
+
+# Per validated finding, what the per-item record keeps (enough to rescore).
+FINDING_FIELDS = ("line", "end_line", "cwe", "severity", "cve_id", "title", "quoted_code")
 
 
 def review_decision(llm_json, batch: list[dict]) -> dict:
@@ -762,6 +1244,7 @@ def review_decision(llm_json, batch: list[dict]) -> dict:
         "flagged_cve_ids": flagged,
         "flagged_categories": sorted({str(categories.get(c)) for c in flagged}),
         "cwes": sorted({f["cwe"] for f in validated if f.get("cwe")}),
+        "findings": [{k: f.get(k) for k in FINDING_FIELDS} for f in validated],
     }
 
 
@@ -829,30 +1312,44 @@ def attach_semgrep(entries: list[dict], scanner) -> dict:
     }
 
 
+def _cache_key(item_id: str, sha: str, model: str, temperature, repeat) -> tuple:
+    return (item_id, sha, model, round(float(temperature), 4), int(repeat))
+
+
 class LLMCache:
     """Append-only JSONL of successful LLM results keyed by (item id, prompt
-    sha256, model). Errors are never cached, so a re-run retries them."""
+    sha256, model, temperature, repeat index). Entries written before the
+    temperature / repeat were recorded count as LEGACY_CACHE_TEMPERATURE /
+    repeat 0 (what they were). Errors are never cached, so a re-run retries
+    them."""
 
     def __init__(self, path: Path | str):
         self.path = Path(path)
-        self._entries: dict[tuple[str, str, str], dict] = {}
+        self._entries: dict[tuple, dict] = {}
         if self.path.exists():
             with open(self.path, encoding="utf-8") as f:
                 for line in f:
                     try:
                         rec = json.loads(line)
-                        self._entries[(rec["id"], rec["prompt_sha256"], rec["model"])] = rec
-                    except (json.JSONDecodeError, KeyError, TypeError):
+                        self._entries[self._key(rec)] = rec
+                    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                         continue  # a torn last line from an interrupted run
+
+    @staticmethod
+    def _key(rec: dict) -> tuple:
+        return _cache_key(rec["id"], rec["prompt_sha256"], rec["model"],
+                          rec.get("temperature", LEGACY_CACHE_TEMPERATURE), rec.get("repeat", 0))
 
     def __len__(self) -> int:
         return len(self._entries)
 
-    def get(self, item_id: str, sha: str, model: str) -> dict | None:
-        return self._entries.get((item_id, sha, model))
+    def get(self, item_id: str, sha: str, model: str,
+            temperature: float = LEGACY_CACHE_TEMPERATURE, repeat: int = 0) -> dict | None:
+        return self._entries.get(_cache_key(item_id, sha, model, temperature, repeat))
 
     def put(self, rec: dict) -> None:
-        self._entries[(rec["id"], rec["prompt_sha256"], rec["model"])] = rec
+        rec = {"temperature": LEGACY_CACHE_TEMPERATURE, "repeat": 0, **rec}
+        self._entries[self._key(rec)] = rec
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
@@ -866,6 +1363,12 @@ def _http_event(resp: httpx.Response) -> dict:
             data = resp.json()
             usage = data.get("usage")
             event["usage"] = usage if isinstance(usage, dict) else None
+            # OpenRouter names the upstream that served the request (and the
+            # exact model); logged so a silent upstream change is visible.
+            if isinstance(data.get("provider"), str):
+                event["upstream_provider"] = data["provider"]
+            if isinstance(data.get("model"), str):
+                event["response_model"] = data["model"]
             # OpenRouter can put an error (incl. an upstream 429) in a 200 body.
             err = data.get("error")
             if isinstance(err, dict):
@@ -894,17 +1397,29 @@ class HttpUsageTap:
     ``usage`` and rate-limit signals. LLMClient returns only the message text and
     folds a 429 into "HTTP 429", so this is how the eval sees real token counts
     (including reasoning tokens) and tells a daily limit from a per-minute one.
-    Only the LLM stage runs inside it (no other httpx traffic in the eval)."""
+    Only the LLM stage runs inside it (no other httpx traffic in the eval).
 
-    def __init__(self):
+    ``inject`` fields are merged into the JSON body of every request whose URL
+    starts with ``inject_url_prefix`` (the eval pins OpenRouter's upstream
+    routing this way: ``{"provider": {"allow_fallbacks": false}}``) without
+    changing the production client."""
+
+    def __init__(self, inject: dict | None = None, inject_url_prefix: str | None = None):
         self.events: list[dict] = []
         self._orig = None
+        self.inject = dict(inject or {})
+        self.inject_url_prefix = inject_url_prefix
 
     def __enter__(self):
         self._orig = orig = httpx.AsyncClient.post
         tap = self
 
         async def post(client, *args, **kwargs):
+            if tap.inject and tap.inject_url_prefix:
+                url = str(args[0] if args else kwargs.get("url", ""))
+                body = kwargs.get("json")
+                if url.startswith(tap.inject_url_prefix) and isinstance(body, dict):
+                    kwargs["json"] = {**body, **tap.inject}
             resp = await orig(client, *args, **kwargs)
             tap.events.append(_http_event(resp))
             return resp
@@ -962,10 +1477,19 @@ def build_llm_entries(
             "language": g.get("language"),
             "length_matched": g.get("length_matched"),
             "code": g["code"],
+            "fix_lines": g.get("fix_lines"),
+            "expected_cwes": g.get("expected_cwes") or [],
             "cves": operating_cves(g, sim_t, rerank_t, margin_t, top_k),
         }
         for g in gathered
     ]
+
+
+def router_temperature(router) -> float:
+    """The temperature the router's primary client sends (settings default)."""
+    clients = getattr(router, "clients", None) or []
+    value = getattr(clients[0], "temperature", None) if clients else None
+    return float(settings.LLM_TEMPERATURE if value is None else value)
 
 
 async def run_llm_stage(
@@ -982,6 +1506,9 @@ async def run_llm_stage(
     sleep=asyncio.sleep,
     progress: bool = True,
     arm: str = "current",
+    repeats: int = 1,
+    temperature: float | None = None,
+    tolerance: int = DEFAULT_LOCALISE_TOLERANCE,
 ) -> dict:
     """Run the report stage over ``entries`` (see ``build_llm_entries``) with
     the ``arm``'s prompt (``LLM_PROMPT_ARMS``, rules in ``ARM_RULES``).
@@ -996,24 +1523,44 @@ async def run_llm_stage(
     after ``max_rate_limit_errors`` consecutive rate-limited failures. Between
     real calls it waits max(``sleep_s``, 60 * last call's tokens / ``tpm``).
     Cached items cost no call, no wait and no budget.
+
+    ``repeats`` K > 1 runs the whole item list K times (repeat r's cache key
+    carries r, so each repeat is its own call; repeat 0 is exactly the K = 1
+    run): ``records`` is repeat 0, ``repeat_records`` repeats 1..K-1.
+    ``temperature`` (default: the router's) is part of the cache key. Each
+    record stores its validated ``findings``, ``fix_lines`` and ``localised``
+    (``record_localised`` with ``tolerance``).
     """
     model = llm_model_key(router)
+    temp = router_temperature(router) if temperature is None else float(temperature)
+    anchored = arm != "legacy"
     n = len(entries)
-    records: list[dict] = []
+    runs: list[list[dict]] = [[] for _ in range(repeats)]
     calls = tokens_used = consecutive_rl = 0
     last_tokens = 0
     stopped: str | None = None
-    for idx, e in enumerate(entries, start=1):
+    jobs = [(rep, idx, e) for rep in range(repeats) for idx, e in enumerate(entries, start=1)]
+    for rep, idx, e in jobs:
         rec = {
             "id": e["id"], "kind": e["kind"], "label": e["label"], "category": e["category"],
             "length_matched": e.get("length_matched"),
             "retrieved_cve_ids": [c.get("cve_id") for c in e["cves"]],
+            "fix_lines": e.get("fix_lines"),
         }
-        records.append(rec)
+        if e.get("expected_cwes"):
+            rec["expected_cwes"] = list(e["expected_cwes"])
+        if repeats > 1:
+            rec["repeat"] = rep
+        runs[rep].append(rec)
+
+        def finish(rec=rec):
+            rec["localised"] = record_localised(rec, tolerance, anchored)
+
         if arm == "legacy":
             if not e["cves"]:
                 rec.update(status="no_candidates", prediction=False, any_finding=False,
-                           validated_count=0)
+                           validated_count=0, findings=[])
+                finish()
                 continue
             system = SYSTEM_PROMPT
             prompt = build_user_prompt(e["code"], e["cves"], [])
@@ -1024,7 +1571,8 @@ async def run_llm_stage(
             batch, prompt = review_prompt_for(e, arm)
             if batch is None:
                 rec.update(status="too_large", prediction=False, any_finding=False,
-                           validated_count=0)
+                           validated_count=0, findings=[])
+                finish()
                 continue
             system = review_prompt.SYSTEM_PROMPT
             rec["shown_cve_ids"] = [c.get("cve_id") for c in batch[0]["cves"]]
@@ -1036,12 +1584,15 @@ async def run_llm_stage(
         rec["prompt_sha256"] = sha
         rec["prompt_tokens_est"] = estimate_tokens(system) + estimate_tokens(prompt)
 
-        cached = cache.get(e["id"], sha, model) if cache is not None else None
+        cached = cache.get(e["id"], sha, model, temp, rep) if cache is not None else None
         if cached is not None:
             try:
                 rec.update(decide(cached["llm_json"]))
                 rec.update(status="cached", provider_used=cached.get("provider_used"),
                            latency_s=cached.get("latency_s"), usage=cached.get("usage"))
+                if cached.get("upstream_provider"):
+                    rec["upstream_provider"] = cached["upstream_provider"]
+                finish()
                 continue
             except (ValueError, KeyError):
                 pass  # unusable cache entry: call again
@@ -1052,7 +1603,7 @@ async def run_llm_stage(
             elif token_budget is not None and tokens_used + rec["prompt_tokens_est"] > token_budget:
                 stopped = "token_budget"
         if stopped is not None:
-            rec.update(status="not_run", prediction=None, any_finding=None)
+            rec.update(status="not_run", prediction=None, any_finding=None, localised=None)
             continue
 
         if calls:
@@ -1069,7 +1620,7 @@ async def run_llm_stage(
         except asyncio.CancelledError:
             # Ctrl-C under asyncio.run: keep what we have (the cache already
             # holds every finished item) and let main() write the partial --out.
-            rec.update(status="not_run", prediction=None, any_finding=None)
+            rec.update(status="not_run", prediction=None, any_finding=None, localised=None)
             stopped = "interrupted"
             continue
         except Exception as exc:  # noqa: BLE001 — any failure is one errored item
@@ -1079,6 +1630,11 @@ async def run_llm_stage(
         usage = _usage_totals(events)
         rec.update(latency_s=latency, usage=usage,
                    http_statuses=[ev["status"] for ev in events] or None)
+        upstreams = [ev["upstream_provider"] for ev in events if ev.get("upstream_provider")]
+        if upstreams:
+            rec["upstream_provider"] = upstreams[-1]  # the answer's (earlier: retries)
+            if len(upstreams) > 1:
+                rec["upstream_providers"] = upstreams
 
         if error is None:
             try:
@@ -1087,17 +1643,20 @@ async def run_llm_stage(
                 error = exc
             else:
                 rec.update(status="ok", provider_used=provider)
+                finish()
                 consecutive_rl = 0
                 if cache is not None:
                     cache.put({
                         "id": e["id"], "prompt_sha256": sha, "model": model,
+                        "temperature": temp, "repeat": rep,
                         "provider_used": provider, "llm_json": llm_json,
+                        "upstream_provider": rec.get("upstream_provider"),
                         "latency_s": latency, "usage": usage,
                         "prompt_tokens_est": rec["prompt_tokens_est"],
                     })
         if error is not None:
             kind = classify_llm_error(error, events)
-            rec.update(status="error", prediction=None, any_finding=None,
+            rec.update(status="error", prediction=None, any_finding=None, localised=None,
                        error=f"{type(error).__name__}: {str(error)[:500]}", error_kind=kind)
             if kind == "daily_limit":
                 stopped = "daily_limit"
@@ -1116,47 +1675,51 @@ async def run_llm_stage(
             pred = {True: "VULN", False: "safe", None: "-"}[rec.get("prediction")]
             detail = (
                 f"{rec.get('error_kind')} error" if rec["status"] == "error"
-                else f"pred={pred} findings={rec.get('validated_count')} "
-                f"via {rec.get('provider_used')}"
+                else f"pred={pred} localised={rec.get('localised')} "
+                f"findings={rec.get('validated_count')} via {rec.get('provider_used')}"
+                + (f" [{rec['upstream_provider']}]" if rec.get("upstream_provider") else "")
             )
+            rep_tag = f" r{rep}" if repeats > 1 else ""
             print(
-                f"  [LLM {idx}/{n}] {e['id']} ({e['kind']}): {detail}, {latency:.1f}s | "
+                f"  [LLM{rep_tag} {idx}/{n}] {e['id']} ({e['kind']}): {detail}, {latency:.1f}s | "
                 f"calls {calls}/{max_calls}, tokens so far {tokens_used}",
                 flush=True,
             )
             if stopped in ("daily_limit", "rate_limit"):
                 print(f"  Stopping LLM calls: {stopped}. Re-run later to resume from the cache.")
 
-    status_counts = Counter(r["status"] for r in records)
+    records = runs[0]
+    all_records = [r for run in runs for r in run]
     return {
         "model": model,
+        "arm": arm,
+        "temperature": temp,
         "records": records,
+        "repeat_records": runs[1:],
         "calls": calls,
         "tokens_used": tokens_used,
         "stopped": stopped,
-        "status_counts": dict(status_counts),
+        "status_counts": dict(Counter(r["status"] for r in records)),
+        "status_counts_all_repeats": dict(Counter(r["status"] for r in all_records)),
         "providers": dict(Counter(r["provider_used"] for r in records if r.get("provider_used"))),
+        "upstream_providers": dict(Counter(
+            r["upstream_provider"] for r in all_records if r.get("upstream_provider"))),
     }
 
 
 def summarize_llm(stage: dict, retrieval_preds: dict[str, bool]) -> dict:
-    """Metrics for the LLM stage: the CVE-finding rule (``realistic``), the
-    any-finding rule (``realistic_any_finding``), retrieval-only on the same
-    scored items (``realistic_retrieval_same_items``), and the category hit rate
-    among true positives."""
+    """Metrics for the LLM stage: the arm's rule (``realistic``), the
+    any-finding rule (``realistic_any_finding``), the localised rule
+    (``realistic_localised``, the primary TPR; None for the legacy arm, whose
+    findings carry no anchor), retrieval-only on the same scored items
+    (``realistic_retrieval_same_items``), the category hit rate among true
+    positives, ``headline`` (the numbers to quote) and, with repeats, the
+    run-to-run ``repeats`` summary (flip rates)."""
     recs = stage["records"]
-
-    def rows(key: str) -> list[dict]:
-        return [
-            {"id": r["id"], "kind": r["kind"], "label": r["label"],
-             "length_matched": r.get("length_matched"), "pred": r.get(key)}
-            for r in recs
-        ]
+    localisable = stage.get("arm", "current") != "legacy"
 
     same_items = [
-        {"id": r["id"], "kind": r["kind"], "label": r["label"],
-         "length_matched": r.get("length_matched"),
-         "pred": retrieval_preds[r["id"]] if r.get("prediction") is not None else None}
+        _row(r, retrieval_preds[r["id"]] if r.get("prediction") is not None else None)
         for r in recs
     ]
     tps = [r for r in recs if r.get("prediction") and r["label"] == "vulnerable"]
@@ -1164,14 +1727,24 @@ def summarize_llm(stage: dict, retrieval_preds: dict[str, bool]) -> dict:
     extra = {}
     if any(r.get("cve_finding") is not None for r in recs):
         # Review arms: how many reviewed findings also cite a shown CVE.
-        extra["realistic_cve_finding"] = realistic_metrics(rows("cve_finding"))
-    return {
+        extra["realistic_cve_finding"] = realistic_metrics(
+            [_row(r, r.get("cve_finding")) for r in recs])
+    any_finding = realistic_metrics([_row(r, r.get("any_finding")) for r in recs])
+    localised = localised_metrics(recs) if localisable else None
+    out = {
         **extra,
-        "realistic": realistic_metrics(rows("prediction")),
-        "realistic_any_finding": realistic_metrics(rows("any_finding")),
+        "realistic": realistic_metrics([_row(r, r.get("prediction")) for r in recs]),
+        "realistic_any_finding": any_finding,
+        "realistic_localised": localised,
         "realistic_retrieval_same_items": realistic_metrics(same_items),
         "category_hit_rate": round(hits / len(tps), 4) if tps else None,
+        "headline": llm_headline(any_finding, localised,
+                                 None if localisable else LEGACY_NOT_LOCALISABLE),
     }
+    runs = [recs, *stage.get("repeat_records", [])]
+    if len(runs) > 1:
+        out["repeats"] = repeat_summary(runs, localisable)
+    return out
 
 
 _UNSET = object()
@@ -1320,8 +1893,38 @@ def build_parser() -> argparse.ArgumentParser:
         "--seed", type=int, default=42,
         help="RNG seed for --sample / --sample-kinds (default 42).",
     )
+    parser.add_argument(
+        "--split", default=None, metavar="PATH",
+        help="Split manifest (JSON {version: 1, seed, dev: {ids}, test: {ids}, meta}); with "
+        "--split-name, evaluate only the items it lists (before any sampling).",
+    )
+    parser.add_argument(
+        "--split-name", choices=SPLIT_NAMES, default=None,
+        help=f"Which split of --split to use. 'test' also needs {TEST_SPLIT_FLAG}.",
+    )
+    parser.add_argument(
+        TEST_SPLIT_FLAG, dest="allow_test_split", action="store_true",
+        help="Allow --split-name test (guard against tuning on the held-out test set).",
+    )
     parser.add_argument("--write-baseline", action="store_true")
     parser.add_argument("--out", default=None, help="Write full sweep results JSON here.")
+    parser.add_argument(
+        "--localise-tolerance", type=int, default=DEFAULT_LOCALISE_TOLERANCE, metavar="N",
+        help="Localised scoring: a finding within N lines of a fix line counts (default "
+        f"{DEFAULT_LOCALISE_TOLERANCE}).",
+    )
+    offline = parser.add_mutually_exclusive_group()
+    offline.add_argument(
+        "--rescore", default=None, metavar="RESULT.json",
+        help="Offline: recompute all LLM metrics (incl. localised) of a saved --out JSON; no "
+        "model load, no LLM call. Old results are backfilled from --llm-cache (raw "
+        "responses) and --dataset (item code). --out writes the rescored JSON.",
+    )
+    offline.add_argument(
+        "--compare", nargs=2, default=None, metavar=("A.json", "B.json"),
+        help="Offline: paired exact McNemar tests (vulnerable localised TP, fixed-twin FP) "
+        "and exact binomial CIs (ordinary FPR) between two saved runs on the same items.",
+    )
 
     llm = parser.add_argument_group(
         "LLM report stage (real provider calls; results go to --out only)"
@@ -1373,7 +1976,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--llm-primary-only", action="store_true",
         help="Use only the primary provider/model (no same-provider fallback model "
         "such as GROQ_FALLBACK_MODEL / OPENROUTER_FALLBACK_MODEL, no "
-        "LLM_FALLBACK_PROVIDER), so every scored item comes from one model.",
+        "LLM_FALLBACK_PROVIDER), so every scored item comes from one model. On "
+        "OpenRouter it also sends provider.allow_fallbacks=false.",
+    )
+    llm.add_argument(
+        "--llm-model", default=None, metavar="PROVIDER:MODEL",
+        help="With --llm-primary-only: pin exactly this model (e.g. groq:qwen/qwen3.8-27b), "
+        "whatever LLM_PROVIDER and the model settings say; only its key is needed.",
+    )
+    llm.add_argument(
+        "--llm-upstream", default=None, metavar="SLUG",
+        help="With --llm-primary-only on OpenRouter: also pin the upstream provider "
+        "(provider.order=[SLUG]); without it OpenRouter may load-balance across upstreams "
+        "(each item records the upstream that answered).",
+    )
+    llm.add_argument(
+        "--llm-temperature", type=float, default=DEFAULT_EVAL_TEMPERATURE, metavar="T",
+        help=f"Sampling temperature for the eval's calls (default {DEFAULT_EVAL_TEMPERATURE}; "
+        f"production uses LLM_TEMPERATURE={settings.LLM_TEMPERATURE}). Part of the cache key.",
+    )
+    llm.add_argument(
+        "--llm-repeat", type=int, default=1, metavar="K",
+        help="Run every item K times (each repeat is its own cached call) and report the "
+        "flip rate across repeats (default 1). Metrics are from repeat 0.",
     )
     return parser
 
@@ -1386,6 +2011,35 @@ def parse_args(argv=None) -> argparse.Namespace:
     """
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.localise_tolerance < 0:
+        parser.error("--localise-tolerance must be >= 0.")
+    args.split_ids = args.split_meta = None
+    if (args.split is None) != (args.split_name is None):
+        parser.error("--split and --split-name go together.")
+    if args.split_name == "test" and not args.allow_test_split:
+        parser.error(f"--split-name test is the held-out test set: pass {TEST_SPLIT_FLAG} "
+                     "only for the final, pre-registered run (tune on dev).")
+    if args.allow_test_split and args.split_name != "test":
+        parser.error(f"{TEST_SPLIT_FLAG} only goes with --split-name test.")
+    if args.split is not None:
+        if args.write_baseline:
+            parser.error("--write-baseline cannot be combined with --split: the baseline is "
+                         "calibrated on the full datasets.")
+        try:
+            args.split_ids, args.split_meta = load_split(args.split, args.split_name)
+        except (OSError, ValueError) as exc:
+            parser.error(f"--split {args.split}: {exc}")
+    if args.rescore is not None or args.compare is not None:
+        mode = "--rescore" if args.rescore is not None else "--compare"
+        clashing = [flag for flag, on in (
+            ("--llm", args.llm), ("--write-baseline", args.write_baseline),
+            ("--sample", args.sample is not None),
+            ("--sample-kinds", args.sample_kinds is not None),
+            ("--split", args.split is not None),
+        ) if on]
+        if clashing:
+            parser.error(f"{mode} is offline (it reads saved results): drop "
+                         f"{', '.join(clashing)}.")
     if args.write_baseline and args.sample is not None:
         parser.error(
             "--write-baseline cannot be combined with --sample: a sample must never "
@@ -1423,6 +2077,23 @@ def parse_args(argv=None) -> argparse.Namespace:
             parser.error("--llm-token-budget must be a positive integer.")
         if args.llm_max_rate_limit_errors < 1:
             parser.error("--llm-max-rate-limit-errors must be >= 1.")
+        if not 0.0 <= args.llm_temperature <= 2.0:
+            parser.error("--llm-temperature must be between 0 and 2.")
+        if args.llm_repeat < 1:
+            parser.error("--llm-repeat must be >= 1.")
+        if (args.llm_model or args.llm_upstream) and not args.llm_primary_only:
+            parser.error("--llm-model / --llm-upstream require --llm-primary-only.")
+        if args.llm_model:
+            try:
+                parse_llm_model(args.llm_model)
+            except ValueError as exc:
+                parser.error(f"--llm-model: {exc}")
+        if args.llm_upstream:
+            provider = (parse_llm_model(args.llm_model)[0] if args.llm_model
+                        else settings.LLM_PROVIDER)
+            if provider != "openrouter":
+                parser.error("--llm-upstream only applies to an OpenRouter model "
+                             f"(the pinned / primary provider is {provider!r}).")
     else:
         given = [
             flag for flag, value, default in (
@@ -1430,6 +2101,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                 ("--llm-token-budget", args.llm_token_budget, None),
                 ("--llm-primary-only", args.llm_primary_only, False),
                 ("--llm-prompt", args.llm_prompt, "current"),
+                ("--llm-model", args.llm_model, None),
+                ("--llm-upstream", args.llm_upstream, None),
+                ("--llm-temperature", args.llm_temperature, DEFAULT_EVAL_TEMPERATURE),
+                ("--llm-repeat", args.llm_repeat, 1),
             ) if value != default
         ]
         if given:
@@ -1473,6 +2148,56 @@ def build_llm_router(primary_only: bool = False) -> LLMRouter:
     return router
 
 
+def parse_llm_model(spec: str) -> tuple[str, str]:
+    """'groq:qwen/qwen3.8-27b' -> ('groq', 'qwen/qwen3.8-27b'); the model part
+    may itself contain ':' (OpenRouter's ':free'). ValueError otherwise."""
+    provider, sep, model = spec.partition(":")
+    if not sep or not model.strip() or provider not in PROVIDERS:
+        raise ValueError(f"expected PROVIDER:MODEL with PROVIDER in {', '.join(PROVIDERS)}; "
+                         f"got {spec!r}")
+    return provider, model.strip()
+
+
+class PinnedRouter(LLMRouter):
+    """A router of exactly one client (``--llm-model``): no fallback model or
+    provider, whatever LLM_PROVIDER / *_FALLBACK_* say, and no key needed for
+    any provider but the pinned one."""
+
+    def __init__(self, client: LLMClient, pacer: TokenPacer):
+        self.mock = False
+        self.pacer = pacer
+        self.clients = [client]
+
+
+def build_pinned_router(spec: str) -> LLMRouter:
+    """``PinnedRouter`` for "PROVIDER:MODEL" (fails fast on a missing key);
+    no per-minute pacing, as in ``build_llm_router``."""
+    provider, model = parse_llm_model(spec)
+    return PinnedRouter(LLMClient(provider, model=model), TokenPacer({}))
+
+
+def set_router_temperature(router, temperature: float) -> None:
+    """Every client of ``router`` sends ``temperature`` (the eval's choice,
+    not settings.LLM_TEMPERATURE)."""
+    for client in getattr(router, "clients", None) or []:
+        client.temperature = float(temperature)
+
+
+def openrouter_routing(args, router) -> dict | None:
+    """OpenRouter ``provider`` routing sent with a primary-only run whose
+    client is on OpenRouter: no fallback to another upstream, and
+    ``--llm-upstream`` pins which one (without it OpenRouter still
+    load-balances across upstreams, which the per-item upstream log shows)."""
+    if not args.llm_primary_only or getattr(router, "mock", False):
+        return None
+    if not any(getattr(c, "provider", None) == "openrouter" for c in router.clients):
+        return None
+    routing: dict = {"allow_fallbacks": False}
+    if args.llm_upstream:
+        routing["order"] = [args.llm_upstream]
+    return routing
+
+
 def build_semgrep_scanner():
     """The production scanner settings (None when SEMGREP_ENABLED is off)."""
     if not settings.SEMGREP_ENABLED:
@@ -1488,24 +2213,33 @@ def run_llm(args, entries: list[dict], router, retrieval_preds: dict[str, bool])
     arm = args.llm_prompt
     cache = LLMCache(args.llm_cache)
     chain = ["mock"] if router.mock else [c.label for c in router.clients]
+    temperature = router_temperature(router)
+    routing = openrouter_routing(args, router)
     semgrep_summary = None
     if arm != "legacy":
         semgrep_summary = attach_semgrep(entries, build_semgrep_scanner())
         print(f"Semgrep evidence (snippet mode): {semgrep_summary}")
     n_need = sum(bool(e["cves"]) for e in entries) if arm == "legacy" else len(entries)
     print(
-        f"\nLLM stage ({arm} prompt): {n_need}/{len(entries)} items need a call; chain "
-        f"{' -> '.join(chain)}; max {args.llm_max_calls} calls; cache {args.llm_cache} "
-        f"({len(cache)} entries)."
+        f"\nLLM stage ({arm} prompt): {n_need}/{len(entries)} items need a call"
+        + (f" x {args.llm_repeat} repeats" if args.llm_repeat > 1 else "")
+        + f"; chain {' -> '.join(chain)}; temperature {temperature:g}; max "
+        f"{args.llm_max_calls} calls; cache {args.llm_cache} ({len(cache)} entries)."
+        + (f" OpenRouter routing: {routing}." if routing else "")
     )
 
     async def _run():
-        with HttpUsageTap() as tap:
+        with HttpUsageTap(
+            inject={"provider": routing} if routing else None,
+            inject_url_prefix=settings.OPENROUTER_BASE_URL.rstrip("/"),
+        ) as tap:
             return await run_llm_stage(
                 entries, router, cache=cache, max_calls=args.llm_max_calls,
                 sleep_s=args.llm_sleep, tpm=args.llm_tpm,
                 max_rate_limit_errors=args.llm_max_rate_limit_errors,
                 token_budget=args.llm_token_budget, tap=tap, arm=arm,
+                repeats=args.llm_repeat, temperature=temperature,
+                tolerance=args.localise_tolerance,
             )
 
     stage = asyncio.run(_run())
@@ -1514,22 +2248,40 @@ def run_llm(args, entries: list[dict], router, retrieval_preds: dict[str, bool])
     print(
         f"LLM stage done: {stage['calls']} calls, {stage['tokens_used']} tokens; statuses "
         f"{counts}; providers {stage['providers']}"
+        + (f"; upstreams {stage['upstream_providers']}" if stage["upstream_providers"] else "")
         + (f"; stopped early: {stage['stopped']}" if stage["stopped"] else "")
     )
-    if counts.get("not_run"):
-        print(f"  {counts['not_run']} items not run — re-run the same command to resume.")
+    if len(stage["upstream_providers"]) > 1:
+        print(f"  WARNING: answers came from {len(stage['upstream_providers'])} different "
+              "upstreams; pass --llm-upstream to pin one.")
+    if stage["status_counts_all_repeats"].get("not_run"):
+        print(f"  {stage['status_counts_all_repeats']['not_run']} item run(s) not run — "
+              "re-run the same command to resume.")
+    print_headline(f"LLM stage, {arm} prompt: headline", summary["headline"])
     print_realistic(f"LLM stage, {arm} prompt ({ARM_RULES[arm]})", summary["realistic"])
     if arm == "legacy":
         print_realistic("LLM stage, legacy prompt, any validated finding",
                         summary["realistic_any_finding"])
+    else:
+        print_realistic("LLM stage, localised rule", summary["realistic_localised"])
     print_realistic(
         "Retrieval-only on the same scored items", summary["realistic_retrieval_same_items"]
     )
+    if "repeats" in summary:
+        print_repeats(summary["repeats"])
+    repeat_by_id: dict[str, list[dict]] = {}
+    for run in stage["repeat_records"]:
+        for r in run:
+            repeat_by_id.setdefault(r["id"], []).append(r)
     return {
         "config": {
             "model": stage["model"],
             "chain": chain,
             "primary_only": args.llm_primary_only,
+            "pinned_model": args.llm_model,
+            "openrouter_provider_routing": routing,
+            "temperature": temperature,
+            "repeats": args.llm_repeat,
             "max_calls": args.llm_max_calls,
             "sleep_s": args.llm_sleep,
             "tpm": args.llm_tpm,
@@ -1538,6 +2290,10 @@ def run_llm(args, entries: list[dict], router, retrieval_preds: dict[str, bool])
             "top_k": settings.RETRIEVAL_TOP_K,
             "prompt": arm,
             "rule": ARM_RULES[arm],
+            "localised_rule": LOCALISED_RULE.format(ctx=INSERTION_CONTEXT,
+                                                    tol=args.localise_tolerance),
+            "localise_tolerance": args.localise_tolerance,
+            "insertion_context": INSERTION_CONTEXT,
             "cves_per_unit": None if arm == "legacy" else (
                 0 if arm == "no_retrieval" else settings.LLM_MAX_CVES_PER_UNIT),
             "max_prompt_tokens": None if arm == "legacy" else settings.LLM_MAX_PROMPT_TOKENS,
@@ -1548,16 +2304,274 @@ def run_llm(args, entries: list[dict], router, retrieval_preds: dict[str, bool])
         "tokens_used": stage["tokens_used"],
         "stopped": stage["stopped"],
         "status_counts": counts,
+        "status_counts_all_repeats": stage["status_counts_all_repeats"],
         "providers": stage["providers"],
+        "upstream_providers": stage["upstream_providers"],
         **summary,
         "items": [
-            {**r, "retrieval_pred": retrieval_preds[r["id"]]} for r in stage["records"]
+            {**r, "retrieval_pred": retrieval_preds[r["id"]],
+             **({"repeats": repeat_by_id.get(r["id"], [])} if args.llm_repeat > 1 else {})}
+            for r in stage["records"]
         ],
     }
 
 
+def print_repeats(rep: dict) -> None:
+    print(f"\nRun-to-run noise over {rep['k']} repeats (items scored in every repeat):")
+    print(f"  flip rate, prediction     {_fmt_rate(rep['flip_rate_prediction'])}")
+    for kind, r in rep["flip_rate_prediction_by_kind"].items():
+        if r["n"]:
+            print(f"    {kind:<22}  {_fmt_rate(r)}")
+    if rep["flip_rate_localised"] is not None:
+        print(f"  flip rate, localised      {_fmt_rate(rep['flip_rate_localised'])}")
+    for i, p in enumerate(rep["per_repeat"]):
+        print(f"  repeat {i}: TPR localised {p['tpr_localised']}, TPR any {p['tpr_any_finding']}, "
+              f"FPR twin {p['fpr_fixed_twin']}, FPR ordinary {p['fpr_ordinary']}")
+
+
+# --- offline rescoring / comparison -------------------------------------------
+
+
+class DatasetIndex:
+    """Eval items by id, for rescoring results offline: ``fix_lines`` are
+    annotated over all loaded items, and a pre-migration id
+    ``<prefix>_{vuln,safe}`` (results written before 01905e8) resolves to the
+    item ``<prefix>_<hash8>_{vuln,safe}`` when that is unambiguous (candidates
+    with the same code and fix lines - exact duplicate pairs - count as one)."""
+
+    def __init__(self, items: list[dict], context: int = INSERTION_CONTEXT):
+        self.fix_targets = annotate_fix_targets(items, context)
+        self.by_id: dict[str, dict] = {}
+        self.aliases: dict[str, list[dict]] = {}
+        for item in items:
+            self.by_id.setdefault(item["id"], item)
+            m = _HASHED_PAIR_ID.match(item["id"])
+            if m:
+                self.aliases.setdefault(f"{m.group(1)}_{m.group(3)}", []).append(item)
+
+    def find(self, item_id: str) -> tuple[dict | None, str | None]:
+        """(item, None), or (None, "missing" | "ambiguous")."""
+        if item_id in self.by_id:
+            return self.by_id[item_id], None
+        candidates = self.aliases.get(item_id, [])
+        distinct = {(c["code"], tuple(c.get("fix_lines") or ())) for c in candidates}
+        if len(distinct) == 1:
+            return candidates[0], None
+        return None, ("ambiguous" if candidates else "missing")
+
+
+def backfill_findings(rec: dict, item: dict, cache: LLMCache, model: str,
+                      temperature: float) -> tuple[list[dict] | None, str | None]:
+    """Findings of an old review-arm record, re-derived offline: its raw LLM
+    response from the cache (same key as the run), validated against a snippet
+    unit of the item's code exactly as ``review_decision`` does. Returns
+    (findings, problem): problem "no cache entry" / "unit too large" (findings
+    None), or "validated count differs" (findings kept, but a stored
+    any_finding False always means no findings)."""
+    if not rec.get("any_finding"):
+        return [], None
+    cached = cache.get(rec["id"], rec.get("prompt_sha256"), model, temperature,
+                       rec.get("repeat", 0))
+    if cached is None:
+        return None, "no cache entry"
+    entry = {"id": rec["id"], "code": item["code"], "language": item.get("language"),
+             "cves": [], "semgrep": []}
+    batch, _ = review_prompt_for(entry, "no_retrieval")
+    if batch is None:
+        return None, "unit too large"
+    decision = review_decision(cached["llm_json"], batch)
+    problem = None if decision["validated_count"] == rec.get("validated_count") else (
+        "validated count differs")
+    return decision["findings"], problem
+
+
+def rescore_llm_block(
+    data: dict, *, dataset_path=None, cache_path=None,
+    tolerance: int = DEFAULT_LOCALISE_TOLERANCE,
+) -> dict:
+    """Recompute every LLM metric of a saved ``--out`` JSON without calling an
+    LLM. Records that already carry ``findings`` / ``fix_lines`` are used as
+    stored; older ones are backfilled - findings from ``cache_path`` (the raw
+    responses) + the item's code, fix lines from ``dataset_path`` - when
+    possible. Returns the new ``llm`` block (items updated, summaries
+    recomputed) with a ``rescore`` section naming what could not be
+    recomputed and why."""
+    llm = data.get("llm")
+    if not llm or not llm.get("items"):
+        raise ValueError("the result has no LLM stage items (was it run with --llm?)")
+    config = llm.get("config", {})
+    # Runs before the arms existed (llm_run.json) used the legacy prompt.
+    arm = config.get("prompt") or "legacy"
+    anchored = arm != "legacy"
+    model = config.get("model")
+    temperature = config.get("temperature", LEGACY_CACHE_TEMPERATURE)
+    items = [dict(r) for r in llm["items"]]
+    repeat_runs: list[list[dict]] = []
+    k = max((len(r.get("repeats") or []) for r in items), default=0)
+    for i in range(k):  # repeat i+1 of every item (not_run where it is missing)
+        repeat_runs.append([
+            dict(r["repeats"][i]) if i < len(r.get("repeats") or []) else
+            {**{f: r.get(f) for f in ("id", "kind", "label", "length_matched")},
+             "status": "not_run", "prediction": None, "any_finding": None}
+            for r in items
+        ])
+    for r in items:
+        r.pop("repeats", None)
+    all_recs = items + [r for run in repeat_runs for r in run]
+
+    def needs_fix(r):
+        return r["kind"] in PAIR_KINDS and "fix_lines" not in r
+
+    def needs_findings(r):
+        return anchored and r.get("any_finding") is not None and "findings" not in r
+
+    todo = [r for r in all_recs if needs_fix(r) or needs_findings(r)]
+    problems: dict[str, list[str]] = {}
+    index = cache = None
+    if todo and dataset_path is not None:
+        index = DatasetIndex(load_datasets(dataset_path))
+    if any(needs_findings(r) for r in todo) and cache_path is not None \
+            and Path(cache_path).exists():
+        cache = LLMCache(cache_path)
+    backfilled = Counter()
+    for r in todo:
+        item, why = index.find(r["id"]) if index is not None else (None, "no --dataset")
+        if needs_fix(r):
+            if item is None:
+                problems.setdefault(f"fix lines: item {why}", []).append(r["id"])
+            else:
+                r["fix_lines"] = item.get("fix_lines")
+                backfilled["fix_lines"] += 1
+        if not needs_findings(r):
+            continue
+        if not r["any_finding"]:
+            r["findings"] = []  # nothing was flagged: no response needed
+            continue
+        if item is None or cache is None:
+            what = f"item code {why}" if item is None else "no LLM cache"
+            problems.setdefault(f"findings: {what}", []).append(r["id"])
+            continue
+        findings, problem = backfill_findings(r, item, cache, model, temperature)
+        if problem:
+            problems.setdefault(f"findings: {problem}", []).append(r["id"])
+        if findings is not None:
+            r["findings"] = findings
+            backfilled["findings"] += 1
+    for r in all_recs:
+        r["localised"] = record_localised(r, tolerance, anchored)
+
+    stage = {"arm": arm, "records": items, "repeat_records": repeat_runs}
+    retrieval = {r["id"]: r.get("retrieval_pred") for r in items}
+    summary = summarize_llm(stage, retrieval)
+    not_recomputable = []
+    if not anchored:
+        not_recomputable.append(LEGACY_NOT_LOCALISABLE)
+    elif any(r.get("any_finding") is not None and r["kind"] in PAIR_KINDS
+             and r.get("localised") is None for r in items):
+        n = sum(r.get("any_finding") is not None and r["kind"] in PAIR_KINDS
+                and r.get("localised") is None for r in items)
+        not_recomputable.append(
+            f"localised outcome of {n} scored vulnerable / fixed-twin item(s) (see problems; "
+            "no twin or no fix lines also leaves an item unlocalisable) - excluded from the "
+            "localised rates")
+    reproduced = {
+        key: (llm.get(key) or {}).get("tpr_vulnerable") == summary[key]["tpr_vulnerable"]
+        and (llm.get(key) or {}).get("fpr_fixed_twin") == summary[key]["fpr_fixed_twin"]
+        and (llm.get(key) or {}).get("fpr_ordinary") == summary[key]["fpr_ordinary"]
+        for key in ("realistic", "realistic_any_finding") if key in llm
+    }
+    by_id = {}
+    for run in repeat_runs:
+        for r in run:
+            by_id.setdefault(r["id"], []).append(r)
+    return {
+        **{k: v for k, v in llm.items() if k not in summary and k != "items"},
+        **summary,
+        "config": {**config, "prompt": arm, "localise_tolerance": tolerance,
+                   "localised_rule": LOCALISED_RULE.format(ctx=INSERTION_CONTEXT, tol=tolerance)},
+        "rescore": {
+            "offline": True,
+            "backfilled": dict(backfilled),
+            "fix_targets": index.fix_targets if index is not None else None,
+            "problems": {k: sorted(set(v)) for k, v in problems.items()},
+            "not_recomputable": not_recomputable,
+            "stored_metrics_reproduced": reproduced,
+        },
+        "items": [{**r, **({"repeats": by_id[r["id"]]} if r["id"] in by_id else {})}
+                  for r in items],
+    }
+
+
+def _llm_items_for_compare(path: str, args) -> tuple[list[dict], str]:
+    data = json.loads(Path(path).read_text())
+    block = rescore_llm_block(data, dataset_path=args.dataset, cache_path=args.llm_cache,
+                              tolerance=args.localise_tolerance)
+    cfg = block["config"]
+    return block["items"], f"{_rel(path)} ({cfg.get('prompt')}, {cfg.get('model')})"
+
+
+def run_rescore(args) -> dict:
+    """``--rescore``: recompute a saved run's metrics offline; print old vs new."""
+    data = json.loads(Path(args.rescore).read_text())
+    block = rescore_llm_block(data, dataset_path=args.dataset, cache_path=args.llm_cache,
+                              tolerance=args.localise_tolerance)
+    cfg = block["config"]
+    print(f"Rescored {args.rescore} offline: {cfg.get('prompt')} prompt, {cfg.get('model')}, "
+          f"{len(block['items'])} items (no LLM call).")
+    info = block["rescore"]
+    print(f"  backfilled: {info['backfilled'] or 'nothing'}; stored any-finding metrics "
+          f"reproduced: {info['stored_metrics_reproduced']}")
+    for what, ids in info["problems"].items():
+        print(f"  could not backfill {what}: {len(ids)} item(s), e.g. {ids[0]}")
+    for note in info["not_recomputable"]:
+        print(f"  not recomputable: {note}")
+    old = (data["llm"].get("realistic_any_finding") or {}).get("tpr_vulnerable")
+    if old:
+        print(f"  stored TPR (any finding): {_fmt_rate(old)}")
+    print_headline("Rescored headline", block["headline"])
+    if block.get("repeats"):
+        print_repeats(block["repeats"])
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps({**data, "llm": block}, indent=2))
+        print(f"Wrote rescored results -> {out_path}")
+    return block
+
+
+def run_compare(args) -> dict:
+    """``--compare A B``: paired exact tests between two saved runs, offline."""
+    a_path, b_path = args.compare
+    a_items, a_label = _llm_items_for_compare(a_path, args)
+    b_items, b_label = _llm_items_for_compare(b_path, args)
+    cmp = compare_items(a_items, b_items)
+    print_comparison(a_label, b_label, cmp)
+    if args.out:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps({"a": a_label, "b": b_label, **cmp}, indent=2))
+        print(f"Wrote comparison -> {out_path}")
+    return cmp
+
+
+def build_eval_router(args) -> LLMRouter:
+    """The LLM router for --llm: pinned (--llm-model) or the production chain
+    (optionally primary-only), every client at --llm-temperature."""
+    router = (build_pinned_router(args.llm_model) if args.llm_model
+              else build_llm_router(args.llm_primary_only))
+    set_router_temperature(router, args.llm_temperature)
+    return router
+
+
 def main(argv=None):
     args = parse_args(argv)
+    # Offline modes: no model load, no LLM call.
+    if args.rescore is not None:
+        run_rescore(args)
+        return
+    if args.compare is not None:
+        run_compare(args)
+        return
     rr_cfg = reranker_config(args.no_rerank, args.reranker_model, args.reranker_max_tokens)
     sampled = args.sample is not None or args.sample_kinds is not None
     sample_meta = {
@@ -1566,7 +2580,7 @@ def main(argv=None):
         "seed": args.seed if sampled else None,
     }
     # Before any model load: a missing LLM key fails here, not after the gather.
-    router = build_llm_router(args.llm_primary_only) if args.llm else None
+    router = build_eval_router(args) if args.llm else None
 
     print(f"Model: {settings.EMBEDDING_MODEL} (pooling={settings.EMBEDDING_POOLING})")
     if rr_cfg is None:
@@ -1591,6 +2605,18 @@ def main(argv=None):
 
     items = load_datasets(args.dataset)
     print(f"Loaded {len(items)} eval snippets; corpus has {seeded} points.")
+    # Fix lines over the full datasets, so a split / sample keeps its twin's diff.
+    fix_targets = annotate_fix_targets(items)
+    print(f"Localised scoring: {fix_targets}.")
+    if args.split_ids is not None:
+        pool = len(items)
+        items, missing = apply_split(items, args.split_ids)
+        sample_meta["split"] = {**args.split_meta, "n_items": len(items),
+                                "n_ids_not_in_datasets": missing}
+        print(f"Split {args.split_meta['name']!r} ({args.split_meta['path']}): "
+              f"{len(items)}/{pool} items"
+              + (f"; WARNING: {missing} manifest id(s) not in the datasets" if missing else "")
+              + ".")
     if args.sample is not None:
         pool = len(items)
         items = sample_items(items, args.sample, args.seed)

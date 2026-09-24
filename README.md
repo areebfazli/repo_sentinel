@@ -284,14 +284,56 @@ Realistic metrics also report the false-positive rate on length-matched ordinary
 - `--llm-token-budget T` sets a hard token stop.
 - The run stops cleanly on a daily-limit error or on repeated rate limits.
 - Results are cached in `ml/evaluation/results/llm_cache.jsonl` by (item id, prompt
-  sha256, model), so re-running the same command resumes without re-calling.
+  sha256, model, temperature, repeat index), so re-running the same command resumes without
+  re-calling. Entries written before temperature and repeat were recorded count as 0.2 and
+  repeat 0.
 - `--llm-primary-only` keeps every answer on one model. Compare arms on the same model.
+  `--llm-model PROVIDER:MODEL` (with `--llm-primary-only`) pins exactly that model, whatever
+  the provider settings say, and needs only that provider's key. On OpenRouter a primary-only
+  run sends `provider: {"allow_fallbacks": false}`, and `--llm-upstream SLUG` also pins the
+  upstream (`order: [SLUG]`). Each item records the upstream `provider` that OpenRouter
+  reports, so a silent upstream change shows up.
+- `--llm-temperature` defaults to 0.0 in the eval. Production uses `LLM_TEMPERATURE` (0.2).
+- `--llm-repeat K` runs every item K times, each repeat as its own cached call. It reports
+  the flip rate (the share of items whose prediction changes between repeats, with a Wilson
+  CI) and per-repeat rates. Metrics come from repeat 0.
+- `--split PATH --split-name dev|test` evaluates only the ids in a split manifest
+  (`{"version": 1, "seed", "dev": {"ids"}, "test": {"ids"}, "meta"}`), before any sampling.
+  The test split is refused unless `--i-know-this-is-the-test-set` is passed. The output JSON
+  records the split, the manifest's sha256 and any ids that aren't in the datasets.
+
+**Localised scoring (the primary LLM metric).** "Any validated finding" counts a vulnerable
+function as detected even when the finding is about another line or another bug. For a
+`_vuln` item whose `_safe` twin is loaded, the eval computes the **fix lines**: the lines the
+fix deleted or modified (difflib over stripped lines, so re-indenting doesn't count). A hunk
+that only inserts lines contributes the insertion point ±2 lines, and blank-only hunks are
+ignored. A vulnerable item is a *localised TP* when a validated finding's line range (or its
+quoted code, located in the item) is within `--localise-tolerance` (2) lines of a fix line.
+It also counts when the finding's CWE is one of the item's expected CWEs (a `cwe`/`cwe_ids`
+field; no current eval set has one, so today only line overlap counts). The false-positive
+rate on fixed twins and ordinary code stays "any validated finding". The eval also reports
+`fpr_fixed_twin_localised`: twins flagged on the lines the fix added or changed. The
+`headline` block puts localised TPR first, next to the any-finding TPR. The legacy prompt's
+findings have no quote or line, so that arm gets no localised numbers.
+
+Offline tools (they read saved results; no model load and no LLM call):
+- `--rescore RESULT.json [--out NEW.json]` recomputes every metric. Per-item records now
+  store their findings (quote, line, CWE), fix lines and localised outcome. Older results are
+  backfilled from the raw responses in `--llm-cache` and the item code in `--dataset`
+  (pre-migration ids are mapped when unambiguous). The output lists what couldn't be
+  recomputed and why.
+- `--compare A.json B.json` pairs two runs by item id. It prints exact McNemar tests on
+  vulnerable localised TP and fixed-twin FP, with the discordant counts, plus exact
+  (Clopper-Pearson) CIs on ordinary FPR.
 
 Measured 2026-09-24 on one model (`groq:qwen/qwen3.8-27b`, 8 vuln/fixed pairs + 13 ordinary
 functions): the new prompt found 2/8 vulnerable functions vs 1/8 for the legacy prompt, flagged
 1/8 fixed twins (legacy 2/8) and 1/13 ordinary functions (legacy 0/13); the `no_retrieval` arm
-flagged exactly the same items as `current` with 44% fewer tokens. All differences are within
-the confidence intervals; see ROADMAP "Results 2026-09-24".
+flagged exactly the same items as `current` with 44% fewer tokens. Rescored offline with
+localised scoring, the new prompt found **1/8**: the other "detection" flagged the SSRF host
+check on lines 11–12, while the fix changed an XSS on line 19, and it flagged the fixed twin
+the same way. No fixed twin was flagged on its fix lines (0/8). All differences are within the
+confidence intervals; see ROADMAP "Results 2026-09-24".
 
 Results go to `--out` only, never to the baseline:
 

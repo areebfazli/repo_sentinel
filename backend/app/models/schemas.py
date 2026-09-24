@@ -104,8 +104,12 @@ class ReportFinding(BaseModel):
     # deterministic findings nothing corroborates (unless configured not to).
     corroborated_by: list[str] = []
     # Stable per-function identity for comment dedupe (the Action hashes it with
-    # file + function); falls back to point_id for older servers.
+    # file + function); falls back to point_id for older servers. LLM findings:
+    # source + the anchored code line, never LLM wording.
     dedupe_key: str | None = None
+    # Keys earlier server versions gave the same finding: the Action adopts a
+    # comment carrying one of them instead of deleting and re-posting it.
+    legacy_dedupe_keys: list[str] = []
 
 
 class StaticAnalysisHit(BaseModel):

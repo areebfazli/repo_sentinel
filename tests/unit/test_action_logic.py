@@ -318,3 +318,32 @@ def test_deterministic_only_findings_do_not_trip_the_gate_by_default():
     assert "not confirmed by the LLM review or Semgrep" in body
     assert "need LLM / Semgrep corroboration" in build_summary("x", "high")
     assert "corroboration" not in build_summary("x", "high", gate_on_deterministic=True)
+
+
+def test_upgrade_adopts_comments_posted_under_the_legacy_marker():
+    base = {"file_path": "a.py", "function_name": "f", "start_line": 1, "line": 1,
+            "title": "t", "severity": "high"}
+    new = {**base, "dedupe_key": "llm:new", "legacy_dedupe_keys": ["llm:old"]}
+    old_marker = finding_marker("a.py", "llm:old", "f")
+    existing = [{"id": 5, "body": f"old body\n<!-- {old_marker} -->"},
+                {"id": 6, "body": f"dup\n<!-- {old_marker} -->"}]
+    desired, _ = desired_comments([new], {"a.py": [1]})
+    ops = plan_comment_ops(existing, desired)
+    assert ops["create"] == []  # not re-posted ...
+    assert [u["id"] for u in ops["update"]] == [5]  # ... the old thread is updated in place
+    assert extract_marker(ops["update"][0]["body"]) == finding_marker("a.py", "llm:new", "f")
+    assert ops["delete"] == [6]  # the duplicate is cleaned up
+    # Once updated, the next run matches the new marker directly: a no-op.
+    again = plan_comment_ops([{"id": 5, "body": ops["update"][0]["body"]}], desired)
+    assert again == {"create": [], "update": [], "delete": []}
+
+
+def test_legacy_marker_is_adopted_at_most_once():
+    old_marker = finding_marker("a.py", "llm:old", "f")
+    d1 = {"marker": "m1", "path": "a.py", "line": 1, "body": "b1\n<!-- m1 -->",
+          "legacy_markers": [old_marker]}
+    d2 = {"marker": "m2", "path": "a.py", "line": 2, "body": "b2\n<!-- m2 -->",
+          "legacy_markers": [old_marker]}
+    ops = plan_comment_ops([{"id": 1, "body": f"x\n<!-- {old_marker} -->"}], [d1, d2])
+    assert [u["id"] for u in ops["update"]] == [1]
+    assert [c["marker"] for c in ops["create"]] == ["m2"] and ops["delete"] == []

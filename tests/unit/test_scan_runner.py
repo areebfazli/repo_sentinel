@@ -39,6 +39,37 @@ def test_build_report_findings_without_citation_is_still_anchored():
     assert g["finding_id"] is None
 
 
+def _unit_with_code():
+    code = "def handle_login(u):\n    q = 'x' + u\n    return db.execute(q)\n"
+    return {"U1": {"uid": "U1", "file_path": "app.py", "function_name": "handle_login",
+                   "start_line": 10, "code": code, "prompt_code": code}}
+
+
+def test_dedupe_key_ignores_llm_wording_and_quote_variation():
+    units = _unit_with_code()
+    a = _build_report_findings([_validated(quoted_code="q = 'x' + u", line=11)], units, [])[0]
+    # Next run: different CWE and title, a partial / re-indented quote of the same line.
+    b = _build_report_findings([_validated(quoted_code="'x'  +  u", line=11, cwe="CWE-564",
+                                           title="Injection")], units, [])[0]
+    c = _build_report_findings([_validated(quoted_code="return db.execute(q)", line=12)],
+                               units, [])[0]
+    assert a["dedupe_key"] == b["dedupe_key"] != c["dedupe_key"]
+    # The key older servers used is still sent, for comment adoption.
+    assert a["legacy_dedupe_keys"] and a["legacy_dedupe_keys"] != b["legacy_dedupe_keys"]
+
+
+def test_two_findings_on_one_line_keep_distinct_keys():
+    from backend.app.services.scan_runner import disambiguate_dedupe_keys
+
+    units = _unit_with_code()
+    found = _build_report_findings(
+        [_validated(line=11, cwe="CWE-79", severity="medium", title="xss"),
+         _validated(line=11, cwe="CWE-89", severity="high", title="sqli")], units, [])
+    disambiguate_dedupe_keys(found)
+    keys = {f["title"]: f["dedupe_key"] for f in found}
+    assert keys["xss"] == keys["sqli"] + "#2"  # the more severe one keeps the plain key
+
+
 def test_dedupe_key_stable_across_rewording_distinct_across_issues():
     a = _build_report_findings([_validated(title="SQL injection")], _UNITS, [])[0]
     b = _build_report_findings([_validated(title="Injectable SQL", line=40)], _UNITS, [])[0]

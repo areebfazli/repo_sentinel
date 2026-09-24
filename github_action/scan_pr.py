@@ -292,27 +292,43 @@ def _finding_identity(finding: dict) -> str:
 def plan_comment_ops(existing: list[dict], desired: list[dict]) -> dict:
     """Diff existing vs desired reposentinel comments by marker.
 
-    existing: [{id, body}]; desired: [{marker, path, line, body}].
+    existing: [{id, body}]; desired: [{marker, path, line, body, legacy_markers?}].
     Returns {create: [desired...], update: [{id, body}], delete: [ids]}.
+
+    A desired comment whose marker isn't posted yet adopts an existing comment
+    carrying one of its ``legacy_markers`` (the marker an older server version
+    gave the same finding): that comment is updated in place (its body, and so
+    its marker, becomes the new one) rather than deleted and re-posted, so the
+    thread survives an upgrade. Existing comments nothing claims are deleted.
     """
     existing_by_marker = {}
+    duplicates = []  # a second comment with the same marker (never both kept)
     for c in existing:
         marker = extract_marker(c.get("body", ""))
-        if marker:
+        if marker and marker in existing_by_marker:
+            duplicates.append(c["id"])
+        elif marker:
             existing_by_marker[marker] = c
     desired_by_marker = {d["marker"]: d for d in desired}
 
+    claimed: set[str] = set(desired_by_marker) & set(existing_by_marker)
     create, update, delete = [], [], []
     for marker, d in desired_by_marker.items():
         ex = existing_by_marker.get(marker)
+        if ex is None:
+            for legacy in d.get("legacy_markers") or []:
+                if legacy in existing_by_marker and legacy not in claimed:
+                    ex = existing_by_marker[legacy]
+                    claimed.add(legacy)
+                    break
         if ex is None:
             create.append(d)
         elif (ex.get("body") or "").strip() != d["body"].strip():
             update.append({"id": ex["id"], "body": d["body"]})
     for marker, ex in existing_by_marker.items():
-        if marker not in desired_by_marker:
+        if marker not in claimed:
             delete.append(ex["id"])
-    return {"create": create, "update": update, "delete": delete}
+    return {"create": create, "update": update, "delete": delete + duplicates}
 
 
 def build_summary(report_markdown: str, gate_threshold: str, result: dict | None = None,
@@ -433,11 +449,14 @@ def desired_comments(
             if path else None
         )
         marker = finding_marker(path or "", _finding_identity(f), f.get("function_name"))
+        legacy = [finding_marker(path or "", k, f.get("function_name"))
+                  for k in f.get("legacy_dedupe_keys") or [] if k]
         body = build_comment_body(f)
         if line is None:
             unanchored.append(f)
             continue
-        desired.append({"marker": marker, "path": path, "line": line, "body": body})
+        desired.append({"marker": marker, "path": path, "line": line, "body": body,
+                        "legacy_markers": [m for m in legacy if m != marker]})
     return desired, unanchored
 
 

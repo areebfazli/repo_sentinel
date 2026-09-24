@@ -24,6 +24,7 @@ from backend.app.core.evidence import (
 )
 from backend.app.core.llm_client import LLMError
 from backend.app.core.markdown_renderer import (
+    SEVERITY_ORDER,
     SYSTEM_PROMPT,
     build_user_prompt,
     render_markdown,
@@ -37,7 +38,7 @@ from backend.app.core.review_plan import (
     snippet_unit,
 )
 from backend.app.core.scoring import relevance
-from backend.app.core.untrusted import md_code_span, new_nonce
+from backend.app.core.untrusted import match_form, md_code_span, new_nonce
 from backend.app.db.models import Finding, Scan
 from backend.app.db.session import SessionLocal
 
@@ -200,10 +201,60 @@ def _row_snapshot(row: Finding) -> dict:
 
 def _dedupe_key(prefix: str, *parts) -> str:
     """Stable id of a report finding within its function, for the Action's
-    comment markers (which also hash file + function): survives line shifts and
-    LLM rewording of the title, not a change of the quoted code."""
+    comment markers (which also hash file + function)."""
     text = "|".join(" ".join(str(p or "").split()) for p in parts)
     return f"{prefix}:{hashlib.sha1(text.encode()).hexdigest()[:16]}"
+
+
+def _anchored_line_text(unit: dict, line: int | None) -> str:
+    """The unit's code line at real line ``line`` (as shown to the model), or ""."""
+    if line is None:
+        return ""
+    lines = (unit.get("prompt_code") or "").splitlines()
+    numbers = unit.get("line_numbers")
+    if numbers:
+        idx = numbers.index(line) if line in numbers else -1
+    else:
+        idx = line - int(unit.get("start_line") or 1)
+    return lines[idx] if 0 <= idx < len(lines) else ""
+
+
+def llm_dedupe_key(unit: dict, finding: dict) -> str:
+    """Comment identity of an LLM finding: the source plus the code line it is
+    anchored to (``untrusted.match_form``: whitespace-insensitive), falling back
+    to the quote's first line. Only stable fields: the Action's marker adds the
+    file path and function name, and nothing the LLM words differently from run
+    to run (title, CWE, explanation) is part of it, so a re-run with the same
+    code updates the same comment. Survives line shifts and re-indentation;
+    changes only when the offending line itself changes."""
+    text = _anchored_line_text(unit, finding.get("line"))
+    if not match_form(text):
+        text = ((finding.get("quoted_code") or "").strip().splitlines() or [""])[0]
+    return _dedupe_key("llm", match_form(text))
+
+
+def legacy_llm_dedupe_key(finding: dict) -> str:
+    """The key older servers used (quote's first line + CWE or title). Sent as
+    ``legacy_dedupe_keys`` so the Action can adopt comments posted by them
+    instead of deleting and re-posting them."""
+    quote_first = (finding.get("quoted_code") or "").strip().splitlines()[:1]
+    return _dedupe_key("llm", quote_first[0] if quote_first else "",
+                       finding.get("cwe") or finding.get("title"))
+
+
+def disambiguate_dedupe_keys(findings: list[dict]) -> None:
+    """Two findings on the same line of the same function (say SQLi and XSS)
+    share a key; number the later ones ("#2", ...) in a stable order
+    (severity, CWE, title), so each keeps its own comment."""
+    groups: dict[tuple, list[dict]] = {}
+    for f in findings:
+        groups.setdefault((f.get("file_path"), f.get("function_name"), f.get("dedupe_key")),
+                          []).append(f)
+    for group in groups.values():
+        group.sort(key=lambda f: (SEVERITY_ORDER.get(f.get("severity"), 4), f.get("cwe") or "",
+                                  f.get("title") or ""))
+        for n, f in enumerate(group[1:], start=2):
+            f["dedupe_key"] = f"{f['dedupe_key']}#{n}"
 
 
 def _build_report_findings(
@@ -228,7 +279,6 @@ def _build_report_findings(
             ),
             None,
         )
-        quote_first = (f.get("quoted_code") or "").strip().splitlines()[:1]
         report.append(
             {
                 "severity": f.get("severity"),
@@ -249,8 +299,8 @@ def _build_report_findings(
                 "point_id": row["point_id"] if row else None,
                 "source": "llm",
                 "deterministic": False,
-                "dedupe_key": _dedupe_key("llm", quote_first[0] if quote_first else "",
-                                          f.get("cwe") or f.get("title")),
+                "dedupe_key": llm_dedupe_key(unit, f),
+                "legacy_dedupe_keys": [legacy_llm_dedupe_key(f)],
             }
         )
     return report
@@ -525,6 +575,7 @@ async def _run_scan_guarded(scan_id: str, merger, router) -> None:
             batches, router, row_snaps, report_findings, not_reviewed
         )
         corroborate_deterministic(report_findings, analysis["semgrep"])
+        disambiguate_dedupe_keys(report_findings)
         coverage = review_coverage(len(review_units), reviewed, not_reviewed)
         provider_used = ",".join(providers) or None
         if "mock" in providers:

@@ -28,6 +28,7 @@ Everything the LLM writes ends up in PR comments. So:
 Pure functions; ``github_action/scan_pr.py`` carries its own copy of the output
 escaping (it can't import the backend).
 """
+import html
 import re
 import secrets
 
@@ -95,8 +96,8 @@ def sanitize_untrusted(text: str | None, max_chars: int | None = None) -> str:
     - anything shaped like our block tags is defused (``&lt;untrusted``).
 
     Only the ``max_chars`` cap removes text, at a line boundary, and it says
-    so (``TRUNCATION_NOTE``). ``markdown_renderer.normalize_for_match`` undoes
-    these substitutions when a finding's quote is checked against the code.
+    so (``TRUNCATION_NOTE``). ``match_form`` undoes these substitutions when a
+    finding's quote is checked against the code.
     """
     text = text or ""
     text = defuse_html_comments(text)
@@ -111,6 +112,26 @@ def sanitize_untrusted(text: str | None, max_chars: int | None = None) -> str:
         cut = cut if cut > max_chars // 2 else max_chars
         text = text[:cut] + "\n" + TRUNCATION_NOTE.format(n=len(text) - cut)
     return text
+
+
+_PLACEHOLDER_RE = re.compile(r"\[U\+[0-9A-F]{4,6}\]")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def match_form(text: str) -> str:
+    """Canonical form for comparing an LLM's quote with the code it reviewed,
+    whichever side of ``sanitize_untrusted`` either one comes from: fence
+    look-alikes back to backticks / tildes, HTML entities (``&lt;!--``,
+    ``&lt;untrusted``) unescaped, ``[U+XXXX]`` placeholders and the invisible /
+    control characters they stand for dropped, and ALL whitespace removed (so
+    re-indented or re-wrapped statements compare equal)."""
+    text = (text or "").replace(FENCE_BACKTICK, "`").replace(FENCE_TILDE, "~")
+    text = html.unescape(text)
+    text = _PLACEHOLDER_RE.sub("", text)
+    text = _INVISIBLE_RE.sub("", text)
+    text = _CONTROL_RE.sub("", text)
+    text = _EXTRA_BREAK_RE.sub("", text)
+    return _WHITESPACE_RE.sub("", text)
 
 
 def safe_label(value, max_chars: int = 160) -> str:

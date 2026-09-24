@@ -150,6 +150,61 @@ def test_locate_quote_variants():
     assert locate_quote("return db.execute(query)\nquery = ", code) is None  # out of order
 
 
+JOINED = (
+    "def run(request):\n"
+    "    cmd = request.args.get('cmd')\n"
+    "    subprocess.call(\n"
+    "        cmd,\n"
+    "        shell=True,\n"
+    "    )\n"
+    "    return render(```x```)\n"
+)
+
+
+def test_locate_quote_multiline_statement_joined_on_one_line():
+    assert locate_quote("subprocess.call(cmd, shell=True)", JOINED) == (2, 5)
+    assert locate_quote("subprocess.call( cmd, shell=True, )", JOINED) == (2, 5)
+
+
+def test_locate_quote_accepts_list_and_trailing_punctuation_or_comment():
+    assert locate_quote(["cmd = request.args.get('cmd')", "subprocess.call("], JOINED) == (1, 2)
+    assert locate_quote("cmd = request.args.get('cmd');", JOINED) == (1, 1)
+    assert locate_quote("cmd = request.args.get('cmd')  # attacker-controlled", JOINED) == (1, 1)
+
+
+def test_locate_quote_matches_either_side_of_the_sanitiser():
+    from backend.app.core.untrusted import sanitize_untrusted
+
+    code = "x = 1\nhtml = '<!--' + user\u200b_id\nprint(```q```)\n"
+    shown = sanitize_untrusted(code)  # what the model saw
+    assert "&lt;!--" in shown and "[U+200B]" in shown and "\u02cb" in shown
+    for quote in ("html = '&lt;!--' + user[U+200B]_id",  # copied as shown
+                  "html = '<!--' + user_id",  # un-sanitised by the model
+                  "html = '<!--' + user\u200b_id"):
+        assert locate_quote(quote, shown) == (1, 1), quote
+    assert locate_quote("print(```q```)", shown) == (2, 2)
+    assert locate_quote("print(\u02cb\u02cb\u02cbq\u02cb\u02cb\u02cb)", shown) == (2, 2)
+
+
+def test_locate_quote_still_rejects_code_that_is_not_there():
+    assert locate_quote("subprocess.call(cmd, shell=False)", JOINED) is None
+    assert locate_quote("os.system(cmd)", JOINED) is None
+    assert locate_quote("cmd = request.form['cmd']", JOINED) is None
+    # Every fragment must be present: one real line doesn't carry an invented one.
+    assert locate_quote("cmd = request.args.get('cmd')\neval(cmd)", JOINED) is None
+    # Nothing matches across an elided region.
+    assert locate_quote("shell=True,)", JOINED, skip_lines={5}) is None
+    assert locate_quote("shell=True,", JOINED, skip_lines={5}) == (4, 4)
+
+
+def test_validate_accepts_list_quote_and_anchors_to_matched_line():
+    units = _units(code=JOINED)
+    [f] = validate_findings([{"unit": "U1", "title": "cmd injection", "severity": "high",
+                              "quoted_code": ["subprocess.call(cmd, shell=True)"]}],
+                            units, set(), set())
+    assert (f["line"], f["end_line"]) == (12, 15)  # unit starts at 10
+
+
 def test_validate_keeps_unlinked_finding_and_strips_unknown_ids():
     units = _units()
     findings = [

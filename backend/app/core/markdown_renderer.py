@@ -8,9 +8,11 @@ old retrieval-only prompt found 1 of 14 vulnerable functions, because retrieval
 picks the right bug class only ~28% of the time on named categories.
 
 Anti-hallucination, now per finding: each finding must quote the offending line(s)
-verbatim from the code under review, and is dropped when the quote isn't there
-(``locate_quote``). A cited ``cve_id`` / ``team_pr_id`` outside the retrieved
-allowlist is removed from the finding, but the finding itself is kept.
+from the code under review, and is dropped when the quote isn't there
+(``locate_quote``: whitespace-insensitive and tolerant of the sanitiser's
+substitutions, but every quoted character sequence must be in the code). A
+cited ``cve_id`` / ``team_pr_id`` outside the retrieved allowlist is removed from
+the finding, but the finding itself is kept.
 
 All untrusted text goes into nonce-tagged blocks (``core.untrusted``); the Markdown
 is rendered here, deterministically, with every LLM-written field escaped.
@@ -21,6 +23,7 @@ from typing import Any
 
 from backend.app.core.untrusted import (
     clean_llm_text,
+    match_form,
     md_code_block,
     md_code_span,
     md_inline,
@@ -292,51 +295,85 @@ def build_user_prompt(units: list[dict], nonce: str) -> str:
 # Validation
 # ---------------------------------------------------------------------------
 
-_LINE_NUMBER_PREFIX = re.compile(r"^\s*\d+\s*\|\s?")
+# "  12| " line-number prefixes (and "  ...| " elision markers) the prompt adds.
+_LINE_NUMBER_PREFIX = re.compile(r"^\s*(?:\d+|\.\.\.)\s*\|\s?")
 _ELLIPSIS = re.compile(r"\.\.\.|…")
+# A comment the model appended to a quoted line ("os.system(cmd)  # injection").
+_TRAILING_COMMENT = re.compile(r"\s+(?:#|//).*$")
+# Never part of a real code character sequence after match_form: stands in for
+# an elided region so no quote can match across it.
+_GAP = "\x00"
+_CLOSERS = (")", "]", "}")
+_TRAILING_COMMA = re.compile(r",(?=[)\]}])")
 
 
-def _norm(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
+def _quote_fragments(quote: str, lenient: bool) -> list[str]:
+    """``quote`` as ordered code fragments in ``match_form``: one per quoted
+    line, further split at "..." / "…" (elided code). ``lenient`` also drops a
+    trailing comment and trailing ``;`` / ``,`` from each line."""
+    frags: list[str] = []
+    for raw in quote.strip().splitlines():
+        raw = _LINE_NUMBER_PREFIX.sub("", raw)
+        if lenient:
+            raw = _TRAILING_COMMENT.sub("", raw)
+        for part in _ELLIPSIS.split(raw):
+            frag = match_form(part)
+            if lenient:
+                frag = frag.rstrip(";,")
+            if frag:
+                frags.append(frag)
+    return frags
 
 
-def locate_quote(quote: str, code: str) -> tuple[int, int] | None:
+def locate_quote(quote, code: str, skip_lines=frozenset()) -> tuple[int, int] | None:
     """0-based (first, last) line index of ``code`` that ``quote`` was copied
-    from, or None. Each non-empty quoted line (line-number prefix stripped,
-    whitespace-normalised, "..." splitting it into fragments) must occur within
-    one code line, in order, at or after the previous quoted line's match."""
+    from, or None.
+
+    Matching rule: both sides are put in ``untrusted.match_form`` (sanitiser
+    substitutions undone, whitespace removed), so the check is insensitive to
+    indentation, re-wrapping and whether the model copied the sanitised or the
+    original characters. The quote is split into fragments (one per quoted line,
+    and at "..."); every fragment must occur, in order and without overlap, as a
+    contiguous run of the code's characters - a fragment may span several code
+    lines (a multi-line statement quoted on one line), fragments may have code
+    between them; a comma right before a closing bracket is ignored on both
+    sides. At least ``MIN_QUOTE_CHARS`` quoted characters are required.
+    Tried as quoted first, then without trailing comments / ``;`` / ``,`` on
+    each quoted line. ``quote`` may be a list of lines. ``skip_lines`` are code
+    line indexes that are not code (elision markers): nothing matches in or
+    across them. The span runs from the first fragment's first line to the
+    last fragment's last line.
+    """
+    if isinstance(quote, (list, tuple)):
+        quote = "\n".join(str(q) for q in quote if q is not None)
     if not quote or not code:
         return None
-    code_lines = [_norm(ln) for ln in code.splitlines()]
-    wanted: list[list[str]] = []
-    for raw in quote.strip().splitlines():
-        frags = [_norm(f) for f in _ELLIPSIS.split(_LINE_NUMBER_PREFIX.sub("", raw))]
-        frags = [f for f in frags if f]
-        if frags:
-            wanted.append(frags)
-    if sum(len(f.replace(" ", "")) for frags in wanted for f in frags) < MIN_QUOTE_CHARS:
-        return None
-
-    def contains(line: str, frags: list[str]) -> bool:
-        pos = 0
-        for f in frags:
-            pos = line.find(f, pos)
-            if pos < 0:
-                return False
-            pos += len(f)
-        return True
-
-    first = last = None
-    idx = 0
-    for frags in wanted:
-        while idx < len(code_lines) and not contains(code_lines[idx], frags):
-            idx += 1
-        if idx >= len(code_lines):
-            return None
-        first = idx if first is None else first
-        last = idx
-        idx += 1
-    return first, last
+    pieces: list[str] = []
+    owner: list[int] = []
+    for i, line in enumerate(code.splitlines()):
+        norm = _GAP if i in skip_lines else match_form(line)
+        pieces.append(norm)
+        owner.extend([i] * len(norm))
+    flat = "".join(pieces)
+    # A comma right before a closing bracket is insignificant (trailing commas
+    # of multi-line calls / literals, which a one-line quote leaves out).
+    keep = [i for i, ch in enumerate(flat) if not (ch == "," and flat[i + 1:i + 2] in _CLOSERS)]
+    flat, owner = "".join(flat[i] for i in keep), [owner[i] for i in keep]
+    for lenient in (False, True):
+        frags = [_TRAILING_COMMA.sub("", f) for f in _quote_fragments(quote, lenient)]
+        if sum(len(f) for f in frags) < MIN_QUOTE_CHARS:
+            continue
+        pos, first, last = 0, None, None
+        for frag in frags:
+            idx = flat.find(frag, pos)
+            if idx < 0:
+                break
+            first = owner[idx] if first is None else first
+            last = owner[idx + len(frag) - 1]
+            pos = idx + len(frag)
+        else:
+            return first, last
+    return None
 
 
 def _id_or_none(value) -> str | None:
@@ -372,8 +409,10 @@ def validate_findings(
     for f in llm_findings:
         if not isinstance(f, dict):
             continue
-        quote = clean_llm_text(f.get("quoted_code") or f.get("vulnerable_code"), MAX_QUOTE_CHARS,
-                               code=True)
+        raw_quote = f.get("quoted_code") or f.get("vulnerable_code")
+        if isinstance(raw_quote, (list, tuple)):  # some models return the lines as a list
+            raw_quote = "\n".join(str(q) for q in raw_quote if q is not None)
+        quote = clean_llm_text(raw_quote, MAX_QUOTE_CHARS, code=True)
         named = by_uid.get(str(f.get("unit") or "").strip())
         order = ([named] if named else []) + [u for u in units if u is not named]
         unit = span = None

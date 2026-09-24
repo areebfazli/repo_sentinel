@@ -12,7 +12,10 @@
   one. ``guard_removed`` changes go to the prompt as change-direction evidence
   (held-out TPR 0.227 / FPR 0.030); the ``alert`` tier (unsafe-API swap, flag
   flip or SQL interpolation; TPR 0.032 at 0/506 FPR) also becomes its own
-  deterministic finding, reported even if the LLM says nothing.
+  deterministic finding (severity GUARD_ALERT_SEVERITY, default medium),
+  reported even if the LLM says nothing, and marked ``corroborated_by`` when
+  the LLM or Semgrep flags the same spot (only then does it fail the Action's
+  severity gate by default).
 
 Every function here is blocking and never raises on bad input; call from async
 code via ``asyncio.to_thread``.
@@ -171,9 +174,21 @@ def guard_evidence(files: list, units: list[dict], parser) -> dict[UnitKey, dict
     return out
 
 
-def guard_alert_findings(guard: dict[UnitKey, dict[str, Any]]) -> list[dict[str, Any]]:
+ALERT_SEVERITIES = ("low", "medium", "high", "critical")
+
+
+def guard_alert_findings(
+    guard: dict[UnitKey, dict[str, Any]], severity: str = "medium"
+) -> list[dict[str, Any]]:
     """Deterministic report findings for the ``alert`` tier: each weakened
-    change with confidence >= ALERT_MIN_CONFIDENCE in a unit flagged alert."""
+    change with confidence >= ALERT_MIN_CONFIDENCE in a unit flagged alert.
+
+    ``severity`` (GUARD_ALERT_SEVERITY, default medium): the alert tier is a
+    pattern match on the diff (TPR 0.032 at 0/506 FPR on the held-out pairs),
+    not a verdict, so it defaults below the usual "high" gate; the Action also
+    keeps a deterministic-only finding from failing the build unless the LLM or
+    Semgrep corroborates it (``corroborate_deterministic``)."""
+    severity = severity if severity in ALERT_SEVERITIES else "medium"
     findings = []
     for g in guard.values():
         if not g.get("alert"):
@@ -187,7 +202,7 @@ def guard_alert_findings(guard: dict[UnitKey, dict[str, Any]]) -> list[dict[str,
             ).hexdigest()[:16]
             findings.append(
                 {
-                    "severity": "high",
+                    "severity": severity,
                     "cve_id": None,
                     "team_pr_id": None,
                     "cwe": None,
@@ -209,7 +224,45 @@ def guard_alert_findings(guard: dict[UnitKey, dict[str, Any]]) -> list[dict[str,
                     "point_id": None,
                     "source": "guard_diff",
                     "deterministic": True,
+                    "corroborated_by": [],
                     "dedupe_key": f"guard:{digest}",
                 }
             )
     return findings
+
+
+# A corroborating LLM finding / Semgrep hit must be this close to the change.
+CORROBORATION_LINES = 3
+
+
+def corroborate_deterministic(
+    findings: list[dict[str, Any]], semgrep: dict[UnitKey, list[dict]]
+) -> None:
+    """Set ``corroborated_by`` (in place) on each deterministic finding: "llm"
+    when an LLM finding in the same unit spans a line within
+    CORROBORATION_LINES of the change, "semgrep" likewise for a (non-regex)
+    Semgrep hit. A change without a new-side line (a pure deletion) is
+    corroborated by any such finding / hit in its unit."""
+    llm = [f for f in findings if f.get("source") == "llm"]
+
+    def near(line, first, last) -> bool:
+        if line is None:
+            return True
+        first = first if first is not None else last
+        last = last if last is not None else first
+        return first is not None and first - CORROBORATION_LINES <= line <= (
+            last + CORROBORATION_LINES)
+
+    for d in findings:
+        if not d.get("deterministic"):
+            continue
+        key = (d.get("file_path"), d.get("function_name"), int(d.get("start_line") or 1))
+        by = []
+        if any(unit_key(f) == key and near(d.get("line"), f.get("line"), f.get("end_line"))
+               for f in llm):
+            by.append("llm")
+        if any(not h.get("low_confidence") and near(d.get("line"), h.get("line"),
+                                                     h.get("end_line") or h.get("line"))
+               for h in semgrep.get(key, [])):
+            by.append("semgrep")
+        d["corroborated_by"] = by

@@ -99,6 +99,10 @@ class ReportFinding(BaseModel):
     point_id: str | None = None
     source: str | None = None
     deterministic: bool = False
+    # For a deterministic finding: which independent signals flag the same
+    # spot ("llm", "semgrep"). The Action's severity gate ignores
+    # deterministic findings nothing corroborates (unless configured not to).
+    corroborated_by: list[str] = []
     # Stable per-function identity for comment dedupe (the Action hashes it with
     # file + function); falls back to point_id for older servers.
     dedupe_key: str | None = None

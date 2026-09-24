@@ -82,12 +82,25 @@ def parse_commentable_lines(patch: str) -> list[int]:
     return lines
 
 
-def severity_gate(findings: list[dict], threshold: str) -> int:
-    """Exit code: 1 if any finding is at/above the threshold severity, else 0."""
+def gates_build(finding: dict, gate_on_deterministic: bool = False) -> bool:
+    """Whether a finding may fail the severity gate. A deterministic-only
+    finding (guard_diff pattern match, no LLM) needs the LLM or Semgrep to
+    corroborate it, unless ``gate_on_deterministic``. Older servers send no
+    ``corroborated_by``: their deterministic findings don't gate either."""
+    if not finding.get("deterministic") or gate_on_deterministic:
+        return True
+    return bool(finding.get("corroborated_by"))
+
+
+def severity_gate(findings: list[dict], threshold: str, gate_on_deterministic: bool = False) -> int:
+    """Exit code: 1 if any gating finding (``gates_build``) is at/above the
+    threshold severity, else 0."""
     if not threshold or threshold == "none":
         return 0
     thr = SEVERITY_RANK.get(threshold, 99)
     for f in findings:
+        if not gates_build(f, gate_on_deterministic):
+            continue
         sev = f.get("severity")
         if sev and SEVERITY_RANK.get(sev, 0) >= thr:
             return 1
@@ -260,7 +273,10 @@ def build_comment_body(finding: dict) -> str:
     if finding.get("fix_snippet"):
         body += f"\n\n{md_code_block(finding['fix_snippet'])}"
     if finding.get("deterministic"):
-        body += "\n\n<sub>Deterministic check (no LLM).</sub>"
+        by = [x for x in finding.get("corroborated_by") or [] if x in ("llm", "semgrep")]
+        note = (f"corroborated by {' and '.join(by)}" if by
+                else "not confirmed by the LLM review or Semgrep")
+        body += f"\n\n<sub>Deterministic check (no LLM), {note}.</sub>"
     marker = finding_marker(
         finding.get("file_path", ""), _finding_identity(finding), finding.get("function_name")
     )
@@ -300,7 +316,7 @@ def plan_comment_ops(existing: list[dict], desired: list[dict]) -> dict:
 
 
 def build_summary(report_markdown: str, gate_threshold: str, result: dict | None = None,
-                  fail_on_partial: bool = True) -> str:
+                  fail_on_partial: bool = True, gate_on_deterministic: bool = False) -> str:
     """The summary comment is the server-rendered report (deterministic Markdown,
     LLM text already escaped there), plus the review-coverage line, the gate
     footer and the dedup marker. An empty report is only called clean when the
@@ -311,6 +327,8 @@ def build_summary(report_markdown: str, gate_threshold: str, result: dict | None
                 else "## ⚠️ RepoSentinel\nNo findings in the reviewed code.")
     body = report_markdown.strip() or fallback
     gates = f"Severity gate: `{gate_threshold}`"
+    if not gate_on_deterministic:
+        gates += " (deterministic-only findings need LLM / Semgrep corroboration)"
     gates += "; fails on partial review" if fail_on_partial else "; partial review allowed"
     footer = f"\n\n{coverage_line(result)}\n\n<sub>{gates}</sub>"
     return f"{body}{footer}\n<!-- reposentinel:summary -->"
@@ -519,6 +537,7 @@ def main() -> int:
     api_key = os.environ.get("REPOSENTINEL_API_KEY", "")
     gate = os.environ.get("INPUT_FAIL_ON_SEVERITY", "none").lower()
     fail_on_partial = _env_flag("INPUT_FAIL_ON_PARTIAL", True)
+    gate_on_deterministic = _env_flag("INPUT_GATE_ON_DETERMINISTIC", False)
     repo = os.environ["GITHUB_REPOSITORY"]
 
     with open(os.environ["GITHUB_EVENT_PATH"]) as f:
@@ -546,7 +565,8 @@ def main() -> int:
         file["path"]: parse_commentable_lines(file.get("patch") or "") for file in files
     }
     desired, unanchored = desired_comments(findings, changed_by_file, commentable_by_file)
-    summary = build_summary(result.get("report_markdown", ""), gate, result, fail_on_partial)
+    summary = build_summary(result.get("report_markdown", ""), gate, result, fail_on_partial,
+                            gate_on_deterministic)
 
     if dry_run:
         print("DRY RUN — planned inline comments:")
@@ -568,7 +588,7 @@ def main() -> int:
         if failures:
             print(f"{failures} comment operation(s) failed")
 
-    exit_code = severity_gate(findings, gate)
+    exit_code = severity_gate(findings, gate, gate_on_deterministic)
     print(f"Severity gate ({gate}) -> exit {exit_code}")
     coverage_exit = coverage_gate(result, fail_on_partial)
     print(f"Coverage gate (fail_on_partial={fail_on_partial}, review "

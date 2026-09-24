@@ -512,6 +512,13 @@ def _render_finding(f: dict[str, Any]) -> list[str]:
     if f.get("fix_snippet"):
         block.append("  - Suggested fix:")
         block.extend(md_code_block(f["fix_snippet"].strip(), indent="    "))
+    if f.get("deterministic"):
+        by = [x for x in f.get("corroborated_by") or [] if x in ("llm", "semgrep")]
+        block.append(
+            f"  - Deterministic diff check, corroborated by {' and '.join(by)}." if by
+            else "  - Deterministic diff check only (not confirmed by the LLM review or "
+                 "Semgrep)."
+        )
     return block
 
 

@@ -158,6 +158,12 @@ class Settings(BaseSettings):
         "python_requests_rule-request-without-timeout",
     ]
 
+    # Severity of a guard_diff alert-tier finding (a deterministic diff pattern:
+    # unsafe-API swap, flag flip, SQL interpolation). Medium: it is evidence, not
+    # a verdict, and the Action's gate ignores it unless the LLM or Semgrep
+    # corroborates it (or INPUT_GATE_ON_DETERMINISTIC is set).
+    GUARD_ALERT_SEVERITY: str = "medium"   # low | medium | high | critical
+
     # Cap on per-scan analysis units (functions) in files mode.
     MAX_UNITS_PER_SCAN: int = 50
 

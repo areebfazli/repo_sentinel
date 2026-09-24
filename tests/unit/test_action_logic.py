@@ -305,3 +305,16 @@ def test_main_fails_on_partial_review_by_default(monkeypatch, tmp_path):
     result["review_status"] = "complete"
     result["units_not_reviewed"] = []
     assert scan_pr.main() == 0
+
+
+def test_deterministic_only_findings_do_not_trip_the_gate_by_default():
+    det = {"severity": "high", "deterministic": True, "source": "guard_diff"}
+    assert severity_gate([det], "high") == 0
+    assert severity_gate([det], "high", gate_on_deterministic=True) == 1
+    assert severity_gate([{**det, "corroborated_by": ["llm"]}], "high") == 1
+    assert severity_gate([{**det, "corroborated_by": ["semgrep"]}], "medium") == 1
+    assert severity_gate([{"severity": "high", "source": "llm"}], "high") == 1
+    body = build_comment_body({**det, "title": "t", "file_path": "a.py", "dedupe_key": "g:1"})
+    assert "not confirmed by the LLM review or Semgrep" in body
+    assert "need LLM / Semgrep corroboration" in build_summary("x", "high")
+    assert "corroboration" not in build_summary("x", "high", gate_on_deterministic=True)

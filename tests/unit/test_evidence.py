@@ -113,7 +113,10 @@ def test_alert_tier_becomes_deterministic_finding(parser):
     guard = guard_evidence([f], units, parser)
     [finding] = guard_alert_findings(guard)
     assert finding["source"] == "guard_diff" and finding["deterministic"] is True
-    assert finding["severity"] == "high" and finding["line"] == 5
+    assert finding["severity"] == "medium" and finding["line"] == 5  # GUARD_ALERT_SEVERITY
+    assert finding["corroborated_by"] == []
+    assert guard_alert_findings(guard, "high")[0]["severity"] == "high"
+    assert guard_alert_findings(guard, "bogus")[0]["severity"] == "medium"
     assert finding["dedupe_key"].startswith("guard:")
     assert "yaml.load" in finding["quoted_code"]
 
@@ -213,6 +216,9 @@ def test_files_scan_feeds_semgrep_and_guard_evidence(monkeypatch):
     assert [s["rule_id"] for s in result["static_analysis"]] == ["python_deserialization_rule-yaml"]
     assert {g["function_name"]: g["alert"] for g in result["guard_diff"]} == {
         "load": True, "read": False}
+    # The Semgrep hit on the same line corroborates the deterministic finding.
+    assert finding["severity"] == "medium" and finding["corroborated_by"] == ["semgrep"]
+    assert "corroborated by semgrep" in result["report_markdown"]
 
 
 def test_snippet_scan_runs_semgrep_on_the_snippet_without_guard(monkeypatch):
@@ -239,3 +245,24 @@ def test_llm_failure_still_reports_semgrep_and_guard_evidence(monkeypatch):
     assert [s["rule_id"] for s in result["static_analysis"]] == ["python_deserialization_rule-yaml"]
     assert result["guard_diff"] and "LLM review failed" in result["report_markdown"]
     assert [u["reason"] for u in result["units_not_reviewed"]] == ["llm_error"]
+
+
+def test_corroboration_needs_the_same_unit_and_a_nearby_line():
+    from backend.app.core.evidence import corroborate_deterministic
+
+    det = {"source": "guard_diff", "deterministic": True, "file_path": "a.py",
+           "function_name": "f", "start_line": 1, "line": 10}
+    llm_near = {"source": "llm", "file_path": "a.py", "function_name": "f", "start_line": 1,
+                "line": 12, "end_line": 12}
+    llm_far = {**llm_near, "line": 40, "end_line": 41}
+    llm_other = {**llm_near, "function_name": "g"}
+    findings = [dict(det), llm_far, llm_other]
+    corroborate_deterministic(findings, {})
+    assert findings[0]["corroborated_by"] == []
+    findings = [dict(det), llm_near]
+    corroborate_deterministic(findings, {("a.py", "f", 1): [
+        {"line": 9, "low_confidence": False}]})
+    assert findings[0]["corroborated_by"] == ["llm", "semgrep"]
+    findings = [dict(det)]
+    corroborate_deterministic(findings, {("a.py", "f", 1): [{"line": 9, "low_confidence": True}]})
+    assert findings[0]["corroborated_by"] == []  # regex heuristics don't count

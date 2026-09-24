@@ -15,6 +15,7 @@ from sqlalchemy import update
 
 from backend.app.config import settings
 from backend.app.core.evidence import (
+    corroborate_deterministic,
     guard_alert_findings,
     guard_evidence,
     guess_language,
@@ -517,10 +518,13 @@ async def _run_scan_guarded(scan_id: str, merger, router) -> None:
             max_refs_per_unit=settings.LLM_MAX_CVES_PER_UNIT,
         )
         # Deterministic guard_diff alerts are reported whatever the LLM says.
-        report_findings: list[dict] = guard_alert_findings(analysis["guard"])
+        report_findings: list[dict] = guard_alert_findings(
+            analysis["guard"], settings.GUARD_ALERT_SEVERITY
+        )
         providers, llm_calls, reviewed = await _review_batches(
             batches, router, row_snaps, report_findings, not_reviewed
         )
+        corroborate_deterministic(report_findings, analysis["semgrep"])
         coverage = review_coverage(len(review_units), reviewed, not_reviewed)
         provider_used = ",".join(providers) or None
         if "mock" in providers:

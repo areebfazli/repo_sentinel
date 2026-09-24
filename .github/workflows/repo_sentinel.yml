@@ -38,4 +38,8 @@ jobs:
           # Fail the check when the LLM review was partial or failed (units not
           # reviewed: budget, rate limits, errors), instead of passing as clean.
           INPUT_FAIL_ON_PARTIAL: "true"
+          # Let deterministic diff-pattern findings (guard_diff alerts) fail the
+          # check on their own. Off: they must be corroborated by the LLM review
+          # or Semgrep to count towards the severity gate.
+          INPUT_GATE_ON_DETERMINISTIC: "false"
         run: python github_action/scan_pr.py

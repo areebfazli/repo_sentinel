@@ -364,6 +364,49 @@ def test_http_tap_reads_usage_and_daily_limit():
     assert run_eval.classify_llm_error(LLMError("HTTP 401"), []) == "other"
 
 
+def test_http_tap_recognizes_openrouter_daily_cap():
+    minute_body = {"error": {"code": 429, "message": "Rate limit exceeded: free-models-per-min. "}}
+    day_body = {"error": {"code": 429, "message": "Rate limit exceeded: free-models-per-day. "
+                          "Add 10 credits to unlock 1000 free model requests per day"}}
+    terse_day = {"error": {"code": 429, "message": "Rate limit exceeded: free-models-per-day"}}
+
+    def handler(request):
+        path = request.url.path
+        if path == "/minute":
+            return httpx.Response(429, json=minute_body)
+        if path == "/day":
+            return httpx.Response(429, json=day_body)
+        if path == "/terse":
+            return httpx.Response(429, json=terse_day)
+        if path == "/in200":  # OpenRouter can wrap an error in an HTTP 200
+            return httpx.Response(200, json=terse_day)
+        return httpx.Response(200, json={"error": {"code": 429, "message": "upstream busy"}})
+
+    async def go():
+        with run_eval.HttpUsageTap() as tap:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+                for path in ("/minute", "/day", "/terse", "/in200", "/in200-minute"):
+                    await c.post(f"https://openrouter.test{path}", json={})
+            return tap.take()
+
+    minute, day, terse, in200, in200_minute = asyncio.run(go())
+    assert not minute["daily_limit"]
+    assert day["daily_limit"] and terse["daily_limit"] and in200["daily_limit"]
+    assert not in200_minute["daily_limit"]
+    assert run_eval.classify_llm_error(LLMError("HTTP 429"), [minute]) == "rate_limit"
+    assert run_eval.classify_llm_error(LLMError("x"), [in200_minute]) == "rate_limit"
+    for event in (day, terse, in200):
+        assert run_eval.classify_llm_error(LLMError("HTTP 429"), [minute, event]) == "daily_limit"
+
+
+def test_openrouter_daily_cap_stops_the_stage():
+    def respond(user):
+        raise LLMError("Rate limit exceeded: free-models-per-day")
+
+    stage = _run([_entry(f"{i}_vuln") for i in range(3)], StubRouter(respond))
+    assert stage["stopped"] == "daily_limit" and stage["calls"] == 1
+
+
 # --- realistic metrics -----------------------------------------------------------
 
 

@@ -28,7 +28,7 @@ class Settings(BaseSettings):
 
     # LLM providers (OpenAI-compatible chat-completions endpoints).
     # A configured provider with a missing key hard-errors at startup — never a silent mock.
-    LLM_PROVIDER: str = "groq"          # groq | gemini | mock
+    LLM_PROVIDER: str = "groq"          # groq | gemini | openrouter | mock
     LLM_FALLBACK_PROVIDER: str | None = "gemini"
     GROQ_API_KEY: str | None = None
     GEMINI_API_KEY: str | None = None
@@ -36,6 +36,16 @@ class Settings(BaseSettings):
     # Same-provider (Groq) fallback: a different model, so not hit by the same per-model rate limit.
     GROQ_FALLBACK_MODEL: str | None = "qwen/qwen3.8-27b"
     GEMINI_MODEL: str = "gemini-2.0-flash"
+    # OpenRouter (aimed at its free ":free" models, which have daily request caps).
+    OPENROUTER_API_KEY: str | None = None
+    # Supports structured outputs but rejects response_format json_object, so it
+    # is always sent without it (see _NO_RESPONSE_FORMAT_MODELS in llm_client).
+    OPENROUTER_MODEL: str = "qwen/qwen3.8-27b:free"
+    # Same-provider (OpenRouter) fallback model on a different upstream; free
+    # models rate-limit per model. Supports response_format, 262K context.
+    # Set empty in .env to disable.
+    OPENROUTER_FALLBACK_MODEL: str | None = "google/gemma-4-31b-it:free"
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     LLM_TIMEOUT_SECONDS: int = 60
     LLM_RETRIES: int = 1                 # same-client retries on 429/5xx/timeout
 

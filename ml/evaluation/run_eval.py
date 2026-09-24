@@ -126,8 +126,10 @@ DEFAULT_LLM_SLEEP = 2.5
 DEFAULT_LLM_TPM = 8000  # Groq free tier tokens/minute per model
 DEFAULT_LLM_MAX_RATE_LIMIT_ERRORS = 3
 DEFAULT_LLM_CACHE = RESULTS_DIR / "llm_cache.jsonl"
-# Groq names the exhausted window in its 429 body ("... tokens per day (TPD)").
-DAILY_LIMIT_MARKERS = ("per day", "(TPD)", "(RPD)")
+# Groq names the exhausted window in its 429 body ("... tokens per day (TPD)");
+# OpenRouter's free tier says "Rate limit exceeded: free-models-per-day" (its
+# per-minute throttle is "free-models-per-min", which matches none of these).
+DAILY_LIMIT_MARKERS = ("per day", "(TPD)", "(RPD)", "free-models-per-day")
 # A Retry-After this long only happens once a daily (not per-minute) window is spent.
 DAILY_LIMIT_RETRY_AFTER_S = 300.0
 
@@ -720,8 +722,16 @@ def _http_event(resp: httpx.Response) -> dict:
     event = {"status": resp.status_code, "usage": None, "retry_after": None, "daily_limit": False}
     if resp.status_code == 200:
         try:
-            usage = resp.json().get("usage")
+            data = resp.json()
+            usage = data.get("usage")
             event["usage"] = usage if isinstance(usage, dict) else None
+            # OpenRouter can put an error (incl. an upstream 429) in a 200 body.
+            err = data.get("error")
+            if isinstance(err, dict):
+                event["error_code"] = err.get("code")
+                if err.get("code") == 429:
+                    message = str(err.get("message", ""))
+                    event["daily_limit"] = any(m in message for m in DAILY_LIMIT_MARKERS)
         except (ValueError, AttributeError):
             pass
     else:
@@ -785,7 +795,10 @@ def classify_llm_error(exc: BaseException, events: list[dict]) -> str:
     text = str(exc)
     if any(e.get("daily_limit") for e in events) or any(m in text for m in DAILY_LIMIT_MARKERS):
         return "daily_limit"
-    if any(e.get("status") == 429 for e in events) or "HTTP 429" in text:
+    if (
+        any(e.get("status") == 429 or e.get("error_code") == 429 for e in events)
+        or "HTTP 429" in text
+    ):
         return "rate_limit"
     return "other"
 
@@ -1179,7 +1192,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     llm.add_argument(
         "--llm-primary-only", action="store_true",
-        help="Use only the primary provider/model (no GROQ_FALLBACK_MODEL / "
+        help="Use only the primary provider/model (no same-provider fallback model "
+        "such as GROQ_FALLBACK_MODEL / OPENROUTER_FALLBACK_MODEL, no "
         "LLM_FALLBACK_PROVIDER), so every scored item comes from one model.",
     )
     return parser

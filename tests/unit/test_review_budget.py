@@ -178,7 +178,7 @@ class ScriptedRouter:
         self.fail = set(fail)
         self.prompts = []
 
-    async def generate(self, system, user):
+    async def generate(self, system, user, **kwargs):
         idx = len(self.prompts)
         self.prompts.append(user)
         if idx in self.fail:
@@ -240,3 +240,46 @@ def test_scan_that_fits_is_one_call(monkeypatch, n_units):
     status, result = _run_files(n_units, router, monkeypatch)
     assert status == "completed" and result["llm_calls"] == 1
     assert result["units_not_reviewed"] == []
+
+
+class DeadlineRouter:
+    """A router on a fake clock: each call takes 100 s; the provider reports a
+    rate budget that would outlast the deadline once ``give_up_after`` calls
+    were made."""
+
+    mock = False
+
+    def __init__(self, give_up_after=99):
+        self.now = 0.0
+        self.calls = 0
+        self.give_up_after = give_up_after
+        self.deadlines = []
+
+    def clock(self):
+        return self.now
+
+    async def generate(self, system, user, *, deadline=None):
+        self.deadlines.append(deadline)
+        if self.calls >= self.give_up_after:
+            raise LLMError("rate budget would end after the deadline", deadline_exceeded=True)
+        self.calls += 1
+        self.now += 100.0
+        return {"findings": []}, "groq:stub"
+
+
+def test_scan_stops_calling_the_llm_when_its_time_budget_runs_out(monkeypatch):
+    router = DeadlineRouter()
+    status, result = _run_files(4, router, monkeypatch, LLM_MAX_UNITS_PER_PROMPT=1,
+                                LLM_SCAN_MAX_WALL_S=250.0)
+    assert status == "completed"
+    assert router.calls == 3 and set(router.deadlines) == {250.0}  # t=0,100,200 < 250
+    assert [u["reason"] for u in result["units_not_reviewed"]] == ["time_budget"]
+    assert "LLM time budget of 250s ran out" in result["report_markdown"]
+    assert result["llm_calls"] == 3
+
+
+def test_rate_budget_past_the_deadline_marks_units_time_budget(monkeypatch):
+    router = DeadlineRouter(give_up_after=1)
+    status, result = _run_files(3, router, monkeypatch, LLM_MAX_UNITS_PER_PROMPT=1)
+    assert status == "completed"
+    assert [u["reason"] for u in result["units_not_reviewed"]] == ["time_budget"] * 2

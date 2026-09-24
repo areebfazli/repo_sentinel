@@ -269,7 +269,7 @@ def test_429_retries_then_succeeds(monkeypatch):
     _, provider = _generate(router)
     assert provider == f"openrouter:{OR_PRIMARY}"
     assert script.order == [PRIMARY, PRIMARY]
-    assert sleeps == [4.0]  # Retry-After honoured
+    assert sleeps == [pytest.approx(4.0, abs=0.5)]  # Retry-After honoured
 
 
 def test_429_exhausts_retries_then_openrouter_fallback_model(monkeypatch):

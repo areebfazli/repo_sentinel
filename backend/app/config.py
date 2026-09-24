@@ -66,6 +66,20 @@ class Settings(BaseSettings):
     LLM_MAX_CALLS_PER_SCAN: int = 6
     # Retrieved CVE matches shown per unit (team matches likewise), best first.
     LLM_MAX_CVES_PER_UNIT: int = 2
+    # Pacing of the scan's (sequential) LLM calls, per model: estimated tokens
+    # (prompt + LLM_OUTPUT_TOKENS_ESTIMATE) per rolling minute. Keys are a
+    # provider or a "<provider>:<model>" label; null / missing = no limit. Groq's
+    # free tier allows ~8K tokens/min per model, so 6 back-to-back ~6K-token
+    # calls would 429 without it; OpenRouter's free models have request caps only.
+    LLM_TPM_LIMITS: dict[str, int | None] = {"groq": 8000, "openrouter": None}
+    LLM_OUTPUT_TOKENS_ESTIMATE: int = 1500
+    # Longest single wait (rate budget or Retry-After) before trying the next
+    # client instead; a daily-limit Retry-After is far longer.
+    LLM_MAX_WAIT_S: float = 60.0
+    # Wall-time budget for a scan's LLM stage; units whose call can't start in
+    # time are listed as not reviewed (reason "time_budget"). The Action polls
+    # for 15 minutes in total.
+    LLM_SCAN_MAX_WALL_S: float = 480.0
 
     # Service URLs (for production)
     DATABASE_URL: str | None = None

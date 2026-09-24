@@ -12,8 +12,12 @@ models rate-limit per model, so the second model is a genuine fallback, not a
 redundant one; OpenRouter's free models also share an upstream pool (429
 "upstream_provider_shared_pool"), hence the cross-provider step.
 
+Calls are paced per model by estimated tokens per minute (``TokenPacer``,
+settings.LLM_TPM_LIMITS: Groq's free tier allows ~8K tokens/min per model).
 A transient failure (429 / 5xx / timeout) is retried on the SAME client up to
-settings.LLM_RETRIES times with backoff, then falls through to the next client; a
+settings.LLM_RETRIES times after its Retry-After (else a short backoff); a wait
+over settings.LLM_MAX_WAIT_S, or past the caller's deadline, skips to the next
+client instead. Then it falls through to the next client; a
 bad-output failure (malformed/empty response, unparseable JSON) or a non-retriable
 HTTP error (e.g. 404 for a retired model, 401) skips straight to the next client.
 HTTP 402 (insufficient credits) is account-wide: no retry, and the provider's
@@ -32,8 +36,10 @@ a missing key raises at construction (fail-fast at startup), never a silent mock
 """
 import asyncio
 import json
+import math
 import random
 import re
+import time
 
 import httpx
 from loguru import logger
@@ -101,9 +107,13 @@ class LLMError(Exception):
     credits): the router then skips the provider's remaining models as well.
     """
 
-    def __init__(self, message: str, provider_wide: bool = False):
+    def __init__(self, message: str, provider_wide: bool = False,
+                 deadline_exceeded: bool = False):
         super().__init__(message)
         self.provider_wide = provider_wide
+        # Some client was skipped because its rate budget would outlast the
+        # caller's deadline (the scan's LLM time budget), not because it failed.
+        self.deadline_exceeded = deadline_exceeded
 
 
 class _Retriable(Exception):
@@ -322,9 +332,89 @@ class LLMClient:
         return content
 
 
+def estimate_tokens(text: str) -> int:
+    """Same estimate as review_plan.estimate_tokens: chars / 4 x 1.25."""
+    return math.ceil(len(text or "") / 4 * 1.25)
+
+
+PACE_OK = "ok"
+PACE_DEADLINE = "deadline"
+PACE_TOO_LONG = "too_long"
+
+
+class TokenPacer:
+    """Per-model tokens-per-minute budget for LLM calls (ROADMAP: Groq's free
+    tier allows ~8K tokens/min per model, and a scan makes up to
+    LLM_MAX_CALLS_PER_SCAN ~6K-token calls back to back).
+
+    Each call reserves its estimated tokens on its client's key (the
+    "<provider>:<model>" label) in a 60 s sliding window; the limit is
+    ``limits[label]``, else ``limits[provider]`` (None / missing = unlimited).
+    Reservations are made before waiting and in FIFO order, so concurrent scans
+    sharing the router can't both take the same room. ``block`` makes a key
+    wait (Retry-After, retry backoff). ``clock`` / ``sleep`` are injectable
+    (tests use a fake clock); ``sleep`` defaults to ``asyncio.sleep`` looked up
+    at call time.
+    """
+
+    WINDOW_S = 60.0
+
+    def __init__(self, limits: dict | None = None, clock=time.monotonic, sleep=None):
+        self.limits = dict(limits or {})
+        self.clock = clock
+        self._sleep = sleep
+        self._reserved: dict[str, list[tuple[float, int]]] = {}
+        self._blocked_until: dict[str, float] = {}
+
+    def limit_for(self, key: str, provider: str) -> int | None:
+        limit = self.limits.get(key, self.limits.get(provider))
+        return int(limit) if limit else None
+
+    def block(self, key: str, seconds: float) -> None:
+        """No call on ``key`` starts before ``seconds`` from now."""
+        until = self.clock() + max(float(seconds), 0.0)
+        self._blocked_until[key] = max(self._blocked_until.get(key, 0.0), until)
+
+    def earliest_start(self, key: str, provider: str, tokens: int, now: float) -> float:
+        reserved = self._reserved.setdefault(key, [])
+        reserved[:] = [(t, n) for t, n in reserved if t > now - self.WINDOW_S]
+        start = max(now, self._blocked_until.get(key, 0.0))
+        limit = self.limit_for(key, provider)
+        if not limit:
+            return start
+        if reserved:
+            start = max(start, reserved[-1][0])  # FIFO
+        while True:
+            window = [(t, n) for t, n in reserved if t > start - self.WINDOW_S]
+            if not window or sum(n for _, n in window) + tokens <= limit:
+                return start
+            start = window[0][0] + self.WINDOW_S  # when the oldest one leaves
+
+    async def acquire(
+        self, key: str, provider: str, tokens: int, *,
+        deadline: float | None = None, max_wait: float | None = None,
+    ) -> str:
+        """Reserve ``tokens`` on ``key`` and wait until they may be used.
+        Returns PACE_OK, or (without reserving or waiting) PACE_DEADLINE when
+        the call couldn't start before ``deadline``, PACE_TOO_LONG when the
+        wait would exceed ``max_wait``."""
+        now = self.clock()
+        start = self.earliest_start(key, provider, tokens, now)
+        if deadline is not None and start > deadline:
+            return PACE_DEADLINE
+        if max_wait is not None and start - now > max_wait:
+            return PACE_TOO_LONG
+        if self.limit_for(key, provider):
+            self._reserved[key].append((start, tokens))
+        if start > now:
+            await (self._sleep or asyncio.sleep)(start - now)
+        return PACE_OK
+
+
 class LLMRouter:
-    def __init__(self):
+    def __init__(self, pacer: TokenPacer | None = None):
         self.mock = settings.LLM_PROVIDER == "mock"
+        self.pacer = pacer or TokenPacer(settings.LLM_TPM_LIMITS)
         self.clients: list[LLMClient] = []
         if not self.mock:
             # Primary must be fully configured (fail fast). The fallback is
@@ -358,16 +448,36 @@ class LLMRouter:
             clients.append(LLMClient(provider, model=fb_model))
         return clients
 
-    async def generate(self, system: str, user: str) -> tuple[dict, str]:
+    @property
+    def clock(self):
+        """The pacer's monotonic clock (scan deadlines are measured on it)."""
+        return self.pacer.clock
+
+    async def generate(
+        self, system: str, user: str, *, deadline: float | None = None
+    ) -> tuple[dict, str]:
         """Return (parsed_json, provider_used). Raises LLMError if all fail.
 
         provider_used is the answering client's "<provider>:<model>" label
         (e.g. "groq:qwen/qwen3.8-27b"), or "mock" in mock mode.
+
+        Every attempt first takes its estimated tokens (prompt + an output
+        allowance) from the client's per-minute budget (``self.pacer``), waiting
+        if needed; a wait longer than LLM_MAX_WAIT_S, or one that would end
+        after ``deadline`` (a ``self.clock`` time), skips to the next client
+        instead. Retry-After (and backoff) waits go through the same pacer, so
+        a rate-limited model is also avoided by later calls. If every client is
+        skipped or fails and at least one was skipped for ``deadline``, the
+        LLMError has ``deadline_exceeded`` set.
         """
         if self.mock:
             return MOCK_RESPONSE, "mock"
 
+        tokens = estimate_tokens(system) + estimate_tokens(user) + (
+            settings.LLM_OUTPUT_TOKENS_ESTIMATE
+        )
         last_error: Exception | None = None
+        deadline_hit = False
         dead_providers: set[str] = set()  # account-level failure (HTTP 402)
         for client in self.clients:
             if client.provider in dead_providers:
@@ -380,23 +490,37 @@ class LLMRouter:
             # retries of a transient failure. LLM_RETRIES=0 -> exactly today's
             # behavior (one try, immediate fallthrough on any failure).
             for attempt in range(settings.LLM_RETRIES + 1):
+                slot = await self.pacer.acquire(
+                    client.label, client.provider, tokens,
+                    deadline=deadline, max_wait=settings.LLM_MAX_WAIT_S,
+                )
+                if slot != PACE_OK:
+                    deadline_hit = deadline_hit or slot == PACE_DEADLINE
+                    why = ("would end after the scan's LLM time budget"
+                           if slot == PACE_DEADLINE else
+                           f"needs a wait over LLM_MAX_WAIT_S={settings.LLM_MAX_WAIT_S:g}s")
+                    logger.warning("Skipping LLM client {}: rate budget {}.", client.label, why)
+                    last_error = last_error or LLMError(f"{client.label}: rate budget {why}")
+                    break
                 try:
                     content = await client.complete(system, user)
                     return extract_json(content), client.label
                 except (_Retriable, httpx.TimeoutException, httpx.TransportError) as exc:
                     last_error = exc
                     transient = getattr(exc, "transient", True)
+                    retry_after = getattr(exc, "retry_after", None)
+                    if retry_after is not None:
+                        # Honoured for every later call to this model too.
+                        self.pacer.block(client.label, retry_after)
                     if transient and attempt < settings.LLM_RETRIES:
-                        retry_after = getattr(exc, "retry_after", None)
-                        backoff = 2 * 2**attempt + random.uniform(0, 0.5)
-                        wait = min(retry_after if retry_after is not None else backoff, 10.0)
+                        if retry_after is None:
+                            self.pacer.block(client.label,
+                                             min(2 * 2**attempt + random.uniform(0, 0.5), 10.0))
                         logger.warning(
-                            "LLM client {} attempt {} failed (retriable), retrying in "
-                            "{:.1f}s: {}",
-                            client.label, attempt + 1, wait, exc,
+                            "LLM client {} attempt {} failed (retriable), retrying: {}",
+                            client.label, attempt + 1, exc,
                         )
-                        await asyncio.sleep(wait)
-                        continue
+                        continue  # the next acquire() waits out the block
                     logger.warning("LLM client {} failed (retriable): {}", client.label, exc)
                     break
                 except json.JSONDecodeError as exc:
@@ -412,5 +536,6 @@ class LLMRouter:
                         dead_providers.add(client.provider)
                     break
         raise LLMError(
-            f"All LLM clients failed ({', '.join(c.label for c in self.clients)}): {last_error}"
+            f"All LLM clients failed ({', '.join(c.label for c in self.clients)}): {last_error}",
+            deadline_exceeded=deadline_hit,
         )

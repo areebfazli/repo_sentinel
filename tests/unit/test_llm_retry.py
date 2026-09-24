@@ -168,7 +168,7 @@ def test_malformed_json_no_retry_immediate_fallback(monkeypatch):
     assert sleeps == []
 
 
-def test_retry_after_header_capped_at_ten_seconds(monkeypatch):
+def test_retry_after_header_is_honoured_up_to_max_wait(monkeypatch):
     router = _setup_router(monkeypatch, retries=1)
     sleeps = _patch_sleep(monkeypatch)
 
@@ -182,7 +182,105 @@ def test_retry_after_header_capped_at_ten_seconds(monkeypatch):
 
     payload, provider = asyncio.run(router.generate("sys", "user"))
     assert provider == f"groq:{GROQ_PRIMARY}"
-    assert sleeps == [10.0]  # honoured but capped, not 60
+    assert sleeps == [pytest.approx(60.0, abs=0.5)]  # honoured in full (LLM_MAX_WAIT_S=60)
+
+
+def test_retry_after_beyond_max_wait_goes_to_the_next_client(monkeypatch):
+    router = _setup_router(monkeypatch, retries=1)
+    sleeps = _patch_sleep(monkeypatch)
+
+    script = _Script()
+    script.set(PRIMARY, [_FakeResp(429, {}, text="daily limit", headers={"Retry-After": "3600"})])
+    script.set(GEMINI, [_ok('{"findings": []}')])
+    _patch_script(monkeypatch, script)
+
+    _, provider = asyncio.run(router.generate("sys", "user"))
+    assert provider == f"gemini:{GEMINI_MODEL}"
+    assert sleeps == [] and script.call_count(PRIMARY) == 1
+    # The block is remembered: the next call skips the blocked model at once.
+    script.set(GEMINI, [_ok('{"findings": []}')])
+    _, provider = asyncio.run(router.generate("sys", "user"))
+    assert provider == f"gemini:{GEMINI_MODEL}" and script.call_count(PRIMARY) == 1
+
+
+# --- Per-model token pacing (fake clock) ---------------------------------------
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+
+    def __call__(self):
+        return self.now
+
+    async def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def test_token_pacer_sliding_window():
+    clock = FakeClock()
+    pacer = llm_client.TokenPacer({"groq": 8000, "openrouter": None}, clock=clock,
+                                  sleep=clock.sleep)
+
+    def take(key, provider, n, **kw):
+        return asyncio.run(pacer.acquire(key, provider, n, **kw))
+
+    assert take("groq:a", "groq", 6000) == llm_client.PACE_OK and clock.sleeps == []
+    assert take("groq:a", "groq", 1500) == llm_client.PACE_OK and clock.sleeps == []  # 7500
+    assert take("groq:a", "groq", 6000) == llm_client.PACE_OK
+    assert clock.sleeps == [60.0]  # both earlier calls had to leave the window
+    assert take("groq:b", "groq", 6000) == llm_client.PACE_OK  # own bucket per model
+    assert take("openrouter:x", "openrouter", 10**6) == llm_client.PACE_OK
+    assert clock.sleeps == [60.0]
+    # Budget / deadline checks don't reserve or wait.
+    assert take("groq:a", "groq", 6000, max_wait=30) == llm_client.PACE_TOO_LONG
+    assert take("groq:a", "groq", 6000, deadline=clock.now + 30) == llm_client.PACE_DEADLINE
+    assert clock.sleeps == [60.0]
+    assert take("groq:a", "groq", 6000, deadline=clock.now + 61) == llm_client.PACE_OK
+    assert clock.sleeps == [60.0, 60.0]
+    # A per-model limit overrides the provider's.
+    pacer.limits["groq:c"] = 1000
+    assert take("groq:c", "groq", 900) == llm_client.PACE_OK
+    assert take("groq:c", "groq", 900) == llm_client.PACE_OK and clock.sleeps[-1] == 60.0
+
+
+def test_router_paces_back_to_back_groq_calls(monkeypatch):
+    clock = FakeClock()
+    _setup_router(monkeypatch, retries=0)
+    monkeypatch.setattr(settings, "LLM_OUTPUT_TOKENS_ESTIMATE", 1500)
+    router = LLMRouter(pacer=llm_client.TokenPacer({"groq": 8000}, clock=clock,
+                                                   sleep=clock.sleep))
+    script = _Script()
+    script.set(PRIMARY, [_ok('{"findings": []}') for _ in range(3)])
+    _patch_script(monkeypatch, script)
+    prompt = "x" * 19000  # ~5.9K estimated tokens + 1.5K output allowance
+
+    for _ in range(3):
+        _, provider = asyncio.run(router.generate("sys", prompt))
+        assert provider == f"groq:{GROQ_PRIMARY}"
+    assert clock.sleeps == [60.0, 60.0]  # one ~7.5K-token call per minute
+
+
+def test_router_skips_clients_that_would_outlast_the_deadline(monkeypatch):
+    clock = FakeClock()
+    _setup_router(monkeypatch, retries=1)
+    router = LLMRouter(pacer=llm_client.TokenPacer({"groq": 8000, "gemini": 8000},
+                                                   clock=clock, sleep=clock.sleep))
+    script = _Script()
+    script.set(PRIMARY, [_ok('{"findings": []}')])
+    script.set(GEMINI, [])
+    _patch_script(monkeypatch, script)
+    prompt = "x" * 19000
+
+    asyncio.run(router.generate("sys", prompt, deadline=clock.now + 300))
+    # Groq and Gemini would both need a ~60 s wait; the deadline is 10 s away.
+    router.pacer.block(f"gemini:{GEMINI_MODEL}", 120)
+    with pytest.raises(LLMError) as err:
+        asyncio.run(router.generate("sys", prompt, deadline=clock.now + 10))
+    assert err.value.deadline_exceeded is True
+    assert clock.sleeps == [] and script.call_count(PRIMARY) == 1
 
 
 def test_zero_retries_falls_through_immediately(monkeypatch):

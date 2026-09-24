@@ -6,6 +6,7 @@ result. Owns its own DB session (it runs outside the request lifecycle).
 import asyncio
 import hashlib
 import json
+import time
 from datetime import UTC, datetime
 from functools import lru_cache
 
@@ -332,28 +333,37 @@ async def _review_batches(
     batches: list[list[dict]], router, row_snaps: list[dict], report_findings: list[dict],
     not_reviewed: list[dict],
 ) -> tuple[list[str], int]:
-    """One LLM call per batch, sequentially (free tiers rate-limit per minute).
-    Appends each batch's anchored findings to ``report_findings``. A failed
-    call's units join ``not_reviewed`` (reason "llm_error"); if every call
-    fails the error propagates and the scan fails, as before batching.
+    """One LLM call per batch, sequentially (free tiers rate-limit per minute;
+    the router paces calls by tokens per model). Appends each batch's anchored
+    findings to ``report_findings``. The whole stage gets LLM_SCAN_MAX_WALL_S:
+    a batch whose call can't start in time is not sent, and its units join
+    ``not_reviewed`` with reason "time_budget"; a failed call's units get
+    "llm_error". If every call fails the error propagates and the scan fails.
     Returns (distinct provider labels that answered, calls made)."""
     providers: list[str] = []
     last_error: Exception | None = None
-    failed = 0
+    failed = calls = 0
+    clock = getattr(router, "clock", time.monotonic)
+    deadline = clock() + settings.LLM_SCAN_MAX_WALL_S
     for batch in batches:
+        if clock() >= deadline:
+            not_reviewed.extend({**u, "not_reviewed_reason": "time_budget"} for u in batch)
+            continue
         assign_uids(batch)
         # Allowlist = the ids this prompt actually showed (per-unit caps apply).
         allowed_cves = {c.get("cve_id") for u in batch for c in u["cves"] if c.get("cve_id")}
         allowed_prs = {str(t.get("pr_id")) for u in batch for t in u["team"] if t.get("pr_id")}
+        calls += 1
         try:
             llm_json, provider = await router.generate(
-                SYSTEM_PROMPT, build_user_prompt(batch, new_nonce())
+                SYSTEM_PROMPT, build_user_prompt(batch, new_nonce()), deadline=deadline
             )
         except LLMError as exc:
             logger.warning("LLM review call failed for {} unit(s): {}", len(batch), exc)
             last_error = exc
             failed += 1
-            not_reviewed.extend({**u, "not_reviewed_reason": "llm_error"} for u in batch)
+            reason = "time_budget" if getattr(exc, "deadline_exceeded", False) else "llm_error"
+            not_reviewed.extend({**u, "not_reviewed_reason": reason} for u in batch)
             continue
         if provider not in providers:
             providers.append(provider)
@@ -362,13 +372,14 @@ async def _review_batches(
         report_findings += _build_report_findings(
             validated, {u["uid"]: u for u in batch}, row_snaps
         )
-    if batches and failed == len(batches):
+    if calls and failed == calls:
         raise last_error
-    return providers, len(batches)
+    return providers, calls
 
 
 def _count_failed(not_reviewed: list[dict]) -> int:
-    return sum(u["not_reviewed_reason"] == "llm_error" for u in not_reviewed)
+    """Units that were in a planned batch but didn't get reviewed."""
+    return sum(u["not_reviewed_reason"] in ("llm_error", "time_budget") for u in not_reviewed)
 
 
 def _unit_label(u: dict) -> str:
@@ -390,6 +401,8 @@ def _coverage_notes(batches: list[list[dict]], not_reviewed: list[dict]) -> list
                    f"~{settings.LLM_MAX_PROMPT_TOKENS} tokens"),
         ("too_large", "too large for one prompt"),
         ("llm_error", "LLM call failed"),
+        ("time_budget", f"LLM time budget of {settings.LLM_SCAN_MAX_WALL_S:g}s ran out, "
+                        "provider rate limits"),
     ):
         units = [u for u in not_reviewed if u["not_reviewed_reason"] == reason]
         if units:

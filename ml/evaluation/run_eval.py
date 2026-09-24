@@ -94,7 +94,7 @@ from backend.app.core.cve_retriever import passes_twin_margin  # noqa: E402
 from backend.app.core.embedder import Embedder  # noqa: E402
 from backend.app.core.embedding_cache import EmbeddingCache  # noqa: E402
 from backend.app.core.evidence import semgrep_evidence  # noqa: E402
-from backend.app.core.llm_client import LLMRouter  # noqa: E402
+from backend.app.core.llm_client import LLMRouter, TokenPacer  # noqa: E402
 from backend.app.core.reranker import Reranker  # noqa: E402
 from backend.app.core.review_plan import (  # noqa: E402
     assign_uids,
@@ -1446,7 +1446,10 @@ def parse_args(argv=None) -> argparse.Namespace:
 def build_llm_router(primary_only: bool = False) -> LLMRouter:
     """The production router (fails fast on a missing key), optionally trimmed
     to its primary client."""
-    router = LLMRouter()
+    # No per-minute token pacing in the router: the eval paces its own calls
+    # (--llm-sleep / --llm-tpm), and pacing twice would double every wait.
+    # Retry-After is still honoured.
+    router = LLMRouter(pacer=TokenPacer({}))
     if primary_only and not router.mock:
         router.clients = router.clients[:1]
     return router

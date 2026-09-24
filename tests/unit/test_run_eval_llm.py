@@ -57,7 +57,7 @@ class StubRouter:
         self._respond = respond
         self.calls: list[tuple[str, str]] = []
 
-    async def generate(self, system, user):
+    async def generate(self, system, user, **kwargs):
         self.calls.append((system, user))
         return self._respond(user), self.clients[0].label
 

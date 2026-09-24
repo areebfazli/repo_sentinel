@@ -143,7 +143,8 @@ class GuardDiffOut(BaseModel):
 
 class UnitNotReviewed(BaseModel):
     """An analysis unit the LLM did not review: ``reason`` is "budget" (beyond
-    LLM_MAX_CALLS_PER_SCAN prompts), "too_large" or "llm_error"."""
+    LLM_MAX_CALLS_PER_SCAN prompts), "too_large", "llm_error" or "time_budget"
+    (LLM_SCAN_MAX_WALL_S ran out, e.g. waiting on provider rate limits)."""
 
     file_path: str | None = None
     function_name: str | None = None

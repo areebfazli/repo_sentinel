@@ -152,7 +152,7 @@ class CapturingRouter:
     def __init__(self):
         self.prompts = []
 
-    async def generate(self, system, user):
+    async def generate(self, system, user, **kwargs):
         self.prompts.append(user)
         return {"findings": []}, "groq:stub"
 

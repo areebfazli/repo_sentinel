@@ -69,7 +69,7 @@ class NoFindingsRouter:
 
     mock = False
 
-    async def generate(self, system, user):
+    async def generate(self, system, user, **kwargs):
         return {"findings": []}, "stub"
 
 

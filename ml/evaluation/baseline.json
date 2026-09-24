@@ -4,15 +4,34 @@
   "sim_threshold_cve": 0.25,
   "sim_threshold_team": 0.25,
   "rerank_threshold": 0.0,
+  "twin_margin_min": null,
   "precision": 0.5,
   "recall": 1.0,
   "f1": 0.6667,
-  "category_hit_rate": 0.96,
-  "dataset_sha256": "54e6f6b3c2cf8620a455788aa8aee7ca78366827e07f936eeff4b9fb11e7023a",
-  "n": 50,
+  "category_hit_rate": 0.4313,
+  "twin_coverage": 0.9765,
+  "dataset_sha256": "df0b73af1da5c1e4df7e3b1abee2d024406e577037bd014ccf972c56bf40f36d",
+  "datasets": [
+    "ml/evaluation/datasets/detection_eval.jsonl",
+    "ml/evaluation/datasets/detection_eval_osv_pypi.jsonl",
+    "ml/evaluation/datasets/detection_eval_osv_npm.jsonl"
+  ],
+  "n": 1062,
   "best_operating_point": {
     "sim_threshold": 0.2,
     "rerank_threshold": 0.0,
+    "margin_threshold": null,
     "f1": 0.6667
+  },
+  "reranker": null,
+  "sample": null,
+  "seed": null,
+  "timing": {
+    "n_items": 1062,
+    "total_seconds": 22.1605,
+    "seconds_per_item": 0.0209,
+    "embed_seconds": 1.9766,
+    "ann_seconds": 20.1605,
+    "rerank_seconds": 0.0
   }
 }

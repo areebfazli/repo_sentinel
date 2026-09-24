@@ -3,7 +3,8 @@ from typing import Any
 from backend.app.config import settings
 from backend.app.core import feedback_store
 from backend.app.core.embedder import Embedder
-from backend.app.core.reranker import Reranker
+from backend.app.core.reranker import Reranker, rank_candidates
+from backend.app.core.scoring import relevance
 from backend.app.core.sparse_encoder import encode as sparse_encode
 from backend.app.core.vector_store import VectorStore
 
@@ -19,15 +20,19 @@ def passes_twin_margin(match: dict[str, Any], margin_min: float | None) -> bool:
 
 
 class CVERetriever:
-    def __init__(self, embedder: Embedder, vector_store: VectorStore, reranker: Reranker):
+    def __init__(
+        self, embedder: Embedder, vector_store: VectorStore, reranker: Reranker | None
+    ):
+        """``reranker`` is None when RERANKER_ENABLED is off: candidates keep
+        similarity order (see ``rank_candidates``)."""
         self.embedder = embedder
         self.vector_store = vector_store
         self.reranker = reranker
 
     @staticmethod
     def base_score(match: dict[str, Any]) -> float:
-        """Pre-feedback CVE score — just the rerank probability."""
-        return match.get("rerank_prob", 0.0)
+        """Pre-feedback CVE score: rerank_prob, or similarity without a reranker."""
+        return relevance(match)
 
     def rerank_candidates(
         self,
@@ -37,9 +42,9 @@ class CVERetriever:
         query_vector: list[float] | None = None,
     ) -> list[dict[str, Any]]:
         """ANN top-N -> similarity gate -> twin-margin gate -> code-to-code
-        rerank, WITHOUT feedback.
+        rerank (similarity order when the reranker is off), WITHOUT feedback.
 
-        Returns reranked candidates (ordered, not truncated). Split out from
+        Returns ordered candidates (not truncated). Split out from
         ``find_vulnerabilities`` so files mode can gather candidates across all
         units, fetch feedback votes once, and finalize in a batch.
         """
@@ -76,10 +81,13 @@ class CVERetriever:
 
         # Rerank against the stored vulnerable code (code-to-code), not the
         # English description.
-        for match in viable_matches:
-            match["rerank_text"] = match.get("vulnerable_code") or match.get("description", "")
+        if self.reranker is not None:
+            for match in viable_matches:
+                match["rerank_text"] = (
+                    match.get("vulnerable_code") or match.get("description", "")
+                )
 
-        return self.reranker.rerank(code_snippet, viable_matches, top_k=len(viable_matches))
+        return rank_candidates(self.reranker, code_snippet, viable_matches)
 
     def find_vulnerabilities(
         self,
@@ -93,7 +101,7 @@ class CVERetriever:
 
         High recall (ANN top-N, optionally language-filtered) -> similarity gate ->
         twin-margin gate -> cross-encoder rerank code-against-code ->
-        rerank-probability gate. All
+        rerank-probability gate (the last two only when RERANKER_ENABLED). All
         thresholds default to settings (single source of truth). ``query_vector``
         lets callers pass a precomputed embedding (files mode batches embedding).
         """
@@ -106,8 +114,10 @@ class CVERetriever:
 
 # Simple CLI test runner if executed directly
 if __name__ == "__main__":
-    print("Initializing components (this will load the embedder + MS-MARCO CrossEncoder)...")
-    retriever = CVERetriever(Embedder(), VectorStore(), Reranker())
+    print("Initializing components (embedder, plus the cross-encoder if RERANKER_ENABLED)...")
+    retriever = CVERetriever(
+        Embedder(), VectorStore(), Reranker() if settings.RERANKER_ENABLED else None
+    )
 
     # A piece of code written by a hypothetical developer that we are reviewing
     test_code = """
@@ -130,7 +140,8 @@ def delete_user_account(db, user_id):
             print(f"Severity: {finding['severity']}/10.0")
             print(f"Description: {finding['description']}")
             print(f"Base Vector Score: {finding.get('similarity_score', 0.0):.4f}")
-            print(f"Reranker Confidence: {finding.get('rerank_prob', 0.0):.4f}")
+            prob = finding.get("rerank_prob")
+            print(f"Reranker Confidence: {'n/a (reranker off)' if prob is None else f'{prob:.4f}'}")
             margin = finding.get("twin_margin")
             print(f"Twin Margin: {'n/a (no fix stored)' if margin is None else f'{margin:+.4f}'}")
     else:

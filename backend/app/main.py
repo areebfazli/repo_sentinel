@@ -21,6 +21,7 @@ _recovered_scan_ids: set[str] = set()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Booting RepoSentinel API Worker...")
+    logger.info("Reranker: {}", _reranker_status())
     init_db()
     # Construct the LLM router eagerly so a missing provider key fails fast at
     # boot (cheap; no model load) rather than on the first scan.
@@ -37,6 +38,14 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("Shutting down...")
     await _cancel_recovery_tasks()
+
+
+def _reranker_status() -> str:
+    if settings.RERANKER_ENABLED:
+        return (
+            f"enabled ({settings.RERANKER_MODEL}, max_tokens={settings.RERANKER_MAX_TOKENS})"
+        )
+    return "disabled (RERANKER_ENABLED=false; candidates ranked by similarity)"
 
 
 async def recover_orphaned_scans() -> list[asyncio.Task]:
@@ -132,7 +141,11 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     def health_check():
-        return {"status": "ok", "environment": settings.ENVIRONMENT}
+        return {
+            "status": "ok",
+            "environment": settings.ENVIRONMENT,
+            "reranker_enabled": settings.RERANKER_ENABLED,
+        }
 
     return app
 

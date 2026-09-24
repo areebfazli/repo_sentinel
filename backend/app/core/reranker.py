@@ -73,3 +73,22 @@ class Reranker:
 
         reranked = sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
         return reranked[:top_k]
+
+
+def rank_candidates(
+    reranker: Reranker | None, query_code: str, candidates: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Order a retriever's gated candidates, best first (none dropped).
+
+    With a reranker (RERANKER_ENABLED): cross-encoder scores, attaching
+    ``rerank_score``/``rerank_prob``. Without one: no score is fabricated —
+    ``rerank_prob`` stays absent (``scoring.relevance`` then falls back to
+    ``similarity_score`` and RERANK_THRESHOLD is not applied). Dense mode sorts
+    by cosine ``similarity_score``; hybrid mode keeps the ANN order, since there
+    ``similarity_score`` is Qdrant's RRF fusion score, which already ranks it.
+    """
+    if reranker is not None:
+        return reranker.rerank(query_code, candidates, top_k=len(candidates))
+    if settings.HYBRID_ENABLED:
+        return list(candidates)
+    return sorted(candidates, key=lambda c: c.get("similarity_score", 0.0), reverse=True)

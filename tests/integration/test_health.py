@@ -14,3 +14,6 @@ def test_health_endpoint():
         body = resp.json()
         assert body["status"] == "ok"
         assert body["environment"] == "development"
+        from backend.app.config import settings
+
+        assert body["reranker_enabled"] is settings.RERANKER_ENABLED

@@ -185,10 +185,17 @@ def test_build_components_no_rerank_never_constructs_reranker(monkeypatch):
 
     monkeypatch.setattr(run_eval, "Reranker", _boom)
     assert run_eval.build_components(no_rerank=True) == ("embedder", "store", None)
+    # Default follows RERANKER_ENABLED (off): still never constructed.
+    monkeypatch.setattr(run_eval.settings, "RERANKER_ENABLED", False)
+    assert run_eval.build_components() == ("embedder", "store", None)
 
     monkeypatch.setattr(run_eval, "Reranker", _Tracking)
-    _, _, reranker = run_eval.build_components()
+    _, _, reranker = run_eval.build_components(no_rerank=False)
     assert isinstance(reranker, _Tracking) and len(built) == 1
+    # ...and with the setting on, the default builds one.
+    monkeypatch.setattr(run_eval.settings, "RERANKER_ENABLED", True)
+    _, _, reranker = run_eval.build_components()
+    assert isinstance(reranker, _Tracking) and len(built) == 2
 
 
 def test_reranker_overrides_are_passed_through(monkeypatch):
@@ -200,13 +207,15 @@ def test_reranker_overrides_are_passed_through(monkeypatch):
     monkeypatch.setattr(run_eval, "EmbeddingCache", lambda: None)
     monkeypatch.setattr(run_eval, "VectorStore", lambda: "store")
     monkeypatch.setattr(run_eval, "Reranker", lambda **kw: captured.append(kw) or "rr")
+    monkeypatch.setattr(settings, "RERANKER_ENABLED", False)
 
+    # An override implies a reranker even with RERANKER_ENABLED off.
     run_eval.build_components(reranker_model="BAAI/bge-reranker-base", reranker_max_tokens=512)
-    run_eval.build_components(reranker_max_tokens=512)
-    run_eval.build_components()
+    run_eval.build_components(reranker_max_tokens=128)
+    run_eval.build_components(no_rerank=False)
     assert captured == [
         {"model_name": "BAAI/bge-reranker-base", "max_tokens": 512},
-        {"model_name": before[0], "max_tokens": 512},
+        {"model_name": before[0], "max_tokens": 128},
         {"model_name": before[0], "max_tokens": before[1]},
     ]
     # What output JSON records matches what was constructed.
@@ -214,6 +223,7 @@ def test_reranker_overrides_are_passed_through(monkeypatch):
         "model": "BAAI/bge-reranker-base", "max_tokens": 512,
     }
     assert run_eval.reranker_config(True) is None
+    assert run_eval.reranker_config() is None  # follows RERANKER_ENABLED (off)
     # Overrides go through constructor args; the settings singleton is untouched.
     assert (settings.RERANKER_MODEL, settings.RERANKER_MAX_TOKENS) == before
 
@@ -259,18 +269,82 @@ def test_write_baseline_with_sample_is_refused(capsys):
     assert "--write-baseline cannot be combined with --sample" in capsys.readouterr().err
 
 
-def test_no_rerank_arg_validation(capsys):
+def test_no_rerank_arg_validation(capsys, monkeypatch):
+    monkeypatch.setattr(run_eval.settings, "RERANKER_ENABLED", False)
     args = run_eval.parse_args(["--no-rerank"])
     assert args.no_rerank and args.rerank_sweep is None
-    assert run_eval.parse_args([]).rerank_sweep == run_eval.DEFAULT_RERANK_SWEEP
+    assert run_eval.parse_args(["--rerank"]).rerank_sweep == run_eval.DEFAULT_RERANK_SWEEP
     for bad in (
         ["--no-rerank", "--rerank-sweep", "0.0:0.5:0.1"],
         ["--no-rerank", "--reranker-model", "BAAI/bge-reranker-base"],
         ["--no-rerank", "--reranker-max-tokens", "512"],
+        ["--no-rerank", "--rerank"],
     ):
         with pytest.raises(SystemExit):
             run_eval.parse_args(bad)
     assert "--no-rerank" in capsys.readouterr().err
+    # With the setting off, a rerank sweep needs an explicit --rerank.
+    with pytest.raises(SystemExit):
+        run_eval.parse_args(["--rerank-sweep", "0.0:0.5:0.1"])
+    assert "--rerank" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("enabled", "argv", "expect_rerank"),
+    [
+        (False, [], False),
+        (True, [], True),
+        (False, ["--rerank"], True),
+        (True, ["--no-rerank"], False),
+        (False, ["--reranker-model", "BAAI/bge-reranker-base"], True),
+        (False, ["--reranker-max-tokens", "256"], True),
+    ],
+)
+def test_default_reranker_follows_setting(monkeypatch, enabled, argv, expect_rerank):
+    monkeypatch.setattr(run_eval.settings, "RERANKER_ENABLED", enabled)
+    args = run_eval.parse_args(argv)
+    assert args.no_rerank is (not expect_rerank)
+    assert (args.rerank_sweep == run_eval.DEFAULT_RERANK_SWEEP) is expect_rerank
+    cfg = run_eval.reranker_config(
+        args.no_rerank, args.reranker_model, args.reranker_max_tokens
+    )
+    assert (cfg is not None) is expect_rerank
+
+
+def test_default_sim_sweep_contains_operating_point():
+    from backend.app.config import settings
+
+    args = run_eval.parse_args([])
+    assert args.sim_sweep == run_eval.DEFAULT_SIM_SWEEP
+    values = run_eval.frange(args.sim_sweep)
+    assert 0.25 in values
+    assert settings.SIM_THRESHOLD_CVE in values
+
+
+def test_main_sweep_always_includes_operating_point(tmp_path, monkeypatch):
+    ds = tmp_path / "ds.jsonl"
+    _write_jsonl(ds, [_ds_item("x_vuln", "vulnerable", "a")])
+    monkeypatch.setattr(
+        run_eval, "build_components",
+        lambda *a, **k: (StubEmbedder(), StubVectorStore({"a": [_raw("C", "sqli", 0.9)]}), None),
+    )
+    out = tmp_path / "out.json"
+    run_eval.main(["--dataset", str(ds), "--out", str(out), "--sim-sweep", "0.6:0.8:0.1"])
+    sims = {r["sim_threshold"] for r in json.loads(out.read_text())["sweep"]}
+    assert run_eval.settings.SIM_THRESHOLD_CVE in sims and 0.6 in sims
+
+
+def test_evaluate_ignores_rerank_threshold_without_reranker(tmp_path, monkeypatch):
+    # RERANK_THRESHOLD gates cross-encoder probabilities; without a reranker
+    # rerank_prob is the similarity, so applying it would be a second sim gate.
+    ds = tmp_path / "ds.jsonl"
+    _write_jsonl(ds, [_ds_item("x_vuln", "vulnerable", "a")])
+    store = StubVectorStore({"a": [_raw("C", "sqli", 0.4)]})
+    monkeypatch.setattr(run_eval.settings, "SIM_THRESHOLD_CVE", 0.25)
+    monkeypatch.setattr(run_eval.settings, "RERANK_THRESHOLD", 0.9)
+    m = run_eval.evaluate(StubEmbedder(), store, None, dataset_path=ds, margin_t=None)
+    assert m["rerank_threshold"] == run_eval.NO_RERANK_THRESHOLD
+    assert m["tp"] == 1
 
 
 def test_gather_reports_timing(capsys):

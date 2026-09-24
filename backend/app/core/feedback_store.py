@@ -42,8 +42,12 @@ def finalize_matches(
 ) -> list[dict]:
     """Apply feedback suppression + downweighting, gate, and sort by adjusted_score.
 
-    base_score(match) -> float is the pre-feedback score (rerank_prob for CVEs,
-    recency/seniority-weighted for Team Memory).
+    base_score(match) -> float is the pre-feedback score (``scoring.relevance``
+    for CVEs, recency/seniority-weighted relevance for Team Memory).
+
+    RERANK_THRESHOLD gates only matches a cross-encoder scored (``rerank_prob``
+    present); with the reranker off there is no probability to gate on, so it
+    is ignored.
 
     ``net_votes`` lets a caller pass a pre-fetched {point_id: net_vote} map so a
     batch of finalize calls (files mode, one per unit) shares a single DB query
@@ -57,7 +61,8 @@ def finalize_matches(
         vote = net.get(m.get("point_id", ""), 0)
         if vote <= settings.FEEDBACK_SUPPRESS_NET:
             continue  # team has repeatedly rejected this memory
-        if m.get("rerank_prob", 0.0) < settings.RERANK_THRESHOLD:
+        prob = m.get("rerank_prob")
+        if prob is not None and prob < settings.RERANK_THRESHOLD:
             continue
         m["adjusted_score"] = base_score(m) * feedback_multiplier(vote, settings)
         kept.append(m)

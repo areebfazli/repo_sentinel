@@ -19,6 +19,7 @@ from backend.app.core.markdown_renderer import (
     severity_from_cvss,
     validate_findings,
 )
+from backend.app.core.scoring import relevance
 from backend.app.db.models import Finding, Scan
 from backend.app.db.session import SessionLocal
 
@@ -52,6 +53,25 @@ def reset_scan_semaphore() -> None:
     _semaphore_loop = None
 
 
+def _score_columns(match: dict) -> dict:
+    """Score columns for a Finding row.
+
+    With the reranker off (RERANKER_ENABLED=false) a match carries no
+    rerank_score/rerank_prob. The columns are NOT NULL (create_all, no
+    migrations), so they get a 0.0 placeholder and payload_json records
+    ``"reranked": false`` — ``_finding_out`` then reports rerank_prob as None
+    rather than a fake "0% relevant". adjusted_score is always set by
+    finalize_matches (relevance-based either way).
+    """
+    reranked = match.get("rerank_prob") is not None
+    return {
+        "similarity_score": float(match.get("similarity_score", 0.0)),
+        "rerank_score": float(match.get("rerank_score") or 0.0) if reranked else 0.0,
+        "rerank_prob": float(match["rerank_prob"]) if reranked else 0.0,
+        "adjusted_score": float(match.get("adjusted_score", relevance(match))),
+    }
+
+
 def _persist_findings(session, scan_id: str, raw: dict) -> list[Finding]:
     """Create a Finding row per retrieved match (CVE + team)."""
     rows: list[Finding] = []
@@ -70,17 +90,19 @@ def _persist_findings(session, scan_id: str, raw: dict) -> list[Finding]:
                 start_line=match.get("anchor_start_line"),
                 end_line=match.get("anchor_end_line"),
                 function_name=match.get("anchor_function_name"),
-                similarity_score=float(match.get("similarity_score", 0.0)),
-                rerank_score=float(match.get("rerank_score", 0.0)),
-                rerank_prob=float(match.get("rerank_prob", 0.0)),
-                adjusted_score=float(match.get("adjusted_score", match.get("rerank_prob", 0.0))),
+                **_score_columns(match),
                 # Twin scores live in payload_json rather than new columns: tables
                 # are made by create_all (no migrations), which would not add
                 # columns to an existing findings table.
                 payload_json=json.dumps(
                     {
-                        k: match.get(k)
-                        for k in ("category", "severity", "language", "sim_fixed", "twin_margin")
+                        **{
+                            k: match.get(k)
+                            for k in (
+                                "category", "severity", "language", "sim_fixed", "twin_margin",
+                            )
+                        },
+                        "reranked": match.get("rerank_prob") is not None,
                     }
                 ),
             )
@@ -99,11 +121,14 @@ def _persist_findings(session, scan_id: str, raw: dict) -> list[Finding]:
                 start_line=match.get("anchor_start_line"),
                 end_line=match.get("anchor_end_line"),
                 function_name=match.get("anchor_function_name"),
-                similarity_score=float(match.get("similarity_score", 0.0)),
-                rerank_score=float(match.get("rerank_score", 0.0)),
-                rerank_prob=float(match.get("rerank_prob", 0.0)),
-                adjusted_score=float(match.get("adjusted_score", match.get("rerank_prob", 0.0))),
-                payload_json=json.dumps({"author": match.get("author"), "url": match.get("url")}),
+                **_score_columns(match),
+                payload_json=json.dumps(
+                    {
+                        "author": match.get("author"),
+                        "url": match.get("url"),
+                        "reranked": match.get("rerank_prob") is not None,
+                    }
+                ),
             )
         )
 
@@ -125,7 +150,9 @@ def _finding_out(row: Finding) -> dict:
         "file_path": row.file_path,
         "start_line": row.start_line,
         "similarity_score": row.similarity_score,
-        "rerank_prob": row.rerank_prob,
+        # None when no cross-encoder scored it (reranker off); rows persisted
+        # before the flag existed were all reranked.
+        "rerank_prob": row.rerank_prob if payload.get("reranked", True) else None,
         "sim_fixed": payload.get("sim_fixed"),
         "twin_margin": payload.get("twin_margin"),
     }

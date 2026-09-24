@@ -44,5 +44,19 @@ def test_embedder_and_reranker_defaults():
     assert s.EMBEDDING_MAX_TOKENS == 2048
     assert s.EMBEDDING_TRUST_REMOTE_CODE is True
     assert s.RERANKER_MODEL == "BAAI/bge-reranker-v2-m3"
-    assert s.RERANKER_MAX_TOKENS == 1024
     assert s.RERANKER_BATCH_SIZE == 8
+
+
+def test_reranker_off_by_default(monkeypatch):
+    # ROADMAP 1d: no measured gain from the cross-encoder, so it is off by
+    # default; 512 tokens (best-measured, half the cost of 1024) when enabled.
+    monkeypatch.delenv("RERANKER_ENABLED", raising=False)
+    monkeypatch.delenv("RERANKER_MAX_TOKENS", raising=False)
+    s = Settings(_env_file=None)
+    assert s.RERANKER_ENABLED is False
+    assert s.RERANKER_MAX_TOKENS == 512
+
+
+def test_reranker_enabled_env_override(monkeypatch):
+    monkeypatch.setenv("RERANKER_ENABLED", "true")
+    assert Settings(_env_file=None).RERANKER_ENABLED is True

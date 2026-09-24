@@ -9,7 +9,7 @@ Decided 2026-09-22. Ordered by expected impact.
 3. Semgrep confirmatory signal (1f step 1)
 4. Prompt-injection hardening (3.2)
 5. SARIF upload (3.1) + suggestion blocks (3.3)
-6. Embedder swap to jina (1c) + reranker swap to bge (1d), evaluated on the bigger eval set
+6. Embedder swap to jina (1c) + reranker swap to bge (1d), evaluated on the bigger eval set — done; reranker then turned off by default (1d)
 7. Neural judge experiments (1f step 3) + confidence score (1f step 4)
 
 ## 1. Detection quality
@@ -31,13 +31,24 @@ Decided 2026-09-22. Ordered by expected impact.
 - Why over UniXcoder: a real embedding model (no self-pooled hidden states, so comments stop diluting the vector); no 512-token truncation; better code-to-code ranking (UniXcoder CoIR 37.3, weakest of the field).
 - Will NOT fix safe-vs-vulnerable twins; that is 1b.
 - Code changes: `vector_store.py:33` hardcodes `vector_size = 768` (make it a setting); `embedder.py:84` hardcodes `max_length=512` (make it `EMBEDDING_MAX_TOKENS`, ~2048); `trust_remote_code=True` in `AutoModel.from_pretrained`; pooling stays `mean`.
-- **Done 2026-09-22** (see 1d for the numbers). Embeds a function in ~70 ms on CPU; peak RSS with both models 3.6 GB.
+- **Done 2026-09-22** (see 1d for the numbers). Peak RSS with both models 3.6 GB. (The ~70 ms/function first quoted here was wrong for real functions: ~1.5 s, see section 2.)
 
-### 1d. Reranker — DECISION: BAAI/bge-reranker-v2-m3
+### 1d. Reranker — DECISION: BAAI/bge-reranker-v2-m3, off by default
 - 568M cross-encoder, Apache-2.0. Current ms-marco MiniLM (web-search trained) scores ~0 on every code pair, so the stage is a no-op.
 - Why over jina-reranker-v3: Jina rerankers are CC-BY-NC-4.0; v3 is listwise, so a pair's score changes with batch composition (https://huggingface.co/jinaai/jina-reranker-v3/discussions/2), which breaks a fixed `RERANK_THRESHOLD`. bge is pairwise, loads via `sentence_transformers.CrossEncoder` with no custom code, and has ONNX/int8 builds.
 - Use `max_length=1024`, batch 8–16; expect ~2.5–3 GB RAM and a few hundred ms per pair on CPU. Fallback if too heavy: bge-reranker-base (278M).
-- **Done 2026-09-22.** Eval (jina + bge, 50 items): recall 0.96 -> 1.0, F1 0.6575 -> 0.667, category hit rate 0.96; precision flat at 0.5 as expected. Thresholds unchanged (0.25 / 0.0); bge puts the right category on top 23/25 vs 19/25 from ANN. (Correction: the "0.50–0.73 on every code pair" probabilities were a double-sigmoid bug in `Reranker`, since fixed; true probabilities and any `RERANK_THRESHOLD` await a re-run of this eval.) Cost: 436 ms/pair on CPU, ~4.4 s per unit, 6x the embedder; first target for ONNX int8 (section 2). `transformers` pinned `<5` (jina's remote code uses the 4.x API).
+- **Result 2026-09-24: reranker OFF by default (`RERANKER_ENABLED=false`), kept available.** Overnight eval on the same 150 held-out items from the OSV eval set (sim 0.25):
+
+  | config | category hit | s/item |
+  |---|---|---|
+  | no reranker | 0.373 (28/75) | 0.05 |
+  | bge-reranker-v2-m3 @1024 | 0.387 (29/75) | 48.6 |
+  | bge-reranker-v2-m3 @512 | 0.413 (31/75) | 25.0 |
+  | bge-reranker-base @512 | 0.360 (27/75) | 7.2 |
+
+  All within noise (27–31 hits of 75). Rerank probability also doesn't separate vulnerable from fixed at any threshold (precision ≤ 0.5 at 0.1–0.9), so `RERANK_THRESHOLD` stays 0.0 and only applies when enabled. Full 1,062-item eval without the reranker (the new `baseline.json`, `"reranker": null`): P 0.5, R 1.0, F1 0.667, category hit 0.431. When off, the cross-encoder is never loaded (~3 GB RAM and its load time saved) and candidates keep similarity order. If enabled, use v2-m3 @512 (`RERANKER_MAX_TOKENS` default; best-measured and half the cost of 1024).
+- Revisit when a code-trained cross-encoder exists, or after fine-tuning one on our vulnerable/fixed pairs (1a/1b data). Untested speed options if it comes back: batch size 1 (no padding to the longest pair) and reranking only the top-N=5 ANN candidates instead of 10.
+- History: the first 50-item eval (2026-09-22) showed recall 0.96 -> 1.0 and the right category on top 23/25 vs 19/25 from ANN; the "0.50–0.73 on every code pair" probabilities were a double-sigmoid bug in `Reranker`, since fixed. `transformers` pinned `<5` (jina's remote code uses the 4.x API).
 
 ### 1e. Strip comments before embedding
 - Tree-sitter is already loaded. Commented SQLi embeds at ~0.30 vs ~0.70 clean.
@@ -54,7 +65,14 @@ Decided 2026-09-22. Ordered by expected impact.
 
 ## 2. Speed
 
-- ONNX int8 for embedder and reranker: ~2.7–3.4x faster at 94–98% quality.
+Measured on the dev box (8 cores, 11 GB RAM, CPU only), 2026-09-23/24:
+- jina embeds ~1.5 s per real function, not the ~70 ms quoted in 1c. With the reranker off (1d) the embedder is the whole model cost, so caching (embeddings, and findings per body hash below) matters most.
+- `EMBEDDING_MAX_TOKENS` 1024 instead of 2048 saves only 7%; keep 2048.
+- torch with 8 threads is 18% *slower* than 4.
+- ONNX int8 export ran out of RAM on 11 GB; needs a bigger box (or a pre-exported model) before it can be measured.
+
+Ideas:
+- ONNX int8 for the embedder (and the reranker, if re-enabled): ~2.7–3.4x faster at 94–98% quality (export OOMed here, see above).
 - Qdrant scalar quantization: 75% less memory, up to 60% faster, ~0.3% precision loss (https://qdrant.tech/articles/scalar-quantization/).
 - Cache findings per function-body hash, not only embeddings.
 - Stream inline comments per unit instead of after the whole scan.

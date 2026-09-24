@@ -7,11 +7,11 @@ candidates — so a full sweep costs one model pass, not one per threshold combo
 
 Run from the project root (stop the API first — local Qdrant is single-process):
 
-    python -m ml.evaluation.run_eval \
-        --sim-sweep 0.50:0.95:0.05 --rerank-sweep 0.0:0.9:0.1 --write-baseline
+    python -m ml.evaluation.run_eval --write-baseline \
+        --dataset ml/evaluation/datasets/detection_eval.jsonl <other.jsonl ...>
     python -m ml.evaluation.run_eval --margin-sweep -0.10:0.20:0.02 \
         --dataset ml/evaluation/datasets/detection_eval.jsonl <other.jsonl ...>
-    python -m ml.evaluation.run_eval --no-rerank --dataset <a.jsonl> <b.jsonl ...>
+    python -m ml.evaluation.run_eval --rerank --rerank-sweep 0.0:0.9:0.1 --dataset <a.jsonl>
     python -m ml.evaluation.run_eval --sample 150 --seed 42 \
         --reranker-model BAAI/bge-reranker-base --out ml/evaluation/results/base.json
 
@@ -24,15 +24,19 @@ rerank_prob >= rerank_t, predict "vulnerable" with that candidate's category.
 reranked after the similarity gate, before the margin gate) has a patched twin —
 the margin sweep only means something when it is well above zero.
 
-``--no-rerank`` skips the cross-encoder entirely (never loaded): candidates are
-ranked by similarity (rerank_prob := similarity_score) and the rerank sweep
-collapses to a no-op — fast retrieval-only metrics on the full set.
+The reranker follows ``settings.RERANKER_ENABLED`` (off by default, like the
+API): without it the cross-encoder is never loaded, candidates are ranked by
+similarity (rerank_prob := similarity_score) and the rerank sweep collapses to
+a no-op — fast retrieval-only metrics on the full set. ``--rerank`` (or a
+``--reranker-model``/``--reranker-max-tokens`` override) forces it on;
+``--no-rerank`` forces it off.
 ``--sample N --seed S`` evaluates a deterministic, label-balanced subsample that
 keeps OSV ``<prefix>_vuln``/``<prefix>_safe`` pairs together — for comparing
 configs quickly; it can never be written as the baseline.
 ``--reranker-model`` / ``--reranker-max-tokens`` override the settings for this
-run. Output JSON records the reranker actually used (null with --no-rerank),
-the sample/seed, and gather() timing (embed / ANN / rerank seconds).
+run. Output JSON (and baseline.json) records the reranker actually used (null
+when off), the sample/seed, and gather() timing (embed / ANN / rerank seconds).
+The sim sweep always includes the operating point (SIM_THRESHOLD_CVE).
 """
 import argparse
 import hashlib
@@ -56,7 +60,9 @@ DEFAULT_DATASET = BASE_DIR / "ml" / "evaluation" / "datasets" / "detection_eval.
 BASELINE_PATH = BASE_DIR / "ml" / "evaluation" / "baseline.json"
 RESULTS_DIR = BASE_DIR / "ml" / "evaluation" / "results"
 DEFAULT_RERANK_SWEEP = "0.0:0.9:0.1"
-# rerank_t used with --no-rerank: rerank_prob is the similarity score there, and
+# Starts below SIM_THRESHOLD_CVE (0.25) so the operating point is in the table.
+DEFAULT_SIM_SWEEP = "0.20:0.95:0.05"
+# rerank_t used without a reranker: rerank_prob is the similarity score there, and
 # every candidate that survives the similarity gate (sim_t >= 0) already has
 # similarity >= 0, so rerank_t = 0.0 is a no-op rather than a second sim gate.
 NO_RERANK_THRESHOLD = 0.0
@@ -105,14 +111,26 @@ def frange(spec: str) -> list[float]:
     return [round(start + i * step, 6) for i in range(n + 1)]
 
 
+def use_reranker(
+    no_rerank: bool | None = None, model: str | None = None, max_tokens: int | None = None
+) -> bool:
+    """Whether a run uses the cross-encoder. ``no_rerank`` True/False forces
+    off/on; None (the default) follows settings.RERANKER_ENABLED, except that a
+    model/max-tokens override implies on (it only means something with one)."""
+    if no_rerank is not None:
+        return not no_rerank
+    return settings.RERANKER_ENABLED or model is not None or max_tokens is not None
+
+
 def reranker_config(
-    no_rerank: bool = False, model: str | None = None, max_tokens: int | None = None
+    no_rerank: bool | None = None, model: str | None = None, max_tokens: int | None = None
 ) -> dict | None:
     """The reranker a run uses (overrides resolved against settings), or None.
 
     This is both what build_components() constructs and what output JSON records.
+    ``no_rerank`` semantics as in ``use_reranker``.
     """
-    if no_rerank:
+    if not use_reranker(no_rerank, model, max_tokens):
         return None
     return {
         "model": settings.RERANKER_MODEL if model is None else model,
@@ -121,11 +139,12 @@ def reranker_config(
 
 
 def build_components(
-    no_rerank: bool = False, reranker_model: str | None = None,
+    no_rerank: bool | None = None, reranker_model: str | None = None,
     reranker_max_tokens: int | None = None,
 ):
-    """(embedder, store, reranker). With ``no_rerank`` the reranker is None and
-    no cross-encoder is ever constructed (no model load)."""
+    """(embedder, store, reranker). Without a reranker (the default unless
+    RERANKER_ENABLED, see ``use_reranker``) it is None and no cross-encoder is
+    ever constructed (no model load)."""
     cfg = reranker_config(no_rerank, reranker_model, reranker_max_tokens)
     reranker = (
         None if cfg is None else Reranker(model_name=cfg["model"], max_tokens=cfg["max_tokens"])
@@ -183,7 +202,7 @@ def gather(
 ) -> tuple[list[dict], dict]:
     """Run the ANN (+ rerank) pipeline once per item; cache scored candidates.
 
-    ``reranker=None`` (--no-rerank) skips the cross-encoder. Returns
+    ``reranker=None`` (reranker off) skips the cross-encoder. Returns
     ``(gathered, timing)``; ``timing`` keys (seconds, summed over items):
     ``n_items``, ``total_seconds`` (wall time of the whole call),
     ``seconds_per_item``, ``embed_seconds`` (embedder.embed_text),
@@ -322,9 +341,12 @@ def evaluate(
 
     ``dataset_path`` may be one path or a list. ``margin_t`` defaults to
     TWIN_MARGIN_MIN; pass None explicitly to score with the twin gate off.
+    ``rerank_t`` defaults to RERANK_THRESHOLD with a reranker and to the no-op
+    NO_RERANK_THRESHOLD without one (as the API ignores it when disabled).
     """
     sim_t = settings.SIM_THRESHOLD_CVE if sim_t is None else sim_t
-    rerank_t = settings.RERANK_THRESHOLD if rerank_t is None else rerank_t
+    if rerank_t is None:
+        rerank_t = NO_RERANK_THRESHOLD if reranker is None else settings.RERANK_THRESHOLD
     margin_t = settings.TWIN_MARGIN_MIN if margin_t is _UNSET else margin_t
     items = load_datasets(dataset_path)
     gathered, _timing = gather(items, embedder, store, reranker, settings.ANN_CANDIDATES)
@@ -403,11 +425,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataset", nargs="+", default=[str(DEFAULT_DATASET)],
         help="One or more JSONL eval sets (combined in order).",
     )
-    parser.add_argument("--sim-sweep", default="0.50:0.95:0.05")
+    parser.add_argument(
+        "--sim-sweep", default=DEFAULT_SIM_SWEEP,
+        help=f"start:stop:step for sim_t (default {DEFAULT_SIM_SWEEP}); "
+        "SIM_THRESHOLD_CVE is always added.",
+    )
     parser.add_argument(
         "--rerank-sweep", default=None,
-        help=f"start:stop:step for rerank_t (default {DEFAULT_RERANK_SWEEP}). With "
-        "--no-rerank it collapses to a single no-op value; passing it is an error.",
+        help=f"start:stop:step for rerank_t (default {DEFAULT_RERANK_SWEEP}). Without "
+        "a reranker it collapses to a single no-op value; passing it is an error.",
     )
     parser.add_argument(
         "--margin-sweep", default=None,
@@ -415,10 +441,16 @@ def build_parser() -> argparse.ArgumentParser:
         "e.g. -0.10:0.20:0.02 ('off' is always included). Python < 3.14's argparse "
         "needs the --margin-sweep=-0.10:... form for a negative start.",
     )
-    parser.add_argument(
+    rerank_group = parser.add_mutually_exclusive_group()
+    rerank_group.add_argument(
+        "--rerank", action="store_true",
+        help="Force the cross-encoder on for this run (default: RERANKER_ENABLED, "
+        f"currently {settings.RERANKER_ENABLED}).",
+    )
+    rerank_group.add_argument(
         "--no-rerank", action="store_true",
-        help="Skip the cross-encoder (never loaded); rank candidates by similarity. "
-        "Fast retrieval-only metrics.",
+        help="Force the cross-encoder off (never loaded); rank candidates by "
+        "similarity. Fast retrieval-only metrics.",
     )
     parser.add_argument(
         "--reranker-model", default=None,
@@ -442,7 +474,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def parse_args(argv=None) -> argparse.Namespace:
-    """Parse + validate CLI args. Every refusal happens here, before any model load."""
+    """Parse + validate CLI args. Every refusal happens here, before any model load.
+
+    Afterwards ``args.no_rerank`` is the resolved decision (True = no reranker),
+    whether it came from --no-rerank, --rerank, an override, or the setting.
+    """
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.write_baseline and args.sample is not None:
@@ -464,6 +500,16 @@ def parse_args(argv=None) -> argparse.Namespace:
             parser.error(
                 "--reranker-model/--reranker-max-tokens cannot be combined with --no-rerank."
             )
+    args.no_rerank = not use_reranker(
+        True if args.no_rerank else (False if args.rerank else None),
+        args.reranker_model, args.reranker_max_tokens,
+    )
+    if args.no_rerank:
+        if args.rerank_sweep is not None:
+            parser.error(
+                "--rerank-sweep requires a reranker: RERANKER_ENABLED is off, so pass "
+                "--rerank (or use --sim-sweep)."
+            )
     elif args.rerank_sweep is None:
         args.rerank_sweep = DEFAULT_RERANK_SWEEP
     return args
@@ -479,7 +525,7 @@ def main(argv=None):
 
     print(f"Model: {settings.EMBEDDING_MODEL} (pooling={settings.EMBEDDING_POOLING})")
     if rr_cfg is None:
-        print("Reranker: off (--no-rerank; candidates ranked by similarity)")
+        print("Reranker: off (candidates ranked by similarity; --rerank to enable)")
     else:
         print(f"Reranker: {rr_cfg['model']} (max_tokens={rr_cfg['max_tokens']})")
     if args.sample is not None:
@@ -521,8 +567,9 @@ def main(argv=None):
     n_twins = sum(c["twin_margin"] is not None for g in gathered for c in g["candidates"])
     print(f"Candidates with a patched twin: {n_twins}/{n_cands}.")
 
-    sim_values = frange(args.sim_sweep)
-    # With --no-rerank, rerank_prob == similarity, so a rerank sweep would only
+    # Always score the operating point, whatever range was asked for.
+    sim_values = sorted(set(frange(args.sim_sweep)) | {settings.SIM_THRESHOLD_CVE})
+    # Without a reranker, rerank_prob == similarity, so a rerank sweep would only
     # re-apply the sim gate and multiply the table out: collapse it to one no-op.
     rerank_values = [NO_RERANK_THRESHOLD] if args.no_rerank else frange(args.rerank_sweep)
     op_rerank_t = NO_RERANK_THRESHOLD if args.no_rerank else settings.RERANK_THRESHOLD

@@ -19,7 +19,9 @@ class RagMerger:
         # Load heavy ML models once and share them across both retrievers to save RAM/VRAM
         self.embedder = Embedder(cache=EmbeddingCache())
         self.vector_store = VectorStore()
-        self.reranker = Reranker()
+        # The cross-encoder (~3 GB) is only built when enabled; off by default
+        # (no measured gain, ROADMAP 1d). None -> retrievers keep similarity order.
+        self.reranker = Reranker() if settings.RERANKER_ENABLED else None
 
         self.cve_retriever = CVERetriever(self.embedder, self.vector_store, self.reranker)
         self.team_retriever = TeamRetriever(self.embedder, self.vector_store, self.reranker)
@@ -78,7 +80,7 @@ class RagMerger:
         cve_findings: list[dict[str, Any]] = []
         team_findings: list[dict[str, Any]] = []
 
-        # Pass 1: retrieve + rerank per unit WITHOUT hitting the feedback table, so
+        # Pass 1: retrieve + rank per unit WITHOUT hitting the feedback table, so
         # the vote lookup can be batched into a single query below (one round-trip
         # for the whole scan instead of two per unit).
         per_unit: list[tuple[dict[str, Any], list[dict], list[dict]]] = []

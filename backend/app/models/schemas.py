@@ -62,7 +62,8 @@ class FindingOut(BaseModel):
     file_path: str | None = None
     start_line: int | None = None
     similarity_score: float
-    rerank_prob: float
+    # Cross-encoder probability; None when the reranker is off (RERANKER_ENABLED).
+    rerank_prob: float | None = None
     # Patched-twin scores (CVE matches with a stored fix only; else None):
     # cos(code, fixed version) and cos(code, vulnerable) - that.
     sim_fixed: float | None = None

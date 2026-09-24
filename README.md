@@ -2,9 +2,9 @@
 
 **An AI security reviewer for pull requests.** RepoSentinel embeds a developer's code and
 runs it concurrently against two vector collections: **Ghost Hunter** (known CVE
-vulnerable-code snippets) and **Team Memory** (the team's own past PR review discussions). It
-reranks the matches with a cross-encoder, then asks an LLM to write a structured, actionable
-PR comment.
+vulnerable-code snippets) and **Team Memory** (the team's own past PR review discussions),
+ranks the matches (by similarity by default; an optional cross-encoder rerank is available),
+then asks an LLM to write a structured, actionable PR comment.
 
 It ships as three surfaces:
 
@@ -44,7 +44,7 @@ POST /api/v1/analyze/  ──▶  Scan row (queued)  ──▶  202 + job_id
                      │                              │
    Embedder (jina-embeddings-v2-base-code, mean-pooled, 768-d, cached)
    → VectorStore ANN top-N (optional language filter)
-   → similarity gate → cross-encoder rerank (code-vs-code)
+   → similarity gate → similarity order (optional cross-encoder rerank, code-vs-code)
    → feedback suppression / downweight → top-k
                      └──────────────┬──────────────┘
                                     ▼
@@ -137,7 +137,9 @@ Settings come from `.env` via Pydantic (`backend/app/config.py`). Highlights:
 | `ENVIRONMENT` | `development` | `development` = file Qdrant + SQLite (Docker-free); `production` = networked Qdrant + Postgres |
 | `EMBEDDING_MODEL` | `jinaai/jina-embeddings-v2-base-code` | Mean-pooled, 768-dim; needs `EMBEDDING_TRUST_REMOTE_CODE=True` |
 | `SIM_THRESHOLD_CVE` | `0.25` | Similarity gate, tuned for high recall |
-| `RERANK_THRESHOLD` | `0.0` | Gate on `sigmoid(logit)`; keep-all until calibrated by the reranker eval (the old 0.50–0.73 range was a double-sigmoid bug) |
+| `RERANKER_ENABLED` | `False` | Cross-encoder rerank stage. Off: no measurable gain on the held-out OSV eval (category hit 0.373 off vs 0.36–0.41 on, at 7–49 s/item) and it costs ~3 GB RAM; when off it is never loaded and matches keep similarity order |
+| `RERANKER_MODEL` / `RERANKER_MAX_TOKENS` | `BAAI/bge-reranker-v2-m3` / `512` | Used only when enabled; 512 was the best-measured length and half the cost of 1024 |
+| `RERANK_THRESHOLD` | `0.0` | Gate on `sigmoid(logit)`; only applies with `RERANKER_ENABLED`. Keep-all: rerank probability didn't separate vulnerable from fixed at any threshold |
 | `TWIN_MARGIN_MIN` | (off) | Drop CVE matches that look at least as much like the stored fix as like the bug; calibrate with `run_eval --margin-sweep` |
 | `LLM_PROVIDER` / `LLM_FALLBACK_PROVIDER` | `groq` / `gemini` | OpenAI-compatible endpoints; primary → fallback |
 | `GROQ_API_KEY` / `GEMINI_API_KEY` | (none) | A configured provider with a missing key **hard-fails at startup** |
@@ -181,14 +183,19 @@ LLM). Each run uses a fresh temp SQLite database.
 Calibrate thresholds or compare embedding models:
 
 ```bash
-python -m ml.evaluation.run_eval --sim-sweep 0.20:0.70:0.05 --write-baseline
+python -m ml.evaluation.run_eval --write-baseline \
+    --dataset ml/evaluation/datasets/detection_eval.jsonl \
+    ml/evaluation/datasets/detection_eval_osv_pypi.jsonl \
+    ml/evaluation/datasets/detection_eval_osv_npm.jsonl
 ```
 
 The eval quantifies the precision ceiling (~0.5 across thresholds, since safe and vulnerable
 near-twins embed alike), which is *why* the gate favors recall and the LLM report is the real
 precision filter. **Category hit rate** (did we retrieve the right CVE?) is the meaningful
 retrieval metric; the calibrated baseline lives in `ml/evaluation/baseline.json`.
-`--no-rerank` skips the cross-encoder for fast retrieval-only metrics on the full set, and
+The reranker follows `RERANKER_ENABLED` (off, so runs are fast retrieval-only metrics);
+`--rerank` forces it on and `--no-rerank` off, and the baseline records which was used. The
+default `--sim-sweep` (0.20–0.95) always includes the 0.25 operating point.
 `--sample N --seed S` runs a label-balanced subsample for quick config comparisons (e.g. of
 `--reranker-model`/`--reranker-max-tokens`); a sample can't be written as the baseline.
 

@@ -8,15 +8,15 @@
   "precision": 0.5,
   "recall": 1.0,
   "f1": 0.6667,
-  "category_hit_rate": 0.4313,
-  "twin_coverage": 0.9765,
-  "dataset_sha256": "df0b73af1da5c1e4df7e3b1abee2d024406e577037bd014ccf972c56bf40f36d",
+  "category_hit_rate": 0.4345,
+  "twin_coverage": 0.9763,
+  "dataset_sha256": "1914fe51c947473cb5727d010ebf4bbc01432c62d991686234b004692d7f3479",
   "datasets": [
     "ml/evaluation/datasets/detection_eval.jsonl",
     "ml/evaluation/datasets/detection_eval_osv_pypi.jsonl",
     "ml/evaluation/datasets/detection_eval_osv_npm.jsonl"
   ],
-  "n": 1062,
+  "n": 1054,
   "best_operating_point": {
     "sim_threshold": 0.2,
     "rerank_threshold": 0.0,
@@ -25,13 +25,14 @@
   },
   "reranker": null,
   "sample": null,
+  "sample_kinds": null,
   "seed": null,
   "timing": {
-    "n_items": 1062,
-    "total_seconds": 22.1605,
-    "seconds_per_item": 0.0209,
-    "embed_seconds": 1.9766,
-    "ann_seconds": 20.1605,
+    "n_items": 1054,
+    "total_seconds": 27.4124,
+    "seconds_per_item": 0.026,
+    "embed_seconds": 2.4689,
+    "ann_seconds": 24.8866,
     "rerank_seconds": 0.0
   }
 }

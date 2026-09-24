@@ -4,13 +4,32 @@ Decided 2026-09-22. Ordered by expected impact.
 
 ## Order
 
-1. Corpus import (1a) + patched twin (1b) + bigger eval set (1g)
-2. Comment stripping (1e) + ONNX / Qdrant quantization (2)
-3. Semgrep confirmatory signal (1f step 1)
-4. Prompt-injection hardening (3.2)
-5. SARIF upload (3.1) + suggestion blocks (3.3)
-6. Embedder swap to jina (1c) + reranker swap to bge (1d), evaluated on the bigger eval set — done; reranker then turned off by default (1d)
-7. Neural judge experiments (1f step 3) + confidence score (1f step 4)
+1. Record findings (this entry).
+2. Realistic eval: add ordinary (non-security) functions from the same repos as negatives; report FPR and precision at 1/2/5% base rates.
+3. Measure the existing end-to-end LLM prompt in `run_eval` on that set.
+4. Three-arm test: LLM with no retrieval vs top-1 fix diff vs random wrong fix diff (+ ordinary negatives). If equal, CVE retrieval is not useful as evidence -> LLM-first review with Semgrep evidence; keep CVEs for citations/category hints.
+5. Semgrep/Opengrep with full language rule packs (not category-selected: retrieval gets the class wrong 72% of the time on named categories).
+6. PR diff-direction check ("did this PR remove a guard?") — the judge got 0/7 guard-added pairs.
+7. Prompt-injection hardening + per-scan token budget / CVE cap.
+8. Later: embedding speed (findings cache per function hash), neural judge experiments.
+
+## Findings 2026-09-24 (precision research + adversarial review)
+
+**Precision experiments** (506 held-out vulnerable/fixed pairs, per-item metrics; 0.50 = chance):
+- Whole-function retrieval similarity: AUC 0.495. Existing twin_margin: AUC 0.534, P@R0.8 0.512 — only cheap signal above chance after length control, too weak to gate on.
+- Hunk-level twin (embed only the fix's removed vs added lines): AUC 0.515 — identical to a random-fix control, so nothing transfers across advisories. Lexical fix-line matching: 0.501.
+- Guard-token vocabulary (tokens fixes add/remove): AUC 0.547 but a length artefact — 0.47 on length-matched pairs.
+- Paired accuracy is length-confounded: "shorter function = vulnerable" alone scores 0.806 paired accuracy. Report per-item AUC, precision@recall 0.8 and length-balanced paired accuracy instead.
+- LLM judge (gpt-oss-120b, top-1 neighbour's fix diff, "does the query still contain the flaw this fix removes?"), 49 pairs: 10 pairs fully correct vs 1 reversed (p≈0.01), precision 0.655 at recall 0.39, 59% both "no". Confound: it scored precision 0.73 when the retrieved fix was the WRONG bug class vs 0.61 when right — suggests general judgement, not diff matching. Small n.
+- Literature: no published method separates vulnerable from fixed for non-clone code; LLM+knowledge methods plateau ~0.30 pairwise accuracy (Vul-RAG replication, https://arxiv.org/pdf/2606.04739); high-precision tools (MVP, MOVERY) need clones.
+
+**Adversarial review findings (verified):**
+- Category hit 0.43 is inflated by the catch-all "other" class: 0.279 on named categories (280 items) vs 0.602 on "other"; always guessing "other" scores 0.447 — better than retrieval.
+- Precision on a 50/50 eval misleads. At the judge's measured FPR 0.204 and recall 0.388, precision would be 0.019 / 0.037 / 0.091 at 1% / 2% / 5% vulnerable base rate. False-positive rate on ordinary code is unmeasured.
+- The fix-diff prompt already exists (`markdown_renderer.build_user_prompt`); `run_eval` never measured the LLM stage end-to-end.
+- A per-CVE LLM call would be up to 150 calls / ~134K tokens per PR; Groq free tier for these models is ~30 req/min, 8K tokens/min, 200K tokens/day (https://console.groq.com/docs/rate-limits).
+- No prompt-injection handling exists; third-party fix code and PR code go straight into the prompt.
+- LLM defaults: llama-3.3-70b-versatile retired on Groq (404); now openai/gpt-oss-120b with qwen/qwen3.8-27b same-provider fallback.
 
 ## 1. Detection quality
 
@@ -55,7 +74,7 @@ Decided 2026-09-22. Ordered by expected impact.
 
 ### 1f. Judge stage between retrieval and the LLM — DECISION: layered, Semgrep first
 - No model solves safe-vs-vulnerable twins off the shelf: PrimeVul paired eval has fine-tuned code models at 1–3% and GPT-4 at 5–13% (https://arxiv.org/abs/2403.18624). Combine non-hallucinating signals instead. Laya and TypeSafe Jev rejected: no code training, no vuln evidence.
-1. **Semgrep / Opengrep (+ Bandit for Python).** LGPL-2.1 / Apache-2.0, milliseconds on CPU, deterministic. Map each corpus `category` to a rule set, run only those rules on the flagged function, pass hits (rule id, line) into the LLM prompt as evidence to cite. Recall on novel patterns is 14–22% (https://arxiv.org/abs/2606.21071), so it is a precision booster, not a gate. Skip CodeQL (not free for private repos).
+1. **Semgrep / Opengrep (+ Bandit for Python).** LGPL-2.1 / Apache-2.0, milliseconds on CPU, deterministic. ~~Map each corpus `category` to a rule set~~ — **superseded 2026-09-24**: run full language rule packs, not category-selected; retrieval gets the category wrong 72% of the time on named categories (see Findings 2026-09-24), so category-scoping the rules would inherit that error. Pass hits (rule id, line) into the LLM prompt as evidence to cite. Recall on novel patterns is 14–22% (https://arxiv.org/abs/2606.21071), so it is a precision booster, not a gate. Skip CodeQL (not free for private repos).
 2. **`sim_vuln - sim_fixed`** from 1b.
 3. **Optional neural judge**, validated on `run_eval` first: R2Vul (1.5B, MIT, https://github.com/martin-wey/R2Vul; verify its benchmark is PrimeVul-style) or Qwen2.5-Coder-3B-Instruct as a logprob yes/no judge (Apache-2.0, GGUF int4 on llama.cpp).
 4. **Confidence score** from Semgrep hit, `sim_vuln - sim_fixed`, rerank score, judge probability, vote history. LLM sees only candidates above a threshold.

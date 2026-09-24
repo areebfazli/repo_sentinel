@@ -48,7 +48,7 @@ POST /api/v1/analyze/  ──▶  Scan row (queued)  ──▶  202 + job_id
    → feedback suppression / downweight → top-k
                      └──────────────┬──────────────┘
                                     ▼
-                        LLM report (Groq → Gemini)
+            LLM report (Groq gpt-oss-120b → Groq qwen3.8-27b → Gemini)
                    structured JSON, allowlist-validated
                                     │
                                     ▼
@@ -142,6 +142,7 @@ Settings come from `.env` via Pydantic (`backend/app/config.py`). Highlights:
 | `RERANK_THRESHOLD` | `0.0` | Gate on `sigmoid(logit)`; only applies with `RERANKER_ENABLED`. Keep-all: rerank probability didn't separate vulnerable from fixed at any threshold |
 | `TWIN_MARGIN_MIN` | (off) | Drop CVE matches that look at least as much like the stored fix as like the bug; calibrate with `run_eval --margin-sweep` |
 | `LLM_PROVIDER` / `LLM_FALLBACK_PROVIDER` | `groq` / `gemini` | OpenAI-compatible endpoints; primary → fallback |
+| `GROQ_MODEL` / `GROQ_FALLBACK_MODEL` | `openai/gpt-oss-120b` / `qwen/qwen3.8-27b` | With a Groq primary the chain is Groq primary model → Groq fallback model → `LLM_FALLBACK_PROVIDER` (Groq rate-limits per model). The job result's `llm_provider_used` names the model that answered, e.g. `groq:qwen/qwen3.8-27b` |
 | `GROQ_API_KEY` / `GEMINI_API_KEY` | (none) | A configured provider with a missing key **hard-fails at startup** |
 | `REPOSENTINEL_API_KEY` | (none) | `X-RepoSentinel-Key` header, optional in dev, required in production |
 | `HYBRID_ENABLED` | `False` | Dense + sparse (BM25) RRF fusion; off by default (measured F1 gain below the adoption bar) |
@@ -223,7 +224,9 @@ tests/            pytest suite (unit + integration; slow eval regression)
 ## Notes & gotchas
 
 - **The LLM is Groq/Gemini, never a silent mock.** Mock output only happens with an explicit
-  `LLM_PROVIDER=mock`.
+  `LLM_PROVIDER=mock`. Defaults are `openai/gpt-oss-120b` with `qwen/qwen3.8-27b` as a
+  same-provider Groq fallback before Gemini; a retired model id (HTTP 404) is logged as a
+  "not found or decommissioned" warning naming the model and falls through to the next one.
 - **Local Qdrant is single-process.** The API, ingest scripts, and eval can never run at the
   same time; scripts print "stop the API first" on a lock error.
 - **Any embedding-model change requires `--recreate` on both collections.** Payloads carry

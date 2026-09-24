@@ -100,6 +100,8 @@ class AnalyzeResult(BaseModel):
     report_findings: list[ReportFinding] = []
     ghost_hunter_matches: int
     team_memory_matches: int
+    # "<provider>:<model>" of the LLM client that answered (e.g. "groq:qwen/qwen3.8-27b"),
+    # "mock" in mock mode, None when the LLM wasn't called (nothing retrieved).
     llm_provider_used: str | None = None
 
 

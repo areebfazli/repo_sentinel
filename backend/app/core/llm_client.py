@@ -1,10 +1,17 @@
 """LLM provider abstraction.
 
 Groq and Gemini both expose OpenAI-compatible chat-completions endpoints, so one
-thin client handles both, both async. LLMRouter retries a transient failure
-(429 / 5xx / timeout) on the SAME provider up to settings.LLM_RETRIES times with
-backoff, then falls through to the fallback provider; a bad-output failure
-(malformed/empty response, unparseable JSON) skips straight to the fallback.
+thin client handles both, both async. Each client is one (provider, model) pair.
+LLMRouter's chain is: primary provider/model -> (Groq primary only) GROQ_FALLBACK_MODEL
+on Groq -> LLM_FALLBACK_PROVIDER. Groq rate-limits per model, so the second Groq
+model is a genuine fallback, not a redundant one.
+
+A transient failure (429 / 5xx / timeout) is retried on the SAME client up to
+settings.LLM_RETRIES times with backoff, then falls through to the next client; a
+bad-output failure (malformed/empty response, unparseable JSON) or a non-retriable
+HTTP error (e.g. 404 for a retired model, 401) skips straight to the next client.
+
+`provider_used` is "<provider>:<model>" (e.g. "groq:openai/gpt-oss-120b"), or "mock".
 
 Mock mode is ONLY entered via LLM_PROVIDER=mock — a configured real provider with
 a missing key raises at construction (fail-fast at startup), never a silent mock.
@@ -47,7 +54,7 @@ MOCK_RESPONSE = {
 
 
 class LLMError(Exception):
-    """Raised when all configured providers fail (or on a non-retriable error)."""
+    """Raised when all configured clients fail (or on a non-retriable error)."""
 
 
 class _Retriable(Exception):
@@ -85,6 +92,15 @@ def _key_configured(api_key: str | None) -> bool:
     return bool(api_key) and not api_key.endswith("_here")
 
 
+# Provider error codes (OpenAI-compatible error body) meaning the model id itself
+# is gone, even when the status isn't 404 (Groq uses 400 for decommissioned models).
+_MODEL_GONE_CODES = ("model_not_found", "model_decommissioned")
+
+
+def _model_gone(resp: httpx.Response) -> bool:
+    return resp.status_code == 404 or any(code in resp.text for code in _MODEL_GONE_CODES)
+
+
 def _provider_key(provider: str) -> str | None:
     if provider not in PROVIDERS:
         raise ValueError(f"Unknown LLM provider: {provider}")
@@ -92,14 +108,17 @@ def _provider_key(provider: str) -> str | None:
 
 
 class LLMClient:
-    def __init__(self, provider: str):
+    def __init__(self, provider: str, model: str | None = None):
         if provider not in PROVIDERS:
             raise ValueError(f"Unknown LLM provider: {provider}")
         cfg = PROVIDERS[provider]
         self.provider = provider
         self.url = cfg["url"]
         self.api_key = getattr(settings, cfg["key_setting"])
-        self.model = getattr(settings, cfg["model_setting"])
+        # None -> the provider's configured default model (GROQ_MODEL / GEMINI_MODEL).
+        self.model = model or getattr(settings, cfg["model_setting"])
+        # Reported as provider_used and used in logs: says exactly which model answered.
+        self.label = f"{provider}:{self.model}"
         if not _key_configured(self.api_key):
             raise RuntimeError(
                 f"{cfg['key_setting']} is not set (or still a placeholder) but LLM "
@@ -125,19 +144,28 @@ class LLMClient:
         if resp.status_code != 200:
             if resp.status_code == 429 or resp.status_code >= 500:
                 raise _Retriable(
-                    f"{self.provider} HTTP {resp.status_code}",
+                    f"{self.label} HTTP {resp.status_code}",
                     retry_after=_retry_after_seconds(resp),
                 )
-            raise LLMError(f"{self.provider} HTTP {resp.status_code}: {resp.text[:200]}")
+            if _model_gone(resp):
+                # Non-retriable, falls through to the next client like any other
+                # 4xx — but a retired/renamed model id must be obvious in the logs.
+                logger.warning(
+                    "LLM model '{}' on provider '{}' not found or decommissioned "
+                    "(HTTP {}); update the model setting. Falling through to the next "
+                    "client.",
+                    self.model, self.provider, resp.status_code,
+                )
+            raise LLMError(f"{self.label} HTTP {resp.status_code}: {resp.text[:200]}")
         # Malformed 200s (null content, empty choices) are bad-output, not transient —
         # try the fallback rather than crashing the whole scan, but no point retrying
         # the same provider for the same bad shape.
         try:
             content = resp.json()["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise _Retriable(f"{self.provider} malformed response: {exc}", transient=False) from exc
+            raise _Retriable(f"{self.label} malformed response: {exc}", transient=False) from exc
         if content is None:
-            raise _Retriable(f"{self.provider} returned null content", transient=False)
+            raise _Retriable(f"{self.label} returned null content", transient=False)
         return content
 
 
@@ -149,7 +177,13 @@ class LLMRouter:
             # Primary must be fully configured (fail fast). The fallback is
             # best-effort: skip it if its key is absent so a valid single-provider
             # setup still boots.
-            self.clients.append(LLMClient(settings.LLM_PROVIDER))
+            primary = LLMClient(settings.LLM_PROVIDER)
+            self.clients.append(primary)
+            # Same-provider model fallback (Groq only). Shares the primary's key,
+            # which was just validated, so it can't fail the fail-fast check.
+            fb_model = settings.GROQ_FALLBACK_MODEL
+            if primary.provider == "groq" and fb_model and fb_model != primary.model:
+                self.clients.append(LLMClient("groq", model=fb_model))
             fb = settings.LLM_FALLBACK_PROVIDER
             if fb and fb not in ("mock", settings.LLM_PROVIDER):
                 if _key_configured(_provider_key(fb)):
@@ -161,19 +195,23 @@ class LLMRouter:
                     )
 
     async def generate(self, system: str, user: str) -> tuple[dict, str]:
-        """Return (parsed_json, provider_used). Raises LLMError if all fail."""
+        """Return (parsed_json, provider_used). Raises LLMError if all fail.
+
+        provider_used is the answering client's "<provider>:<model>" label
+        (e.g. "groq:qwen/qwen3.8-27b"), or "mock" in mock mode.
+        """
         if self.mock:
             return MOCK_RESPONSE, "mock"
 
         last_error: Exception | None = None
         for client in self.clients:
-            # attempt 0 is the first try; attempts 1..LLM_RETRIES are same-provider
+            # attempt 0 is the first try; attempts 1..LLM_RETRIES are same-client
             # retries of a transient failure. LLM_RETRIES=0 -> exactly today's
             # behavior (one try, immediate fallthrough on any failure).
             for attempt in range(settings.LLM_RETRIES + 1):
                 try:
                     content = await client.complete(system, user)
-                    return json.loads(content), client.provider
+                    return json.loads(content), client.label
                 except (_Retriable, httpx.TimeoutException, httpx.TransportError) as exc:
                     last_error = exc
                     transient = getattr(exc, "transient", True)
@@ -182,21 +220,24 @@ class LLMRouter:
                         backoff = 2 * 2**attempt + random.uniform(0, 0.5)
                         wait = min(retry_after if retry_after is not None else backoff, 10.0)
                         logger.warning(
-                            "LLM provider {} attempt {} failed (retriable), retrying in "
+                            "LLM client {} attempt {} failed (retriable), retrying in "
                             "{:.1f}s: {}",
-                            client.provider, attempt + 1, wait, exc,
+                            client.label, attempt + 1, wait, exc,
                         )
                         await asyncio.sleep(wait)
                         continue
-                    logger.warning("LLM provider {} failed (retriable): {}", client.provider, exc)
+                    logger.warning("LLM client {} failed (retriable): {}", client.label, exc)
                     break
                 except json.JSONDecodeError as exc:
-                    logger.warning("LLM provider {} returned non-JSON: {}", client.provider, exc)
+                    logger.warning("LLM client {} returned non-JSON: {}", client.label, exc)
                     last_error = exc
                     break
                 except LLMError as exc:
-                    # Non-retriable (e.g. 4xx auth) — still try the fallback provider.
-                    logger.warning("LLM provider {} error: {}", client.provider, exc)
+                    # Non-retriable (e.g. 4xx auth, 404 retired model) — no same-client
+                    # retry, but still try the next client in the chain.
+                    logger.warning("LLM client {} error: {}", client.label, exc)
                     last_error = exc
                     break
-        raise LLMError(f"All LLM providers failed: {last_error}")
+        raise LLMError(
+            f"All LLM clients failed ({', '.join(c.label for c in self.clients)}): {last_error}"
+        )

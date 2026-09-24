@@ -32,10 +32,12 @@ class Settings(BaseSettings):
     LLM_FALLBACK_PROVIDER: str | None = "gemini"
     GROQ_API_KEY: str | None = None
     GEMINI_API_KEY: str | None = None
-    GROQ_MODEL: str = "llama-3.3-70b-versatile"
+    GROQ_MODEL: str = "openai/gpt-oss-120b"
+    # Same-provider (Groq) fallback: a different model, so not hit by the same per-model rate limit.
+    GROQ_FALLBACK_MODEL: str | None = "qwen/qwen3.8-27b"
     GEMINI_MODEL: str = "gemini-2.0-flash"
     LLM_TIMEOUT_SECONDS: int = 60
-    LLM_RETRIES: int = 1                 # same-provider retries on 429/5xx/timeout
+    LLM_RETRIES: int = 1                 # same-client retries on 429/5xx/timeout
 
     # Service URLs (for production)
     DATABASE_URL: str | None = None

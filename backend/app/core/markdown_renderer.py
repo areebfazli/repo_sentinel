@@ -372,7 +372,8 @@ def validate_findings(
     for f in llm_findings:
         if not isinstance(f, dict):
             continue
-        quote = clean_llm_text(f.get("quoted_code") or f.get("vulnerable_code"), MAX_QUOTE_CHARS)
+        quote = clean_llm_text(f.get("quoted_code") or f.get("vulnerable_code"), MAX_QUOTE_CHARS,
+                               code=True)
         named = by_uid.get(str(f.get("unit") or "").strip())
         order = ([named] if named else []) + [u for u in units if u is not named]
         unit = span = None
@@ -396,7 +397,7 @@ def validate_findings(
             "title": clean_llm_text(f.get("title"), MAX_TITLE_CHARS) or "Security finding",
             "explanation": clean_llm_text(f.get("explanation"), MAX_TEXT_CHARS),
             "reasoning": clean_llm_text(f.get("reasoning"), MAX_TEXT_CHARS),
-            "fix_snippet": clean_llm_text(f.get("fix_snippet"), MAX_SNIPPET_CHARS),
+            "fix_snippet": clean_llm_text(f.get("fix_snippet"), MAX_SNIPPET_CHARS, code=True),
             "quoted_code": quote,
             "line": start + span[0],
             "end_line": start + span[1],

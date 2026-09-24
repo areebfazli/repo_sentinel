@@ -143,19 +143,27 @@ _URL_RE = re.compile(r"(?:\b[a-zA-Z][a-zA-Z0-9+.\-]{1,15}://|\bwww\.)[^\s<>]+")
 _MENTION_RE = re.compile(r"(?<![\w`])@(?=[A-Za-z0-9])")
 _MD_SPECIAL_RE = re.compile(r"([\\`*_\[\]()!#|~{}])")
 _BACKTICKS_RE = re.compile(r"`+")
-_HIDDEN_RE = re.compile(
-    r"<!--.*?(?:-->|\Z)|[\u00ad\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064"
-    r"\u2066-\u2069\ufeff\x00-\x08\x0b\x0c\x0e-\x1f\x7f]",
-    re.DOTALL,
+_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_HIDDEN_CHARS_RE = re.compile(
+    r"[\u00ad\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064"
+    r"\u2066-\u2069\ufeff\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"
 )
 
 
 def _strip_hidden(text) -> str:
-    return _HIDDEN_RE.sub("", str(text or ""))
+    """Prose: complete HTML comments and invisible / control characters removed
+    (a dangling ``<!--`` is escaped by ``_escape_plain``)."""
+    return _HIDDEN_CHARS_RE.sub("", _COMMENT_RE.sub("", str(text or "")))
+
+
+def _code_text(text) -> str:
+    """Code: nothing removed but invisible / control characters; an HTML-comment
+    opener is defused in place (stripping it would delete code)."""
+    return _HIDDEN_CHARS_RE.sub("", str(text or "")).replace("<!--", "<! --")
 
 
 def md_code_span(text: str) -> str:
-    text = re.sub(r"\s*\n\s*", " ", _strip_hidden(text))
+    text = re.sub(r"\s*\n\s*", " ", _code_text(text))
     longest = max((len(m.group(0)) for m in _BACKTICKS_RE.finditer(text)), default=0)
     pad = " " if text.startswith("`") or text.endswith("`") or not text else ""
     fence = "`" * (longest + 1)
@@ -180,7 +188,7 @@ def md_inline(text) -> str:
 
 
 def md_code_block(text) -> str:
-    text = _strip_hidden(text).replace("<!--", "<! --")
+    text = _code_text(text)
     longest = max((len(m.group(0)) for m in _BACKTICKS_RE.finditer(text)), default=0)
     fence = "`" * max(3, longest + 1)
     return f"{fence}\n{text}\n{fence}"

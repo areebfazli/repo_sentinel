@@ -2,8 +2,9 @@
 
 A *review unit* is a planner unit (``analysis_planner.plan_units``: one function,
 or a whole file / snippet) plus the evidence gathered for it: the retrieved CVE
-and team matches anchored to it, and its prompt-ready code
-(``untrusted.sanitize_untrusted``, same line count as the real code). Pure.
+and team matches anchored to it, its Semgrep hits and guard_diff result
+(``core.evidence``), and its prompt-ready code (``untrusted.sanitize_untrusted``,
+same line count as the real code). Pure.
 """
 from typing import Any
 
@@ -37,9 +38,14 @@ def snippet_unit(code: str, language: str | None) -> dict[str, Any]:
 
 
 def build_review_units(
-    units: list[dict[str, Any]], raw: dict[str, Any]
+    units: list[dict[str, Any]],
+    raw: dict[str, Any],
+    semgrep: dict[UnitKey, list[dict]] | None = None,
+    guard: dict[UnitKey, dict] | None = None,
 ) -> list[dict[str, Any]]:
-    """One review unit per planner unit, with its retrieval matches attached.
+    """One review unit per planner unit, with its retrieval matches, Semgrep
+    hits (``semgrep``) and guard_diff result (``guard``, both keyed by
+    ``unit_key``) attached.
 
     Files-mode matches carry ``anchor_*`` keys naming their unit; unanchored
     matches (snippet mode) belong to the single (first) unit. Matches stay in
@@ -47,7 +53,8 @@ def build_review_units(
     """
     review = [
         {**u, "key": unit_key(u), "prompt_code": sanitize_untrusted(u.get("code") or ""),
-         "cves": [], "team": []}
+         "cves": [], "team": [], "semgrep": (semgrep or {}).get(unit_key(u), []),
+         "guard": (guard or {}).get(unit_key(u))}
         for u in units
     ]
     by_key = {r["key"]: r for r in review}

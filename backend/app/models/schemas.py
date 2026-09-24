@@ -104,6 +104,43 @@ class ReportFinding(BaseModel):
     dedupe_key: str | None = None
 
 
+class StaticAnalysisHit(BaseModel):
+    """A Semgrep hit given to the LLM as evidence (at/above SEMGREP_MIN_SEVERITY)."""
+
+    file_path: str | None = None
+    function_name: str | None = None
+    start_line: int | None = None  # the unit's first line
+    rule_id: str
+    severity: str | None = None
+    cwe: list[str] = []
+    line: int | None = None
+    message: str = ""
+
+
+class GuardChangeOut(BaseModel):
+    direction: str  # removed | added | weakened | strengthened
+    kind: str
+    line: int | None = None  # new-file line, when the change has a new side
+    old_text: str = ""
+    new_text: str = ""
+    confidence: float
+    rationale: str = ""
+
+
+class GuardDiffOut(BaseModel):
+    """guard_diff result for one unit with a signal (files mode only)."""
+
+    file_path: str | None = None
+    function_name: str | None = None
+    start_line: int | None = None
+    risk: str  # guard_removed | guard_added
+    alert: bool = False
+    removed_score: float = 0.0
+    added_score: float = 0.0
+    note: str | None = None
+    changes: list[GuardChangeOut] = []
+
+
 class AnalyzeResult(BaseModel):
     """The completed analysis payload."""
 
@@ -114,8 +151,11 @@ class AnalyzeResult(BaseModel):
     ghost_hunter_matches: int
     team_memory_matches: int
     # "<provider>:<model>" of the LLM client that answered (e.g. "groq:qwen/qwen3.8-27b"),
-    # "mock" in mock mode, None when the LLM wasn't called (nothing retrieved).
+    # "mock" in mock mode, None when the LLM wasn't called (no code to review).
     llm_provider_used: str | None = None
+    # Evidence the review was given (deterministic, not LLM output).
+    static_analysis: list[StaticAnalysisHit] = []
+    guard_diff: list[GuardDiffOut] = []
 
 
 class JobStatusResponse(BaseModel):

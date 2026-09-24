@@ -267,8 +267,16 @@ sources=None)` scans all units in one engine run and returns `{(file_path, funct
 start_line): [hit, ...]}`, each hit `rule_id, message, severity, cwe, line, end_line, snippet`.
 Pass `sources={file_path: full_text}` when you have the files: they are scanned whole (imports
 in context) and hits are assigned to units by line. Engine missing / timeout / crash logs a
-warning and returns `{}`. It is blocking; call it with `asyncio.to_thread`. Not yet wired into
-the scan pipeline.
+warning and returns `{}`. It is blocking; call it with `asyncio.to_thread`.
+
+**In scans** (`backend/app/core/evidence.py`): every scan runs it in a worker thread alongside
+embedding and retrieval — files mode over the full file text, snippet mode over the snippet
+(language guessed when the client sends none). Hits at or above `SEMGREP_MIN_SEVERITY`
+(default `high`) not in `SEMGREP_EXCLUDED_RULES` (Bandit's `assert`, Python `random`,
+requests-without-timeout) go into the prompt as *static-analysis evidence* (rule id, CWE,
+line; regex / ReDoS rules marked low-confidence) and into the result's `static_analysis`. They
+are evidence for the LLM, never findings on their own. `SEMGREP_ENABLED=false` turns it off;
+`SEMGREP_TIMEOUT_S` (60) bounds the run.
 
 Measured on the eval sets (snippet mode, no imports), a hit is weak evidence, not a gate: with
 Bandit's `assert` rule excluded, 4.3% of vulnerable functions vs 2.2% of their fixed twins and
@@ -286,8 +294,14 @@ SQL turned into interpolated SQL. It nets them into `risk` (`guard_removed` / `g
 per kind with identifier-anonymised keys, so renames, reformatting and moved statements don't
 count. The vocabularies are module-level tables. Files mode already has what it needs:
 `old_code_for_units` reverse-applies the Action's `patch` to `content` to get the old file.
-The planner selects functions by *added* lines only, so a pure-deletion guard removal needs
-`patch_touched_lines(patch)` as `changed_lines`. Not yet wired into the scan pipeline.
+
+**In scans** (files mode only; a snippet has no previous version): units are planned with
+`patch_touched_lines(patch)` (deletion points count as changes, so a function whose only
+change is a deleted guard is analysed), each unit's old code is rebuilt, and units with
+`risk: guard_removed` get their removed / weakened changes in the prompt as *change-direction
+evidence*. The `alert` tier is also reported as its own deterministic finding (`source:
+"guard_diff"`, severity high, rendered under "Removed security guards (deterministic check, no
+LLM)"), whatever the LLM says. Every unit with a signal is listed in the result's `guard_diff`.
 
 `python -m ml.evaluation.eval_guard_diff` treats real fix commits as benign changes and their
 reversal as vulnerability-introducing PRs. On 506 held-out pairs: TPR 0.227 and fix-direction

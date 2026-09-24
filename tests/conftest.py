@@ -11,6 +11,9 @@ os.environ.setdefault("ENVIRONMENT", "development")
 os.environ.setdefault("PRELOAD_MODELS", "false")
 os.environ.setdefault("LLM_PROVIDER", "mock")
 os.environ.setdefault("REPOSENTINEL_API_KEY", "")
+# The Semgrep engine is a multi-second subprocess; tests that need it stub the
+# scanner (tests/unit/test_semgrep_scanner.py covers the real engine separately).
+os.environ.setdefault("SEMGREP_ENABLED", "false")
 
 # Fresh, isolated SQLite file per test run (so job/finding/feedback rows don't
 # accumulate across invocations).

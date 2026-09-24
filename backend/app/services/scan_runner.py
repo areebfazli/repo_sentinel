@@ -13,6 +13,13 @@ from loguru import logger
 from sqlalchemy import update
 
 from backend.app.config import settings
+from backend.app.core.evidence import (
+    guard_alert_findings,
+    guard_evidence,
+    guess_language,
+    plan_with_touched_lines,
+    semgrep_evidence,
+)
 from backend.app.core.markdown_renderer import (
     SYSTEM_PROMPT,
     build_user_prompt,
@@ -241,32 +248,88 @@ def _build_report_findings(
     return report
 
 
+@lru_cache(maxsize=1)
+def _get_semgrep():
+    """The shared Semgrep scanner, or None when SEMGREP_ENABLED is off (a
+    missing engine is handled inside the scanner: a warning, no evidence)."""
+    if not settings.SEMGREP_ENABLED:
+        return None
+    from backend.app.core.semgrep_scanner import SemgrepScanner
+
+    return SemgrepScanner(
+        timeout_s=settings.SEMGREP_TIMEOUT_S,
+        exclude_rules=frozenset(settings.SEMGREP_EXCLUDED_RULES),
+    )
+
+
+def _semgrep_task(units: list[dict], sources: dict[str, str] | None) -> asyncio.Task:
+    """Start Semgrep in a worker thread (a subprocess: runs alongside the
+    embedding / retrieval work instead of after it)."""
+    return asyncio.create_task(
+        asyncio.to_thread(
+            semgrep_evidence, _get_semgrep(), units, sources, settings.SEMGREP_MIN_SEVERITY,
+            frozenset(settings.SEMGREP_EXCLUDED_RULES),
+        )
+    )
+
+
+async def _with_semgrep(semgrep: asyncio.Task, work):
+    """Await ``work`` then the Semgrep task; on failure don't leave the task
+    un-awaited (its thread finishes on its own, bounded by SEMGREP_TIMEOUT_S)."""
+    try:
+        result = await work
+    except BaseException:
+        semgrep.cancel()
+        raise
+    return result, await semgrep
+
+
 async def _analyze_request(merger, request: dict) -> dict:
-    """Run the right retrieval mode. Returns {raw, units, notes}: the retrieval
-    result, the analysis units the LLM reviews, and trusted report notes."""
+    """Run the right retrieval mode plus the deterministic evidence. Returns
+    {raw, units, semgrep, guard, notes}: the retrieval result, the analysis
+    units the LLM reviews, Semgrep hits and guard_diff results per unit key,
+    and trusted report notes."""
     if request.get("files"):
         from backend.app.core.analysis_planner import plan_units
         from backend.app.models.schemas import FileInput
 
         files = [FileInput(**f) for f in request["files"]]
-        # tree-sitter parsing is CPU-bound; keep it off the event loop.
+        # Deletion points count as changes, so a function whose only change is
+        # a removed guard is analysed. tree-sitter parsing is CPU-bound; keep it
+        # off the event loop.
         units, dropped = await asyncio.to_thread(
-            plan_units, files, _get_parser(), settings.MAX_UNITS_PER_SCAN
+            plan_units, plan_with_touched_lines(files), _get_parser(),
+            settings.MAX_UNITS_PER_SCAN,
         )
-        raw = await merger.analyze_units(units)
+        semgrep = _semgrep_task(units, {f.path: f.content for f in files})
+        raw, semgrep_hits = await _with_semgrep(semgrep, merger.analyze_units(units))
+        guard = await asyncio.to_thread(guard_evidence, files, units, _get_parser())
         notes = (
             [f"_Analysis capped at {settings.MAX_UNITS_PER_SCAN} functions; "
              f"{dropped} not scanned._"]
             if dropped
             else []
         )
-        return {"raw": raw, "units": units, "notes": notes}
+        return {"raw": raw, "units": units, "semgrep": semgrep_hits, "guard": guard,
+                "notes": notes}
 
     code = request["code_snippet"]
     language = request.get("language")
-    raw = await merger.analyze_code(code, language)
-    units = [snippet_unit(code, language)] if code.strip() else []
-    return {"raw": raw, "units": units, "notes": []}
+    units = [snippet_unit(code, language or guess_language(code))] if code.strip() else []
+    semgrep = _semgrep_task(units, None)
+    raw, semgrep_hits = await _with_semgrep(semgrep, merger.analyze_code(code, language))
+    # guard_diff needs the previous version of the code: not applicable to a snippet.
+    return {"raw": raw, "units": units, "semgrep": semgrep_hits, "guard": {}, "notes": []}
+
+
+def _static_out(semgrep: dict) -> list[dict]:
+    return [
+        {"file_path": key[0], "function_name": key[1], "start_line": key[2],
+         "rule_id": h["rule_id"], "severity": h.get("severity"), "cwe": h.get("cwe") or [],
+         "line": h.get("line"), "message": h.get("message") or ""}
+        for key, hits in semgrep.items()
+        for h in hits
+    ]
 
 
 def _mark_failed(session, scan_id: str, error: str) -> None:
@@ -325,9 +388,12 @@ async def _run_scan_guarded(scan_id: str, merger, router) -> None:
 
         # The LLM reviews every analysis unit on its own merits; retrieved
         # matches are reference context, not a precondition for the call.
-        review_units = build_review_units(analysis["units"], raw)
+        review_units = build_review_units(
+            analysis["units"], raw, analysis["semgrep"], analysis["guard"]
+        )
         provider_used = None
-        report_findings: list[dict] = []
+        # Deterministic guard_diff alerts are reported whatever the LLM says.
+        report_findings: list[dict] = guard_alert_findings(analysis["guard"])
         if review_units:
             allowed_cves = {c.get("cve_id") for c in cves if c.get("cve_id")}
             allowed_prs = {str(t.get("pr_id")) for t in team if t.get("pr_id")}
@@ -336,13 +402,15 @@ async def _run_scan_guarded(scan_id: str, merger, router) -> None:
             llm_json, provider_used = await router.generate(SYSTEM_PROMPT, user_prompt)
             raw_findings = llm_json.get("findings") if isinstance(llm_json, dict) else None
             validated = validate_findings(raw_findings, batch, allowed_cves, allowed_prs)
-            report_findings = _build_report_findings(
+            report_findings += _build_report_findings(
                 validated, {u["uid"]: u for u in batch}, row_snaps
             )
         if provider_used == "mock":
             notes.append("_LLM_PROVIDER=mock: no real review was performed._")
+        static_out = _static_out(analysis["semgrep"])
         report_markdown = render_markdown(
-            report_findings, len(cves), len(team), units_reviewed=len(review_units), notes=notes
+            report_findings, len(cves), len(team), units_reviewed=len(review_units),
+            static_hits=len(static_out), notes=notes,
         )
 
         # is_vulnerable reflects the reviewed findings (the precision filter), not
@@ -355,6 +423,8 @@ async def _run_scan_guarded(scan_id: str, merger, router) -> None:
             "ghost_hunter_matches": len(cves),
             "team_memory_matches": len(team),
             "llm_provider_used": provider_used,
+            "static_analysis": static_out,
+            "guard_diff": list(analysis["guard"].values()),
         }
 
         scan.is_vulnerable = result["is_vulnerable"]

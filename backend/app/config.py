@@ -117,6 +117,22 @@ class Settings(BaseSettings):
         "COLLABORATOR": 1.05,
     }
 
+    # Static-analysis evidence for the LLM review (Semgrep CE or Opengrep with the
+    # vendored GitLab sast-rules, backend/app/rules/semgrep). Evidence, not a gate:
+    # a high/critical hit fired on 3.2% of vulnerable functions vs 1.4% of their
+    # fixed twins and 0.5% of ordinary ones on the eval sets. A missing engine only
+    # logs a warning (the scan runs without it). Excluded: Bandit's assert rule
+    # (the largest source of hits on fixed and ordinary code), Python `random` and
+    # requests-without-timeout (not vulnerabilities in most code).
+    SEMGREP_ENABLED: bool = True
+    SEMGREP_MIN_SEVERITY: str = "high"      # info | low | medium | high | critical
+    SEMGREP_TIMEOUT_S: float = 60.0         # whole engine run (~7-13 s fixed startup)
+    SEMGREP_EXCLUDED_RULES: list[str] = [
+        "python_assert_rule-assert-used",
+        "python_random_rule-random",
+        "python_requests_rule-request-without-timeout",
+    ]
+
     # Cap on per-scan analysis units (functions) in files mode.
     MAX_UNITS_PER_SCAN: int = 50
 

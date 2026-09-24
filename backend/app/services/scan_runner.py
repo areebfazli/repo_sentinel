@@ -20,6 +20,7 @@ from backend.app.core.evidence import (
     plan_with_touched_lines,
     semgrep_evidence,
 )
+from backend.app.core.llm_client import LLMError
 from backend.app.core.markdown_renderer import (
     SYSTEM_PROMPT,
     build_user_prompt,
@@ -27,9 +28,14 @@ from backend.app.core.markdown_renderer import (
     severity_from_cvss,
     validate_findings,
 )
-from backend.app.core.review_plan import assign_uids, build_review_units, snippet_unit
+from backend.app.core.review_plan import (
+    assign_uids,
+    build_review_units,
+    plan_review_prompts,
+    snippet_unit,
+)
 from backend.app.core.scoring import relevance
-from backend.app.core.untrusted import new_nonce
+from backend.app.core.untrusted import md_code_span, new_nonce
 from backend.app.db.models import Finding, Scan
 from backend.app.db.session import SessionLocal
 
@@ -322,6 +328,79 @@ async def _analyze_request(merger, request: dict) -> dict:
     return {"raw": raw, "units": units, "semgrep": semgrep_hits, "guard": {}, "notes": []}
 
 
+async def _review_batches(
+    batches: list[list[dict]], router, row_snaps: list[dict], report_findings: list[dict],
+    not_reviewed: list[dict],
+) -> tuple[list[str], int]:
+    """One LLM call per batch, sequentially (free tiers rate-limit per minute).
+    Appends each batch's anchored findings to ``report_findings``. A failed
+    call's units join ``not_reviewed`` (reason "llm_error"); if every call
+    fails the error propagates and the scan fails, as before batching.
+    Returns (distinct provider labels that answered, calls made)."""
+    providers: list[str] = []
+    last_error: Exception | None = None
+    failed = 0
+    for batch in batches:
+        assign_uids(batch)
+        # Allowlist = the ids this prompt actually showed (per-unit caps apply).
+        allowed_cves = {c.get("cve_id") for u in batch for c in u["cves"] if c.get("cve_id")}
+        allowed_prs = {str(t.get("pr_id")) for u in batch for t in u["team"] if t.get("pr_id")}
+        try:
+            llm_json, provider = await router.generate(
+                SYSTEM_PROMPT, build_user_prompt(batch, new_nonce())
+            )
+        except LLMError as exc:
+            logger.warning("LLM review call failed for {} unit(s): {}", len(batch), exc)
+            last_error = exc
+            failed += 1
+            not_reviewed.extend({**u, "not_reviewed_reason": "llm_error"} for u in batch)
+            continue
+        if provider not in providers:
+            providers.append(provider)
+        raw_findings = llm_json.get("findings") if isinstance(llm_json, dict) else None
+        validated = validate_findings(raw_findings, batch, allowed_cves, allowed_prs)
+        report_findings += _build_report_findings(
+            validated, {u["uid"]: u for u in batch}, row_snaps
+        )
+    if batches and failed == len(batches):
+        raise last_error
+    return providers, len(batches)
+
+
+def _count_failed(not_reviewed: list[dict]) -> int:
+    return sum(u["not_reviewed_reason"] == "llm_error" for u in not_reviewed)
+
+
+def _unit_label(u: dict) -> str:
+    return f"{u.get('file_path') or 'snippet'}:{u.get('function_name') or u.get('start_line')}"
+
+
+def _coverage_notes(batches: list[list[dict]], not_reviewed: list[dict]) -> list[str]:
+    """Trusted report lines for units the LLM saw only partly or not at all
+    (labels are file/function names: shown as code)."""
+    notes = []
+    truncated = [u for b in batches for u in b if u.get("truncated")]
+    if truncated:
+        notes.append(
+            f"_{len(truncated)} unit(s) only partly reviewed (too long for one prompt): "
+            f"{', '.join(md_code_span(_unit_label(u)) for u in truncated[:10])}._"
+        )
+    for reason, why in (
+        ("budget", f"LLM budget: {settings.LLM_MAX_CALLS_PER_SCAN} call(s) of "
+                   f"~{settings.LLM_MAX_PROMPT_TOKENS} tokens"),
+        ("too_large", "too large for one prompt"),
+        ("llm_error", "LLM call failed"),
+    ):
+        units = [u for u in not_reviewed if u["not_reviewed_reason"] == reason]
+        if units:
+            more = f" and {len(units) - 10} more" if len(units) > 10 else ""
+            notes.append(
+                f"_⚠️ {len(units)} unit(s) NOT reviewed by the LLM ({why}): "
+                f"{', '.join(md_code_span(_unit_label(u)) for u in units[:10])}{more}._"
+            )
+    return notes
+
+
 def _static_out(semgrep: dict) -> list[dict]:
     return [
         {"file_path": key[0], "function_name": key[1], "start_line": key[2],
@@ -391,25 +470,25 @@ async def _run_scan_guarded(scan_id: str, merger, router) -> None:
         review_units = build_review_units(
             analysis["units"], raw, analysis["semgrep"], analysis["guard"]
         )
-        provider_used = None
+        batches, not_reviewed = plan_review_prompts(
+            review_units,
+            max_prompt_tokens=settings.LLM_MAX_PROMPT_TOKENS,
+            max_units_per_prompt=settings.LLM_MAX_UNITS_PER_PROMPT,
+            max_calls=settings.LLM_MAX_CALLS_PER_SCAN,
+            max_refs_per_unit=settings.LLM_MAX_CVES_PER_UNIT,
+        )
         # Deterministic guard_diff alerts are reported whatever the LLM says.
         report_findings: list[dict] = guard_alert_findings(analysis["guard"])
-        if review_units:
-            allowed_cves = {c.get("cve_id") for c in cves if c.get("cve_id")}
-            allowed_prs = {str(t.get("pr_id")) for t in team if t.get("pr_id")}
-            batch = assign_uids(review_units)
-            user_prompt = build_user_prompt(batch, new_nonce())
-            llm_json, provider_used = await router.generate(SYSTEM_PROMPT, user_prompt)
-            raw_findings = llm_json.get("findings") if isinstance(llm_json, dict) else None
-            validated = validate_findings(raw_findings, batch, allowed_cves, allowed_prs)
-            report_findings += _build_report_findings(
-                validated, {u["uid"]: u for u in batch}, row_snaps
-            )
-        if provider_used == "mock":
+        providers, llm_calls = await _review_batches(batches, router, row_snaps,
+                                                     report_findings, not_reviewed)
+        provider_used = ",".join(providers) or None
+        if "mock" in providers:
             notes.append("_LLM_PROVIDER=mock: no real review was performed._")
+        notes.extend(_coverage_notes(batches, not_reviewed))
         static_out = _static_out(analysis["semgrep"])
         report_markdown = render_markdown(
-            report_findings, len(cves), len(team), units_reviewed=len(review_units),
+            report_findings, len(cves), len(team),
+            units_reviewed=sum(len(b) for b in batches) - _count_failed(not_reviewed),
             static_hits=len(static_out), notes=notes,
         )
 
@@ -425,6 +504,12 @@ async def _run_scan_guarded(scan_id: str, merger, router) -> None:
             "llm_provider_used": provider_used,
             "static_analysis": static_out,
             "guard_diff": list(analysis["guard"].values()),
+            "llm_calls": llm_calls,
+            "units_not_reviewed": [
+                {"file_path": u.get("file_path"), "function_name": u.get("function_name"),
+                 "start_line": u.get("start_line"), "reason": u["not_reviewed_reason"]}
+                for u in not_reviewed
+            ],
         }
 
         scan.is_vulnerable = result["is_vulnerable"]

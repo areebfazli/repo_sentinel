@@ -55,6 +55,17 @@ class Settings(BaseSettings):
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     LLM_TIMEOUT_SECONDS: int = 60
     LLM_RETRIES: int = 1                 # same-client retries on 429/5xx/timeout
+    # Per-scan LLM budget. Units are ordered by evidence (guard_diff alert, Semgrep
+    # hit, guard_removed, retrieval similarity) and packed into as few prompts as
+    # fit; units beyond LLM_MAX_CALLS_PER_SCAN prompts are listed in the result as
+    # not reviewed. Prompt tokens are estimated (chars / 4 x 1.25). 6000 keeps one
+    # prompt plus a reasoning model's answer under Groq's free-tier 8K tokens/min
+    # per model (the fallback provider); OpenRouter has no per-minute token cap.
+    LLM_MAX_PROMPT_TOKENS: int = 6000
+    LLM_MAX_UNITS_PER_PROMPT: int = 6
+    LLM_MAX_CALLS_PER_SCAN: int = 6
+    # Retrieved CVE matches shown per unit (team matches likewise), best first.
+    LLM_MAX_CVES_PER_UNIT: int = 2
 
     # Service URLs (for production)
     DATABASE_URL: str | None = None

@@ -141,6 +141,16 @@ class GuardDiffOut(BaseModel):
     changes: list[GuardChangeOut] = []
 
 
+class UnitNotReviewed(BaseModel):
+    """An analysis unit the LLM did not review: ``reason`` is "budget" (beyond
+    LLM_MAX_CALLS_PER_SCAN prompts), "too_large" or "llm_error"."""
+
+    file_path: str | None = None
+    function_name: str | None = None
+    start_line: int | None = None
+    reason: str
+
+
 class AnalyzeResult(BaseModel):
     """The completed analysis payload."""
 
@@ -156,6 +166,9 @@ class AnalyzeResult(BaseModel):
     # Evidence the review was given (deterministic, not LLM output).
     static_analysis: list[StaticAnalysisHit] = []
     guard_diff: list[GuardDiffOut] = []
+    # LLM review coverage: prompts sent, and units left out (never silently).
+    llm_calls: int = 0
+    units_not_reviewed: list[UnitNotReviewed] = []
 
 
 class JobStatusResponse(BaseModel):

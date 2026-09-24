@@ -161,6 +161,9 @@ can still be overridden there. Highlights:
 | `OPENROUTER_MODEL` / `OPENROUTER_FALLBACK_MODEL` | `qwen/qwen3.8-27b:free` / `google/gemma-4-31b-it:free` | OpenRouter free models (20 req/min, 1,000 req/day with ≥ $10 credits, fewer without; they need "allow free endpoints that may train on inputs" in OpenRouter's privacy settings or return 404; see [openrouter.ai/docs](https://openrouter.ai/docs)). The qwen primary is always sent without `response_format` (it rejects it); set `OPENROUTER_FALLBACK_MODEL=` to disable the gemma fallback. OpenRouter default model → OpenRouter fallback model → `LLM_FALLBACK_PROVIDER`. 429 is retried; 402 (insufficient credits) is not, and skips OpenRouter's other models; a model that rejects `response_format` is retried once without it |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | `/chat/completions` is appended |
 | `OPENROUTER_API_KEY` / `GROQ_API_KEY` / `GEMINI_API_KEY` | (none) | The only LLM settings `.env` needs. A missing key for `LLM_PROVIDER` **hard-fails at startup**; a missing key for `LLM_FALLBACK_PROVIDER` just logs a warning and that provider is skipped |
+| `LLM_MAX_PROMPT_TOKENS` / `LLM_MAX_UNITS_PER_PROMPT` / `LLM_MAX_CALLS_PER_SCAN` | `6000` / `6` / `6` | Per-scan LLM budget. Units are ordered by evidence (guard_diff alert, Semgrep hit, `guard_removed`, then retrieval similarity) and packed into as few prompts as fit (one call when everything fits). Tokens are estimated as chars / 4 × 1.25; 6000 keeps a prompt plus a reasoning model's answer under Groq's free-tier 8K tokens/min. An oversized unit loses its references, then the tail of its code; units beyond the call cap are listed in `units_not_reviewed` and in the report, never dropped silently |
+| `LLM_MAX_CVES_PER_UNIT` | `2` | Retrieved CVE matches shown per unit (team matches likewise) |
+| `SEMGREP_ENABLED` / `SEMGREP_MIN_SEVERITY` | `True` / `high` | Static-analysis evidence for the review (see below); a missing engine only logs a warning |
 | `REPOSENTINEL_API_KEY` | (none) | `X-RepoSentinel-Key` header, optional in dev, required in production |
 | `HYBRID_ENABLED` | `False` | Dense + sparse (BM25) RRF fusion; off by default (measured F1 gain below the adoption bar) |
 
@@ -177,6 +180,11 @@ nearest changed line. Comments are deduped across pushes via hidden
 `<!-- reposentinel:f:<sha1> -->` markers (hash of file, function and the finding's
 `dedupe_key`; only a marker at the very end of a comment counts). It also posts a summary
 comment and applies a configurable severity gate. Finding text is escaped before it is posted.
+
+The job result also carries the review's inputs and coverage: `static_analysis` (Semgrep
+evidence), `guard_diff` (units whose diff removed or added a guard), `llm_calls`, and
+`units_not_reviewed` (units left out by the token budget, too large for a prompt, or whose LLM
+call failed; the report lists them too).
 
 Configure two repository secrets:
 

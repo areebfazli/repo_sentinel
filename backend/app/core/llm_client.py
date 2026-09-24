@@ -232,6 +232,9 @@ class LLMClient:
         self.use_response_format = not (
             self._response_format_fallback and self.model in _NO_RESPONSE_FORMAT_MODELS
         )
+        # Sampling temperature sent with every request (settings.LLM_TEMPERATURE;
+        # the eval overrides it per client, e.g. 0.0 for reproducible runs).
+        self.temperature = settings.LLM_TEMPERATURE
         # Reported as provider_used and used in logs: says exactly which model answered.
         self.label = f"{provider}:{self.model}"
         if not _key_configured(self.api_key):
@@ -255,7 +258,7 @@ class LLMClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "temperature": 0.2,
+            "temperature": self.temperature,
         }
         if self.use_response_format:
             body["response_format"] = {"type": "json_object"}

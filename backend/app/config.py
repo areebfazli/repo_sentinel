@@ -54,6 +54,9 @@ class Settings(BaseSettings):
     OPENROUTER_FALLBACK_MODEL: str | None = "google/gemma-4-31b-it:free"
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     LLM_TIMEOUT_SECONDS: int = 60
+    # Sampling temperature of every review call. 0.2 is what production has always
+    # used; the eval (ml/evaluation/run_eval --llm-temperature) defaults to 0.0.
+    LLM_TEMPERATURE: float = 0.2
     LLM_RETRIES: int = 1                 # same-client retries on 429/5xx/timeout
     # Per-scan LLM budget. Units are ordered by evidence (guard_diff alert, Semgrep
     # hit, guard_removed, retrieval similarity) and packed into as few prompts as

@@ -3,7 +3,8 @@
 For each file we extract functions (tree-sitter), keep only those overlapping the
 changed lines (explicit ``changed_lines`` wins over ``patch``; neither -> all
 functions), skip any marked ``# reposentinel-ignore``, and cap the total. Files in
-an unsupported language become a single whole-file unit.
+an unsupported language become a single whole-file unit. Each unit carries its
+``changed_lines`` (None without change information).
 """
 from pathlib import Path
 
@@ -39,14 +40,25 @@ def _changed_line_set(file) -> set[int] | None:
     return None
 
 
-def _whole_file_unit(file, ext: str) -> dict:
+def _unit_changed_lines(changed: set[int] | None, start: int, end: int) -> list[int] | None:
+    """The changed lines inside [start, end] (sorted), or None when the file
+    came without change information. Used to keep the changed part of a unit
+    in view when it has to be trimmed for the LLM prompt."""
+    if changed is None:
+        return None
+    return sorted(ln for ln in changed if start <= ln <= end)
+
+
+def _whole_file_unit(file, ext: str, changed: set[int] | None = None) -> dict:
+    end = len(file.content.splitlines()) or 1
     return {
         "file_path": file.path,
         "function_name": None,
         "start_line": 1,
-        "end_line": len(file.content.splitlines()) or 1,
+        "end_line": end,
         "code": file.content,
         "language": _language_name(ext.lstrip(".")),
+        "changed_lines": _unit_changed_lines(changed, 1, end),
     }
 
 
@@ -74,7 +86,7 @@ def plan_units(files, parser, max_units: int) -> tuple[list[dict], int]:
         if not parser.supports(ext):
             # Unsupported language -> one whole-file unit (unless ignored).
             if IGNORE_DIRECTIVE not in file.content:
-                units.append(_whole_file_unit(file, ext))
+                units.append(_whole_file_unit(file, ext, _changed_line_set(file)))
             continue
 
         changed = _changed_line_set(file)
@@ -94,6 +106,9 @@ def plan_units(files, parser, max_units: int) -> tuple[list[dict], int]:
                     "end_line": func["end_line"],
                     "code": func["code"],
                     "language": _language_name(func["language"]),
+                    "changed_lines": _unit_changed_lines(
+                        changed, func["start_line"], func["end_line"]
+                    ),
                 }
             )
 
@@ -111,7 +126,7 @@ def plan_units(files, parser, max_units: int) -> tuple[list[dict], int]:
         else:
             needs_whole_file = bool(changed - covered)  # changed lines outside functions
         if needs_whole_file:
-            units.append(_whole_file_unit(file, ext))
+            units.append(_whole_file_unit(file, ext, changed))
 
     dropped = 0
     if len(units) > max_units:

@@ -8,7 +8,11 @@ import pytest
 
 from backend.app.config import settings
 from backend.app.core.llm_client import LLMError
-from backend.app.core.markdown_renderer import SYSTEM_PROMPT, build_user_prompt
+from backend.app.core.markdown_renderer import (
+    SYSTEM_PROMPT,
+    build_user_prompt,
+    validate_findings,
+)
 from backend.app.core.review_plan import (
     assign_uids,
     build_review_units,
@@ -87,15 +91,68 @@ def test_token_budget_splits_prompts():
         assert _prompt_tokens(b) <= 3000
 
 
-def test_oversized_unit_loses_references_then_code_tail():
+def test_oversized_unit_loses_references_then_code_is_elided():
     big = _unit("big", lines=900)
     batches, dropped = plan_review_prompts(
         _review([big], [_cve("CVE-1", 0.8, big)]), **{**BUDGET, "max_prompt_tokens": 4000})
     [[unit]] = batches
     assert not dropped and unit["cves"] == []
-    assert unit["truncated"].startswith("first ") and "of 900 lines" in unit["truncated"]
+    assert "of 900 lines" in unit["truncated"] and unit["partial"] is True
     assert _prompt_tokens([unit]) <= 4000
     assert "Only part of this unit is shown" in build_user_prompt([unit], "f" * 16)
+
+
+def _sink_at_end(n=902, start=100):
+    """A 902-line function whose only dangerous call is its last line."""
+    code = "def handler(request):\n" + "".join(f"    v{i} = request.args.get('k{i}')\n"
+                                              for i in range(n - 2))
+    code += "    os.system(request.args['cmd'])\n"
+    return {"file_path": "big.py", "function_name": "handler", "start_line": start,
+            "end_line": start + n - 1, "code": code, "language": "python"}
+
+
+def test_snippet_mode_keeps_head_and_tail_with_real_line_numbers():
+    unit = _sink_at_end()  # no changed_lines: snippet / no-diff mode
+    [[shown]], _ = plan_review_prompts(_review([unit]), **{**BUDGET, "max_prompt_tokens": 4000})
+    prompt = build_user_prompt(assign_uids([shown]), "f" * 16)
+    assert "1001|     os.system(request.args['cmd'])" in prompt  # last line, real number
+    assert "  100| def handler(request):" in prompt
+    assert "  ...| [... " in prompt and "line(s) omitted: lines " in prompt
+    assert "first and last lines" in shown["truncated"] and shown["partial"] is True
+    assert "## Unit U1: `big.py` function `handler` lines 100-1001" in prompt
+    # A finding quoting the sink anchors to its real line.
+    [f] = validate_findings([{"unit": "U1", "title": "cmd", "severity": "high",
+                              "quoted_code": "os.system(request.args['cmd'])"}],
+                            [shown], set(), set())
+    assert f["line"] == 1001
+    # Nothing matches inside an omission marker.
+    assert validate_findings([{"unit": "U1", "title": "x",
+                               "quoted_code": "line(s) omitted: lines"}],
+                             [shown], set(), set()) == []
+
+
+def test_files_mode_window_is_centred_on_the_changed_lines():
+    unit = {**_sink_at_end(), "changed_lines": [600, 601]}
+    [[shown]], _ = plan_review_prompts(_review([unit]), **{**BUDGET, "max_prompt_tokens": 4000})
+    numbers = [n for n in shown["line_numbers"] if n is not None]
+    assert numbers[0] == 100  # the signature is kept
+    assert 600 in numbers and 601 in numbers
+    window = numbers[1:]
+    assert window == list(range(window[0], window[-1] + 1))  # one contiguous window
+    assert abs((600 - window[0]) - (window[-1] - 601)) <= 1  # centred on the change
+    assert shown["partial"] is False  # every changed line was shown
+    assert "around the changed lines" in shown["truncated"]
+    assert _prompt_tokens([shown]) <= 4000
+
+
+def test_changed_lines_too_far_apart_get_one_window_each():
+    unit = {**_sink_at_end(), "changed_lines": [150, 1001]}
+    [[shown]], _ = plan_review_prompts(_review([unit]), **{**BUDGET, "max_prompt_tokens": 4000})
+    numbers = [n for n in shown["line_numbers"] if n is not None]
+    assert {100, 150, 1001} <= set(numbers)
+    assert shown["line_numbers"].count(None) == 1  # two windows (signature + 150, and 1001)
+    assert "1001|     os.system(request.args['cmd'])" in build_user_prompt(
+        assign_uids([shown]), "f" * 16)
 
 
 def test_unit_that_cannot_fit_at_all_is_reported():

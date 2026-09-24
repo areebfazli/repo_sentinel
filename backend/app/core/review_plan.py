@@ -12,8 +12,10 @@ first-fit into prompts of at most ``LLM_MAX_PROMPT_TOKENS`` (estimated) and
 ``LLM_MAX_UNITS_PER_PROMPT`` units, at most ``LLM_MAX_CALLS_PER_SCAN`` prompts,
 so a scan that fits is still exactly one call. Each unit keeps at most
 ``LLM_MAX_CVES_PER_UNIT`` CVE matches (and as many team matches). A unit too big
-for a prompt on its own loses its references, then the tail of its code (marked
-truncated). Units that don't fit are returned, never silently dropped.
+for a prompt on its own loses its references, then code is elided around its
+changed lines (head + tail without change information), with explicit markers
+and real line numbers (``_shrink_to_fit``). Units that don't fit are returned,
+never silently dropped.
 """
 import math
 from dataclasses import dataclass, field
@@ -123,27 +125,114 @@ class Batch:
     tokens: int = 0
 
 
+# Placeholder for the truncation note while sizing (the real note is shorter).
+_NOTE_PLACEHOLDER = "x" * 120
+
+
+def elide(lines: list[str], keep: set[int], start_line: int) -> tuple[str, list[int | None]]:
+    """``lines`` with the ones not in ``keep`` (0-based) collapsed into
+    ``[... N lines omitted ...]`` markers. Returns (text, line_numbers): the
+    real file line of each output line, None for a marker."""
+    out: list[str] = []
+    numbers: list[int | None] = []
+    i = 0
+    while i < len(lines):
+        if i in keep:
+            out.append(lines[i])
+            numbers.append(start_line + i)
+            i += 1
+            continue
+        j = i
+        while j < len(lines) and j not in keep:
+            j += 1
+        first, last = start_line + i, start_line + j - 1
+        span = f"line {first}" if first == last else f"lines {first}-{last}"
+        out.append(f"[... {j - i} line(s) omitted: {span} ...]")
+        numbers.append(None)
+        i = j
+    return "\n".join(out), numbers
+
+
+def _around_changes(n: int, focus: list[int], radius: int, limit: int | None = None) -> set[int]:
+    """The first line (signature) plus ``radius`` lines either side of each of
+    the first ``limit`` focus lines."""
+    keep = {0}
+    for c in focus[:limit]:
+        keep.update(range(max(c - radius, 0), min(c + radius, n - 1) + 1))
+    return keep
+
+
+def _head_and_tail(n: int, k: int) -> set[int]:
+    return set(range(min(k, n))) | set(range(max(n - k, 0), n))
+
+
+def _largest_fitting(lo: int, hi: int, fits) -> int | None:
+    """Largest x in [lo, hi] with fits(x) (fits is monotone), or None."""
+    if hi < lo or not fits(lo):
+        return None
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
 def _shrink_to_fit(unit: dict[str, Any], size_of, available: int) -> bool:
     """Make an oversized unit fit ``available`` tokens: drop team matches, then
-    CVE matches (least relevant first), then cut code lines from the end.
-    False when even one line of code doesn't fit."""
+    CVE matches (least relevant first), then elide code.
+
+    Code is cut to a window, never just from the end (the offending line may be
+    the last one): with change information (files mode, ``changed_lines``) the
+    signature plus as many lines as fit around every changed line (or, if even
+    that is too big, as many changed lines as fit); without it (snippet mode, or
+    a file sent without a patch) the head and tail. Elided regions become
+    explicit ``[... N lines omitted ...]`` markers and every shown line keeps its
+    real number (``line_numbers``). ``truncated`` describes the cut;
+    ``partial`` is True when changed lines (or, without change information, any
+    lines) were cut, i.e. part of what the review is for went unseen. False
+    when not even one line of code fits.
+    """
     while size_of(unit) > available and (unit["team"] or unit["cves"]):
         (unit["team"] if unit["team"] else unit["cves"]).pop()
     if size_of(unit) <= available:
         return True
     lines = unit["prompt_code"].splitlines()
-    lo, hi = 0, len(lines)  # largest prefix that fits, by bisection
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if size_of({**unit, "prompt_code": "\n".join(lines[:mid]),
-                    "truncated": "x" * 40}) <= available:
-            lo = mid
+    n = len(lines)
+    start = int(unit.get("start_line") or 1)
+    focus = sorted({ln - start for ln in unit.get("changed_lines") or ()
+                    if 0 <= ln - start < n})
+
+    def fits(keep: set[int]) -> bool:
+        text, numbers = elide(lines, keep, start)
+        return size_of({**unit, "prompt_code": text, "line_numbers": numbers,
+                        "truncated": _NOTE_PLACEHOLDER}) <= available
+
+    keep = None
+    if focus:
+        radius = _largest_fitting(0, n, lambda r: fits(_around_changes(n, focus, r)))
+        if radius is not None:
+            keep = _around_changes(n, focus, radius)
         else:
-            hi = mid - 1
-    if lo == 0:
+            count = _largest_fitting(1, len(focus),
+                                     lambda k: fits(_around_changes(n, focus, 0, k)))
+            if count is not None:
+                keep = _around_changes(n, focus, 0, count)
+        how = "the signature and the lines around the changed lines"
+    else:
+        k = _largest_fitting(1, (n + 1) // 2, lambda k: fits(_head_and_tail(n, k)))
+        keep = _head_and_tail(n, k) if k is not None else None
+        how = "the first and last lines"
+    if keep is None:
         return False
-    unit["prompt_code"] = "\n".join(lines[:lo])
-    unit["truncated"] = f"first {lo} of {len(lines)} lines, the rest exceeded the prompt budget"
+    unit["prompt_code"], unit["line_numbers"] = elide(lines, keep, start)
+    shown = len(keep)
+    unit["partial"] = not set(focus) <= keep if focus else shown < n
+    unit["truncated"] = (
+        f"{shown} of {n} lines ({how}); the rest exceeded the prompt budget and is "
+        "replaced by '[... N line(s) omitted ...]' markers"
+    )
     return True
 
 

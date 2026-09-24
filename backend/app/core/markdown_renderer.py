@@ -154,15 +154,37 @@ def unit_header(unit: dict) -> str:
     else:
         parts.append("submitted snippet")
     start = int(unit.get("start_line") or 1)
-    n_lines = len((unit.get("prompt_code") or "").splitlines()) or 1
-    parts.append(f"lines {start}-{start + n_lines - 1}")
+    if unit.get("line_numbers"):  # elided: the unit's full range
+        last = max(int(unit.get("end_line") or 0),
+                   max(n for n in unit["line_numbers"] if n is not None))
+    else:
+        last = start + (len((unit.get("prompt_code") or "").splitlines()) or 1) - 1
+    parts.append(f"lines {start}-{last}")
     if unit.get("language"):
         parts.append(f"({safe_label(unit['language'], 20)})")
     return " ".join(parts)
 
 
-def numbered_code(code: str, start_line: int) -> str:
-    return "\n".join(f"{start_line + i:>5}| {ln}" for i, ln in enumerate(code.splitlines()))
+def numbered_code(code: str, start_line: int, line_numbers: list | None = None) -> str:
+    """Each line prefixed with its real line number; with ``line_numbers``
+    (an elided unit) those numbers, and "..." on omission markers."""
+    lines = code.splitlines()
+    numbers = line_numbers or [start_line + i for i in range(len(lines))]
+    return "\n".join(
+        f"{'...' if num is None else num:>5}| {ln}" for num, ln in zip(numbers, lines, strict=False)
+    )
+
+
+def unit_line_number(unit: dict, index: int) -> int:
+    """Real file line of line ``index`` (0-based) of a unit's prompt_code."""
+    numbers = unit.get("line_numbers")
+    if numbers and 0 <= index < len(numbers) and numbers[index] is not None:
+        return numbers[index]
+    return int(unit.get("start_line") or 1) + index
+
+
+def _marker_lines(unit: dict) -> frozenset[int]:
+    return frozenset(i for i, n in enumerate(unit.get("line_numbers") or []) if n is None)
 
 
 def _semgrep_lines(hits: list[dict]) -> list[str]:
@@ -246,18 +268,21 @@ def build_unit_section(unit: dict, nonce: str) -> str:
     """One unit's part of the prompt: header, numbered code, then its evidence.
 
     ``unit`` keys: uid, prompt_code (sanitised code as shown), start_line, and
-    optionally file_path, function_name, language, truncated, semgrep (hits),
-    guard ({risk, changes}), cves, team.
+    optionally line_numbers (per prompt_code line, None for an omission
+    marker; set when code was elided), end_line, file_path, function_name,
+    language, truncated, semgrep (hits), guard ({risk, changes}), cves, team.
     """
     uid = unit["uid"]
     start = int(unit.get("start_line") or 1)
     lines = [unit_header(unit),
              "Code under review (each line starts with its line number and '| ', which is "
              "not part of the code):",
-             wrap_untrusted(nonce, "code", numbered_code(unit.get("prompt_code") or "", start),
+             wrap_untrusted(nonce, "code", numbered_code(unit.get("prompt_code") or "", start,
+                                                         unit.get("line_numbers")),
                             unit=uid)]
     if unit.get("truncated"):
-        lines.append(f"(Only part of this unit is shown: {unit['truncated']}.)")
+        lines.append(f"(Only part of this unit is shown: {unit['truncated']}. Do not "
+                     "assume anything about the omitted lines.)")
     if unit.get("semgrep"):
         lines.extend(_semgrep_lines(unit["semgrep"]))
     guard = unit.get("guard")
@@ -417,7 +442,7 @@ def validate_findings(
         order = ([named] if named else []) + [u for u in units if u is not named]
         unit = span = None
         for u in order:
-            span = locate_quote(quote, u.get("prompt_code") or "")
+            span = locate_quote(quote, u.get("prompt_code") or "", _marker_lines(u))
             if span is not None:
                 unit = u
                 break
@@ -426,7 +451,6 @@ def validate_findings(
         cid = _id_or_none(f.get("cve_id"))
         pid = _id_or_none(f.get("team_pr_id"))
         severity = str(f.get("severity") or "").strip().lower()
-        start = int(unit.get("start_line") or 1)
         finding = {
             "unit": unit["uid"],
             "severity": severity if severity in SEVERITY_ORDER else None,
@@ -438,8 +462,8 @@ def validate_findings(
             "reasoning": clean_llm_text(f.get("reasoning"), MAX_TEXT_CHARS),
             "fix_snippet": clean_llm_text(f.get("fix_snippet"), MAX_SNIPPET_CHARS, code=True),
             "quoted_code": quote,
-            "line": start + span[0],
-            "end_line": start + span[1],
+            "line": unit_line_number(unit, span[0]),
+            "end_line": unit_line_number(unit, span[1]),
         }
         key = (finding["unit"], finding["line"], finding["cwe"] or finding["title"].lower())
         current = best.get(key)

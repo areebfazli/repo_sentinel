@@ -260,6 +260,25 @@ Bandit's `assert` rule excluded, 4.3% of vulnerable functions vs 2.2% of their f
 1.7% of ordinary functions have a hit (high/critical severity only: 3.2% / 1.4% / 0.5%). The
 engine costs ~7 s fixed per run (Python rules; ~13 s with JS as well), then ~0.05 s per unit.
 
+## Diff-direction evidence (did the PR remove a guard?)
+
+`backend/app/core/guard_diff.py` compares a unit's old and new code (tree-sitter, Python + JS,
+no model, ~15 ms per unit). It reports `GuardChange`s: removed/added sanitisers, auth checks,
+path-containment and bounds checks, `raise`/`return`/`throw` guard blocks, unsafe-API swaps
+(`yaml.safe_load` to `yaml.load`), flag flips (`shell=True`, `verify=False`) and parameterised
+SQL turned into interpolated SQL. It nets them into `risk` (`guard_removed` / `guard_added` /
+`none`) plus a high-precision `alert` tier (swap/flag/SQL evidence only). Features are counted
+per kind with identifier-anonymised keys, so renames, reformatting and moved statements don't
+count. The vocabularies are module-level tables. Files mode already has what it needs:
+`old_code_for_units` reverse-applies the Action's `patch` to `content` to get the old file.
+The planner selects functions by *added* lines only, so a pure-deletion guard removal needs
+`patch_touched_lines(patch)` as `changed_lines`. Not yet wired into the scan pipeline.
+
+`python -m ml.evaluation.eval_guard_diff` treats real fix commits as benign changes and their
+reversal as vulnerability-introducing PRs. On 506 held-out pairs: TPR 0.227 and fix-direction
+FPR 0.030. The `alert` tier has TPR 0.032 and FPR 0/506. Synthetic benign edits of 994 ordinary
+functions produce 0 flags. Results are written to `ml/evaluation/results/guard_diff_eval.json`.
+
 ---
 
 ## Project layout

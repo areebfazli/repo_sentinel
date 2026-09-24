@@ -287,3 +287,45 @@ python scripts/build_corpus_from_osv.py --ecosystem PyPI --ecosystem npm --max-a
   commit-URL parsing, diff-hunk overlap, the CWE→category table, whitespace-only-change
   detection, the advisory split, the dedupe key, and the quality score and filter. See
   `tests/unit/test_build_corpus_from_osv.py`.
+
+### Ordinary-function negatives
+
+The OSV eval sets are half vulnerable, so their precision doesn't reflect a real PR, where
+maybe 1–5% of functions are vulnerable. `scripts/build_ordinary_negatives.py` builds
+`ml/evaluation/datasets/detection_eval_ordinary.jsonl`: 1,000 ordinary functions from the same
+real repos that no security fix touched. It works offline from `data/osv_cache/`, makes no API
+calls and loads no models.
+
+```bash
+python scripts/build_ordinary_negatives.py        # --seed 42 --eval-fraction 0.15, as the builder
+```
+
+- **Source.** The functions come from the files each **held-out** advisory's fix commit modified,
+  taken at the fix commit. The script recomputes the split with the builder's own functions. An
+  advisory or commit that also appears on the corpus side is dropped.
+- **Exclusions.** A function is dropped if it:
+  - overlaps any patch hunk (context lines and pure deletions included);
+  - sits on a test, doc or example path;
+  - is outside 3–120 lines;
+  - is a trivial accessor with ≤ 3 statement lines (`--no-drop-trivial` keeps these);
+  - has the same repo, file and name as any function a mined fix commit changed;
+  - has the same normalised body (sha256, with comments and whitespace removed) as any eval item,
+    corpus entry or earlier pick.
+- **Sampling.** Selection is seeded. The language mix follows the eval sets (80% Python, 20%
+  JavaScript), with at most `--per-repo-cap 25` functions per repo.
+- **Item fields.** Items use the eval format with `label: "safe"`, `category: "none"`,
+  `expected_cve_id: null`, `source: "osv_ordinary"` and `kind: "ordinary"`. They also carry
+  `repo`, `commit`, `advisory_id`, `file_path`, `function_name`, `line_count` and
+  `repo_in_corpus`.
+- **`length_matched`.** Ordinary functions are much shorter than the vulnerable eval items
+  (median 14 vs 29 lines). `length_matched: true` marks the largest subset that matches the OSV
+  vulnerable items' line-count quintiles per language. Report false-positive rate on that
+  subset too.
+- **`kind` for older eval items.** Older items have no `kind` field; it comes from the id:
+  - `source: "handwritten"` → `handwritten`
+  - an id ending `_vuln` → `vulnerable`
+  - an id ending `_safe` → `fixed_twin`
+
+  `infer_kind` in the script implements this.
+- **Caveat.** These functions are not known to be bug-free. They were only never changed by a
+  known security fix.

@@ -238,20 +238,30 @@ only the vulnerable one is flagged, and the reverse. `--sample-kinds
 vulnerable=40,fixed_twin=40,ordinary=80 --seed S` draws a stratified sample that keeps
 pairs together. With the same kinds and seed, raising the quotas gives a superset.
 
-**LLM report stage (`--llm`).** This measures the real precision filter end to end. For
-every item with retrieved CVEs, the eval builds the production prompt (the top
-`RETRIEVAL_TOP_K` matches, including the fix diff) and calls the configured `LLMRouter`. It
-then validates the findings against the retrieved-ID allowlist exactly as the API does. An
-item counts as vulnerable when a validated finding references a retrieved CVE.
-`realistic_any_finding` also scores the API's `is_vulnerable`, which is true for any
-validated finding. The run makes real provider calls, so it has several limits:
+**LLM stage (`--llm`).** This measures the reviewer end to end. `--llm-prompt` picks the arm:
+
+- `current` (default): the production review prompt, built exactly as a snippet scan builds
+  it: the item's top retrieved CVEs (capped at `LLM_MAX_CVES_PER_UNIT`, with fix diffs), the
+  Semgrep evidence from one engine run over all items as snippets, the prompt budget, and a
+  deterministic per-item nonce (so prompts and cache keys are reproducible). guard_diff is
+  not applicable (a snippet has no previous version). Every item gets a call. An item counts
+  as vulnerable when a finding survives validation (its quote is in the code), which is what
+  the API's `is_vulnerable` means; `realistic_cve_finding` also counts findings that cite a
+  shown CVE.
+- `no_retrieval`: the same prompt and Semgrep evidence with zero CVEs.
+- `legacy`: the old retrieval-only prompt (`ml/evaluation/legacy_prompt.py`). Items without
+  retrieved CVEs get no call, and an item counts as vulnerable when a validated finding
+  references a retrieved CVE (`realistic_any_finding`: any validated finding).
+
+Realistic metrics also report the false-positive rate on length-matched ordinary functions
+(`fpr_ordinary_length_matched`). The run makes real provider calls, so it has several limits:
 - `--llm-max-calls N` is required and capped at 200.
 - Calls are paced by `--llm-sleep` (2.5 s) and `--llm-tpm` (8000 tokens/min).
 - `--llm-token-budget T` sets a hard token stop.
 - The run stops cleanly on a daily-limit error or on repeated rate limits.
 - Results are cached in `ml/evaluation/results/llm_cache.jsonl` by (item id, prompt
   sha256, model), so re-running the same command resumes without re-calling.
-- `--llm-primary-only` keeps every answer on one model.
+- `--llm-primary-only` keeps every answer on one model. Compare arms on the same model.
 
 Results go to `--out` only, never to the baseline:
 

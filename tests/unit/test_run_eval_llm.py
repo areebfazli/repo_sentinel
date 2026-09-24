@@ -123,6 +123,7 @@ def _run(entries, router, **kw):
     kw.setdefault("sleep_s", 0.0)
     kw.setdefault("tpm", 0)
     kw.setdefault("progress", False)
+    kw.setdefault("arm", "legacy")
     return asyncio.run(run_eval.run_llm_stage(entries, router, **kw))
 
 
@@ -594,7 +595,7 @@ def test_main_llm_end_to_end(tmp_path, monkeypatch, op_settings):
     cache = tmp_path / "cache.jsonl"
     argv = ["--dataset", str(ds), "--out", str(out), "--no-rerank", "--llm",
             "--llm-max-calls", "10", "--llm-cache", str(cache), "--llm-tpm", "0",
-            "--llm-sleep", "0"]
+            "--llm-sleep", "0", "--llm-prompt", "legacy"]
     run_eval.main(argv)
 
     data = json.loads(out.read_text())
@@ -620,3 +621,158 @@ def test_main_llm_end_to_end(tmp_path, monkeypatch, op_settings):
     assert len(router.calls) == 3
     assert json.loads(out.read_text())["llm"]["status_counts"] == {"cached": 3, "no_candidates": 1}
 
+
+
+# --- prompt arms (current / no_retrieval / legacy) ------------------------------
+
+
+class StubSemgrep:
+    """Flags eval() in any unit; records what it was asked to scan."""
+
+    def __init__(self):
+        self.calls = []
+
+    def available(self):
+        return True
+
+    def scan_units(self, units, sources=None):
+        self.calls.append((units, sources))
+        return {
+            (u["file_path"], u["function_name"], u["start_line"]): [
+                {"rule_id": "python_eval_rule-eval", "severity": "high", "cwe": ["CWE-95"],
+                 "line": 2, "end_line": 2, "message": "eval", "snippet": ""}]
+            for u in units if "eval(" in u["code"]
+        }
+
+
+EVAL_CODE = "def run(expr):\n    return eval(expr)\n"
+
+
+def _review_entry(item_id="e_vuln", code=EVAL_CODE, cves=None, kind="vulnerable",
+                  label="vulnerable", **kw):
+    cves = [{"cve_id": f"CVE-{i}", "category": "code_injection", "similarity_score": 0.5,
+             "vulnerable_code": "eval(x)", "fixed_code": "ast.literal_eval(x)"}
+            for i in range(3)] if cves is None else cves
+    return {"id": item_id, "kind": kind, "label": label, "category": "code_injection",
+            "language": "python", "code": code, "cves": cves, **kw}
+
+
+def test_review_arm_prompt_is_the_production_snippet_prompt():
+    from backend.app.core.review_plan import (
+        assign_uids,
+        build_review_units,
+        plan_review_prompts,
+        snippet_unit,
+    )
+
+    e = _review_entry()
+    run_eval.attach_semgrep([e], StubSemgrep())
+    batch, prompt = run_eval.review_prompt_for(e, "current")
+    # Built independently the way scan_runner does for a snippet scan.
+    unit = snippet_unit(e["code"], "python")
+    units = build_review_units(
+        [unit], {"ghost_hunter_findings": e["cves"], "team_memory_findings": []},
+        {(None, None, 1): e["semgrep"]})
+    [prod_batch], _ = plan_review_prompts(
+        units, max_prompt_tokens=run_eval.settings.LLM_MAX_PROMPT_TOKENS,
+        max_units_per_prompt=run_eval.settings.LLM_MAX_UNITS_PER_PROMPT,
+        max_calls=run_eval.settings.LLM_MAX_CALLS_PER_SCAN,
+        max_refs_per_unit=run_eval.settings.LLM_MAX_CVES_PER_UNIT)
+    assert prompt == run_eval.review_prompt.build_user_prompt(
+        assign_uids(prod_batch), run_eval.eval_nonce(e["id"]))
+    assert "cve_id=CVE-0" in prompt and "cve_id=CVE-1" in prompt
+    assert "cve_id=CVE-2" not in prompt  # LLM_MAX_CVES_PER_UNIT = 2
+    assert "python_eval_rule-eval" in prompt
+    assert run_eval.review_prompt_for(e, "current")[1] == prompt  # deterministic nonce
+
+    _, bare = run_eval.review_prompt_for(e, "no_retrieval")
+    assert "cve_id=" not in bare and "python_eval_rule-eval" in bare
+
+
+def test_review_arms_call_every_item_and_require_a_quote():
+    entries = [
+        _review_entry("a_vuln"),
+        _review_entry("a_safe", code="def run(expr):\n    return ast.literal_eval(expr)\n",
+                      kind="fixed_twin", label="safe"),
+        _review_entry("o1", code="def add(a, b):\n    return a + b\n", cves=[],
+                      kind="ordinary", label="safe", length_matched=True),
+    ]
+    run_eval.attach_semgrep(entries, StubSemgrep())
+
+    def respond(user):
+        if "return eval(expr)" in user:
+            return {"findings": [{"unit": "U1", "severity": "high", "title": "eval",
+                                  "quoted_code": "return eval(expr)", "cve_id": "CVE-0"}]}
+        # A finding whose quote isn't in the code is dropped.
+        return {"findings": [{"unit": "U1", "title": "made up", "quoted_code": "os.system(x)"}]}
+
+    router = StubRouter(respond)
+    stage = _run(entries, router, arm="current")
+    assert len(router.calls) == 3  # the ordinary item without CVEs is reviewed too
+    assert router.calls[0][0] == run_eval.review_prompt.SYSTEM_PROMPT
+    recs = {r["id"]: r for r in stage["records"]}
+    assert recs["a_vuln"]["prediction"] and recs["a_vuln"]["cve_finding"]
+    assert recs["a_vuln"]["semgrep_rules"] == ["python_eval_rule-eval"]
+    assert not recs["a_safe"]["prediction"] and recs["a_safe"]["raw_finding_count"] == 1
+    assert recs["o1"]["prediction"] is False and recs["o1"]["length_matched"] is True
+    summary = run_eval.summarize_llm(stage, {e["id"]: True for e in entries})
+    assert summary["realistic"]["pairs"]["vuln_only"] == 1.0
+    assert summary["realistic_cve_finding"]["tpr_vulnerable"]["rate"] == 1.0
+
+    nr = StubRouter(respond)
+    stage = _run(entries, nr, arm="no_retrieval")
+    assert all("cve_id=" not in u for _, u in nr.calls)
+    # The cited CVE wasn't shown, so it is stripped: still a finding, no CVE.
+    rec = stage["records"][0]
+    assert rec["prediction"] and not rec["cve_finding"] and rec["shown_cve_ids"] == []
+
+
+def test_length_matched_ordinary_fpr():
+    recs = [
+        {"id": "o1", "kind": "ordinary", "label": "safe", "pred": True, "length_matched": True},
+        {"id": "o2", "kind": "ordinary", "label": "safe", "pred": False, "length_matched": True},
+        {"id": "o3", "kind": "ordinary", "label": "safe", "pred": True, "length_matched": False},
+        {"id": "v_vuln", "kind": "vulnerable", "label": "vulnerable", "pred": True},
+    ]
+    m = run_eval.realistic_metrics(recs)
+    assert m["fpr_ordinary"]["rate"] == pytest.approx(2 / 3, abs=1e-4)
+    assert m["fpr_ordinary_length_matched"]["rate"] == 0.5
+    assert m["precision_at_base_rate_length_matched"]["0.01"] == pytest.approx(
+        0.01 / (0.01 + 0.5 * 0.99), abs=1e-4)
+
+
+def test_main_current_arm_end_to_end(tmp_path, monkeypatch, op_settings):
+    ds = tmp_path / "ds.jsonl"
+    items = [
+        _item("CVE-1_f_vuln", "vulnerable", EVAL_CODE, language="python"),
+        _item("CVE-1_f_safe", "safe", "def run(expr):\n    return 1\n", language="python"),
+        _item("ord_2", "safe", "unmatched code", category="none", kind="ordinary",
+              language="python", length_matched=True),
+    ]
+    ds.write_text("".join(json.dumps(i) + "\n" for i in items))
+    store = StubVectorStore({EVAL_CODE: [_payload("CVE-7", 0.9)]})
+    monkeypatch.setattr(
+        run_eval, "build_components", lambda *a, **k: (StubEmbedder(), store, None)
+    )
+    scanner = StubSemgrep()
+    monkeypatch.setattr(run_eval, "build_semgrep_scanner", lambda: scanner)
+
+    def respond(user):
+        if "return eval(expr)" in user:
+            return {"findings": [{"unit": "U1", "title": "eval", "quoted_code": "eval(expr)"}]}
+        return {"findings": []}
+
+    router = StubRouter(respond)
+    monkeypatch.setattr(run_eval, "build_llm_router", lambda primary_only=False: router)
+    out = tmp_path / "out.json"
+    run_eval.main(["--dataset", str(ds), "--out", str(out), "--no-rerank", "--llm",
+                   "--llm-max-calls", "10", "--llm-cache", str(tmp_path / "c.jsonl"),
+                   "--llm-tpm", "0", "--llm-sleep", "0"])
+    llm = json.loads(out.read_text())["llm"]
+    assert len(router.calls) == 3  # every item, retrieval or not
+    assert llm["config"]["prompt"] == "current" and "guard_diff" in llm["config"]
+    assert llm["config"]["semgrep"]["items_with_evidence"] == {"vulnerable": 1}
+    assert len(scanner.calls) == 1  # one engine run for all items
+    r = llm["realistic"]
+    assert r["tpr_vulnerable"]["rate"] == 1.0 and r["fpr_fixed_twin"]["rate"] == 0.0
+    assert r["fpr_ordinary_length_matched"]["n"] == 1

@@ -51,13 +51,21 @@ point" (exactly what score() counts at SIM_THRESHOLD_CVE).
 ``--sample-kinds vulnerable=40,fixed_twin=40,ordinary=80 --seed S`` draws a
 deterministic stratified sample (vuln/twin pairs kept together).
 
-``--llm`` adds the report stage: for every item with retrieved CVEs it builds
-the production prompt (``build_user_prompt(code, top-K CVE matches, [])``, as
-scan_runner does in snippet mode), calls ``LLMRouter.generate``, validates the
-findings against the retrieved-id allowlist and predicts "vulnerable" iff a
-validated finding references a retrieved CVE (``realistic_any_finding`` also
-scores production's ``is_vulnerable`` = any validated finding). Items without
-retrieved CVEs are "safe" without a call (production skips the LLM there too).
+``--llm`` adds the LLM stage; ``--llm-prompt`` picks the arm:
+
+- ``current`` (default): the production review prompt, built exactly as
+  scan_runner builds a snippet scan (one unit; its top-K retrieved CVEs capped
+  to LLM_MAX_CVES_PER_UNIT; Semgrep evidence from one engine run over all items
+  as snippets; the LLM_MAX_PROMPT_TOKENS budget; a deterministic per-item nonce
+  so prompts and cache keys are reproducible). guard_diff is not applicable:
+  a snippet has no previous version. Every item gets a call; prediction =
+  production's ``is_vulnerable`` = at least one reviewed finding whose quote is
+  in the code (``realistic_cve_finding``: one that also cites a shown CVE).
+- ``no_retrieval``: the same prompt and Semgrep evidence with zero CVEs.
+- ``legacy``: the pre-2026-09-24 prompt (``ml/evaluation/legacy_prompt.py``):
+  items with retrieved CVEs only (others "safe" without a call, as the old
+  production did), prediction = a validated finding references a retrieved CVE
+  (``realistic_any_finding``: any validated finding).
 Calls are capped (``--llm-max-calls``, <= 200 per run), paced
 (``--llm-sleep``, ``--llm-tpm``), stop cleanly on repeated rate limits or a
 daily limit, and are cached in a JSONL file keyed by (item id, prompt sha256,
@@ -81,11 +89,20 @@ _ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(_ROOT))
 
 from backend.app.config import BASE_DIR, settings  # noqa: E402
+from backend.app.core import markdown_renderer as review_prompt  # noqa: E402
 from backend.app.core.cve_retriever import passes_twin_margin  # noqa: E402
 from backend.app.core.embedder import Embedder  # noqa: E402
 from backend.app.core.embedding_cache import EmbeddingCache  # noqa: E402
+from backend.app.core.evidence import semgrep_evidence  # noqa: E402
 from backend.app.core.llm_client import LLMRouter  # noqa: E402
 from backend.app.core.reranker import Reranker  # noqa: E402
+from backend.app.core.review_plan import (  # noqa: E402
+    assign_uids,
+    build_review_units,
+    plan_review_prompts,
+    snippet_unit,
+    unit_key,
+)
 from backend.app.core.vector_store import VectorStore  # noqa: E402
 from ml.evaluation.legacy_prompt import (  # noqa: E402
     SYSTEM_PROMPT,
@@ -414,6 +431,8 @@ def gather(
                 "category": item.get("category"),
                 "kind": item_kind(item),
                 "label": item["label"],
+                "language": item.get("language"),
+                "length_matched": item.get("length_matched"),
                 "code": code,
                 "candidates": scored,
             }
@@ -551,7 +570,10 @@ def realistic_metrics(records: list[dict], base_rates=BASE_RATES) -> dict:
       fpr_fixed_twin / fpr_ordinary / fpr_handwritten_safe: flagged fraction of
       fixed twins, ordinary functions, handwritten safe items (tpr_handwritten
       for handwritten vulnerable ones). Each with a Wilson 95% interval.
-    - precision_at_base_rate[pi] = TPR*pi / (TPR*pi + FPR_ordinary*(1-pi)).
+      fpr_ordinary_length_matched: ordinary items with ``length_matched`` true
+      (line counts matched to the vulnerable items; ordinary code is shorter).
+    - precision_at_base_rate[pi] = TPR*pi / (TPR*pi + FPR_ordinary*(1-pi))
+      (``_length_matched``: with the length-matched FPR).
     - precision_balanced_vs_{fixed_twin,ordinary}: the same at pi = 0.5.
     - pairs: over (vuln, fixed twin) pairs with both scored, the fraction with
       only the vuln flagged (vuln_only — the discrimination we want), only the
@@ -566,6 +588,9 @@ def realistic_metrics(records: list[dict], base_rates=BASE_RATES) -> dict:
     tpr = _rate(preds(lambda r: r["kind"] == KIND_VULNERABLE))
     fpr_twin = _rate(preds(lambda r: r["kind"] == KIND_FIXED_TWIN))
     fpr_ord = _rate(preds(lambda r: r["kind"] == KIND_ORDINARY))
+    fpr_ord_lm = _rate(
+        preds(lambda r: r["kind"] == KIND_ORDINARY and r.get("length_matched") is True)
+    )
     fpr_hw = _rate(preds(lambda r: r["kind"] == KIND_HANDWRITTEN and r["label"] != "vulnerable"))
     tpr_hw = _rate(preds(lambda r: r["kind"] == KIND_HANDWRITTEN and r["label"] == "vulnerable"))
 
@@ -597,10 +622,15 @@ def realistic_metrics(records: list[dict], base_rates=BASE_RATES) -> dict:
         "tpr_vulnerable": tpr,
         "fpr_fixed_twin": fpr_twin,
         "fpr_ordinary": fpr_ord,
+        "fpr_ordinary_length_matched": fpr_ord_lm,
         "fpr_handwritten_safe": fpr_hw,
         "tpr_handwritten": tpr_hw,
         "precision_at_base_rate": {
             str(pi): precision_at_base_rate(tpr["rate"], fpr_ord["rate"], pi)
+            for pi in base_rates
+        },
+        "precision_at_base_rate_length_matched": {
+            str(pi): precision_at_base_rate(tpr["rate"], fpr_ord_lm["rate"], pi)
             for pi in base_rates
         },
         "precision_balanced_vs_fixed_twin": precision_at_base_rate(
@@ -630,6 +660,7 @@ def print_realistic(title: str, m: dict) -> None:
     print(f"  TPR vulnerable        {_fmt_rate(m['tpr_vulnerable'])}")
     print(f"  FPR fixed twin        {_fmt_rate(m['fpr_fixed_twin'])}")
     print(f"  FPR ordinary          {_fmt_rate(m['fpr_ordinary'])}")
+    print(f"  FPR ordinary (len-m.) {_fmt_rate(m['fpr_ordinary_length_matched'])}")
     print(f"  FPR handwritten safe  {_fmt_rate(m['fpr_handwritten_safe'])}")
     print(f"  TPR handwritten       {_fmt_rate(m['tpr_handwritten'])}")
     prec = ", ".join(
@@ -658,14 +689,14 @@ def estimate_tokens(text: str) -> int:
     return math.ceil(len(text) / 4)
 
 
-def prompt_sha256(user_prompt: str) -> str:
+def prompt_sha256(user_prompt: str, system_prompt: str = SYSTEM_PROMPT) -> str:
     """Cache key part: covers the system prompt too, so editing it invalidates."""
-    return hashlib.sha256(f"{SYSTEM_PROMPT}\x00{user_prompt}".encode()).hexdigest()
+    return hashlib.sha256(f"{system_prompt}\x00{user_prompt}".encode()).hexdigest()
 
 
 def llm_decision(llm_json, cves: list[dict]) -> dict:
-    """Validate an LLM response exactly as scan_runner does and derive the
-    prediction. ``prediction`` = a validated finding references a retrieved CVE
+    """``legacy`` arm: validate an LLM response as the old scan_runner did and
+    derive the prediction. ``prediction`` = a validated finding references a retrieved CVE
     (a CVE finding in the report); ``any_finding`` = any validated finding
     (production's ``is_vulnerable``). Raises ValueError on a response shape the
     production pipeline would fail the scan on."""
@@ -685,6 +716,98 @@ def llm_decision(llm_json, cves: list[dict]) -> dict:
         "raw_finding_count": len(raw),
         "flagged_cve_ids": flagged,
         "flagged_categories": sorted({str(categories.get(c)) for c in flagged}),
+    }
+
+
+def review_decision(llm_json, batch: list[dict]) -> dict:
+    """``current`` / ``no_retrieval`` arms: validate as scan_runner does now
+    (the quote must be in the unit; a cve_id outside the shown matches is
+    stripped). ``prediction`` = ``any_finding`` = at least one reviewed finding
+    (production's ``is_vulnerable``); ``cve_finding`` = one cites a shown CVE.
+    Raises ValueError on a response shape production would reject."""
+    if not isinstance(llm_json, dict):
+        raise ValueError(f"LLM returned a JSON {type(llm_json).__name__}, not an object")
+    raw = llm_json.get("findings", [])
+    if not isinstance(raw, list):
+        raise ValueError(f"'findings' is a {type(raw).__name__}, not a list")
+    shown = [c for u in batch for c in u["cves"]]
+    allowed = {c.get("cve_id") for c in shown if c.get("cve_id")}
+    validated = review_prompt.validate_findings(raw, batch, allowed, set())
+    flagged = [f["cve_id"] for f in validated if f.get("cve_id")]
+    categories = {c.get("cve_id"): c.get("category") for c in shown}
+    return {
+        "prediction": bool(validated),
+        "any_finding": bool(validated),
+        "cve_finding": bool(flagged),
+        "validated_count": len(validated),
+        "raw_finding_count": len(raw),
+        "flagged_cve_ids": flagged,
+        "flagged_categories": sorted({str(categories.get(c)) for c in flagged}),
+        "cwes": sorted({f["cwe"] for f in validated if f.get("cwe")}),
+    }
+
+
+LLM_PROMPT_ARMS = ("current", "legacy", "no_retrieval")
+ARM_RULES = {
+    "current": "vulnerable iff >= 1 reviewed finding (quote in the code); production prompt "
+               "with retrieved CVEs + Semgrep evidence, snippet mode (guard_diff N/A)",
+    "no_retrieval": "vulnerable iff >= 1 reviewed finding; production prompt with Semgrep "
+                    "evidence but zero CVEs",
+    "legacy": "vulnerable iff >= 1 validated finding references a retrieved CVE (the old "
+              "prompt; items without retrieved CVEs get no call)",
+}
+
+
+def eval_nonce(item_id: str) -> str:
+    """Deterministic stand-in for untrusted.new_nonce(), so the prompt (and its
+    cache key) is reproducible across runs."""
+    return hashlib.sha256(f"eval-nonce:{item_id}".encode()).hexdigest()[:16]
+
+
+def review_prompt_for(e: dict, arm: str) -> tuple[list[dict] | None, str | None]:
+    """(batch, user prompt) exactly as scan_runner builds them for a snippet
+    scan of ``e``: one unit with its Semgrep evidence (``e["semgrep"]``) and,
+    for ``current``, its retrieved CVEs; budgeted by the production settings.
+    (None, None) when the unit can't fit a prompt (production: not reviewed)."""
+    unit = snippet_unit(e["code"], e.get("language"))
+    raw = {"ghost_hunter_findings": e["cves"] if arm == "current" else [],
+           "team_memory_findings": []}
+    units = build_review_units([unit], raw, {unit_key(unit): e.get("semgrep") or []})
+    batches, _ = plan_review_prompts(
+        units,
+        max_prompt_tokens=settings.LLM_MAX_PROMPT_TOKENS,
+        max_units_per_prompt=settings.LLM_MAX_UNITS_PER_PROMPT,
+        max_calls=settings.LLM_MAX_CALLS_PER_SCAN,
+        max_refs_per_unit=settings.LLM_MAX_CVES_PER_UNIT,
+    )
+    if not batches:
+        return None, None
+    batch = assign_uids(batches[0])
+    return batch, review_prompt.build_user_prompt(batch, eval_nonce(e["id"]))
+
+
+def attach_semgrep(entries: list[dict], scanner) -> dict:
+    """Scan every entry's code as a snippet (one engine run, no file context,
+    like production snippet mode) and store evidence-grade hits in
+    ``e["semgrep"]``. Returns a summary (items with evidence, by kind)."""
+    units = [
+        {"file_path": f"item{i:05d}", "function_name": None, "start_line": 1,
+         "code": e["code"], "language": e.get("language")}
+        for i, e in enumerate(entries)
+    ]
+    t0 = time.perf_counter()
+    hits = semgrep_evidence(scanner, units, None, settings.SEMGREP_MIN_SEVERITY,
+                            frozenset(settings.SEMGREP_EXCLUDED_RULES))
+    for e, u in zip(entries, units, strict=True):
+        e["semgrep"] = hits.get(unit_key(u), [])
+    by_kind = Counter(e["kind"] for e in entries if e["semgrep"])
+    return {
+        "engine_available": bool(scanner is not None and scanner.available()),
+        "min_severity": settings.SEMGREP_MIN_SEVERITY,
+        "items_with_evidence": dict(by_kind),
+        "items_by_kind": dict(Counter(e["kind"] for e in entries)),
+        "rules": dict(Counter(h["rule_id"] for e in entries for h in e["semgrep"])),
+        "seconds": round(time.perf_counter() - t0, 2),
     }
 
 
@@ -818,6 +941,8 @@ def build_llm_entries(
             "kind": g["kind"],
             "label": g["label"],
             "category": g["category"],
+            "language": g.get("language"),
+            "length_matched": g.get("length_matched"),
             "code": g["code"],
             "cves": operating_cves(g, sim_t, rerank_t, margin_t, top_k),
         }
@@ -838,12 +963,16 @@ async def run_llm_stage(
     tap: HttpUsageTap | None = None,
     sleep=asyncio.sleep,
     progress: bool = True,
+    arm: str = "current",
 ) -> dict:
-    """Run the report stage over ``entries`` (see ``build_llm_entries``).
+    """Run the report stage over ``entries`` (see ``build_llm_entries``) with
+    the ``arm``'s prompt (``LLM_PROMPT_ARMS``, rules in ``ARM_RULES``).
 
-    Per item ``status``: ``no_candidates`` (no retrieved CVE -> "safe", no call,
-    as in production), ``ok`` / ``cached`` (scored), ``error`` (the call failed —
-    excluded from metrics), ``not_run`` (a stop condition hit first — excluded).
+    Per item ``status``: ``no_candidates`` (legacy only: no retrieved CVE ->
+    "safe", no call, as the old production did), ``too_large`` (the unit can't
+    fit a prompt -> not reviewed, "safe", no call), ``ok`` / ``cached``
+    (scored), ``error`` (the call failed — excluded from metrics), ``not_run``
+    (a stop condition hit first — excluded).
     Stops calling (remaining items -> not_run) after ``max_calls`` real calls,
     when the next call would exceed ``token_budget``, on a daily-limit error, or
     after ``max_rate_limit_errors`` consecutive rate-limited failures. Between
@@ -859,22 +988,40 @@ async def run_llm_stage(
     for idx, e in enumerate(entries, start=1):
         rec = {
             "id": e["id"], "kind": e["kind"], "label": e["label"], "category": e["category"],
+            "length_matched": e.get("length_matched"),
             "retrieved_cve_ids": [c.get("cve_id") for c in e["cves"]],
         }
         records.append(rec)
-        if not e["cves"]:
-            rec.update(status="no_candidates", prediction=False, any_finding=False,
-                       validated_count=0)
-            continue
-        prompt = build_user_prompt(e["code"], e["cves"], [])
-        sha = prompt_sha256(prompt)
+        if arm == "legacy":
+            if not e["cves"]:
+                rec.update(status="no_candidates", prediction=False, any_finding=False,
+                           validated_count=0)
+                continue
+            system = SYSTEM_PROMPT
+            prompt = build_user_prompt(e["code"], e["cves"], [])
+
+            def decide(llm_json, e=e):
+                return llm_decision(llm_json, e["cves"])
+        else:
+            batch, prompt = review_prompt_for(e, arm)
+            if batch is None:
+                rec.update(status="too_large", prediction=False, any_finding=False,
+                           validated_count=0)
+                continue
+            system = review_prompt.SYSTEM_PROMPT
+            rec["shown_cve_ids"] = [c.get("cve_id") for c in batch[0]["cves"]]
+            rec["semgrep_rules"] = [h["rule_id"] for h in batch[0]["semgrep"]]
+
+            def decide(llm_json, batch=batch):
+                return review_decision(llm_json, batch)
+        sha = prompt_sha256(prompt, system)
         rec["prompt_sha256"] = sha
-        rec["prompt_tokens_est"] = estimate_tokens(SYSTEM_PROMPT) + estimate_tokens(prompt)
+        rec["prompt_tokens_est"] = estimate_tokens(system) + estimate_tokens(prompt)
 
         cached = cache.get(e["id"], sha, model) if cache is not None else None
         if cached is not None:
             try:
-                rec.update(llm_decision(cached["llm_json"], e["cves"]))
+                rec.update(decide(cached["llm_json"]))
                 rec.update(status="cached", provider_used=cached.get("provider_used"),
                            latency_s=cached.get("latency_s"), usage=cached.get("usage"))
                 continue
@@ -900,7 +1047,7 @@ async def run_llm_stage(
         t0 = time.perf_counter()
         error: BaseException | None = None
         try:
-            llm_json, provider = await router.generate(SYSTEM_PROMPT, prompt)
+            llm_json, provider = await router.generate(system, prompt)
         except asyncio.CancelledError:
             # Ctrl-C under asyncio.run: keep what we have (the cache already
             # holds every finished item) and let main() write the partial --out.
@@ -917,7 +1064,7 @@ async def run_llm_stage(
 
         if error is None:
             try:
-                rec.update(llm_decision(llm_json, e["cves"]))
+                rec.update(decide(llm_json))
             except ValueError as exc:
                 error = exc
             else:
@@ -983,18 +1130,25 @@ def summarize_llm(stage: dict, retrieval_preds: dict[str, bool]) -> dict:
 
     def rows(key: str) -> list[dict]:
         return [
-            {"id": r["id"], "kind": r["kind"], "label": r["label"], "pred": r.get(key)}
+            {"id": r["id"], "kind": r["kind"], "label": r["label"],
+             "length_matched": r.get("length_matched"), "pred": r.get(key)}
             for r in recs
         ]
 
     same_items = [
         {"id": r["id"], "kind": r["kind"], "label": r["label"],
+         "length_matched": r.get("length_matched"),
          "pred": retrieval_preds[r["id"]] if r.get("prediction") is not None else None}
         for r in recs
     ]
     tps = [r for r in recs if r.get("prediction") and r["label"] == "vulnerable"]
     hits = sum(str(r.get("category")) in r.get("flagged_categories", []) for r in tps)
+    extra = {}
+    if any(r.get("cve_finding") is not None for r in recs):
+        # Review arms: how many reviewed findings also cite a shown CVE.
+        extra["realistic_cve_finding"] = realistic_metrics(rows("cve_finding"))
     return {
+        **extra,
         "realistic": realistic_metrics(rows("prediction")),
         "realistic_any_finding": realistic_metrics(rows("any_finding")),
         "realistic_retrieval_same_items": realistic_metrics(same_items),
@@ -1156,8 +1310,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     llm.add_argument(
         "--llm", action="store_true",
-        help="Also run the production LLM report stage on every item with retrieved "
-        "CVEs. Requires --llm-max-calls and --out.",
+        help="Also run the LLM review stage on every item (legacy: every item with "
+        "retrieved CVEs). Requires --llm-max-calls and --out.",
+    )
+    llm.add_argument(
+        "--llm-prompt", choices=LLM_PROMPT_ARMS, default="current",
+        help="current (default): the production review prompt with retrieved CVEs and "
+        "Semgrep evidence (snippet mode, so no guard_diff); no_retrieval: the same with "
+        "zero CVEs; legacy: the pre-2026-09-24 retrieval-only prompt "
+        "(ml/evaluation/legacy_prompt.py).",
     )
     llm.add_argument(
         "--llm-max-calls", type=int, default=None, metavar="N",
@@ -1250,6 +1411,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                 ("--llm-max-calls", args.llm_max_calls, None),
                 ("--llm-token-budget", args.llm_token_budget, None),
                 ("--llm-primary-only", args.llm_primary_only, False),
+                ("--llm-prompt", args.llm_prompt, "current"),
             ) if value != default
         ]
         if given:
@@ -1290,13 +1452,28 @@ def build_llm_router(primary_only: bool = False) -> LLMRouter:
     return router
 
 
+def build_semgrep_scanner():
+    """The production scanner settings (None when SEMGREP_ENABLED is off)."""
+    if not settings.SEMGREP_ENABLED:
+        return None
+    from backend.app.core.semgrep_scanner import SemgrepScanner
+
+    return SemgrepScanner(timeout_s=max(settings.SEMGREP_TIMEOUT_S, 300.0),
+                          exclude_rules=frozenset(settings.SEMGREP_EXCLUDED_RULES))
+
+
 def run_llm(args, entries: list[dict], router, retrieval_preds: dict[str, bool]) -> dict:
     """Run + summarize the LLM stage for main(); returns the ``llm`` out-JSON block."""
+    arm = args.llm_prompt
     cache = LLMCache(args.llm_cache)
     chain = ["mock"] if router.mock else [c.label for c in router.clients]
-    n_need = sum(bool(e["cves"]) for e in entries)
+    semgrep_summary = None
+    if arm != "legacy":
+        semgrep_summary = attach_semgrep(entries, build_semgrep_scanner())
+        print(f"Semgrep evidence (snippet mode): {semgrep_summary}")
+    n_need = sum(bool(e["cves"]) for e in entries) if arm == "legacy" else len(entries)
     print(
-        f"\nLLM stage: {n_need}/{len(entries)} items have retrieved CVEs; chain "
+        f"\nLLM stage ({arm} prompt): {n_need}/{len(entries)} items need a call; chain "
         f"{' -> '.join(chain)}; max {args.llm_max_calls} calls; cache {args.llm_cache} "
         f"({len(cache)} entries)."
     )
@@ -1307,7 +1484,7 @@ def run_llm(args, entries: list[dict], router, retrieval_preds: dict[str, bool])
                 entries, router, cache=cache, max_calls=args.llm_max_calls,
                 sleep_s=args.llm_sleep, tpm=args.llm_tpm,
                 max_rate_limit_errors=args.llm_max_rate_limit_errors,
-                token_budget=args.llm_token_budget, tap=tap,
+                token_budget=args.llm_token_budget, tap=tap, arm=arm,
             )
 
     stage = asyncio.run(_run())
@@ -1320,8 +1497,10 @@ def run_llm(args, entries: list[dict], router, retrieval_preds: dict[str, bool])
     )
     if counts.get("not_run"):
         print(f"  {counts['not_run']} items not run — re-run the same command to resume.")
-    print_realistic("LLM report stage (prediction = a validated CVE finding)", summary["realistic"])
-    print_realistic("LLM report stage, any validated finding", summary["realistic_any_finding"])
+    print_realistic(f"LLM stage, {arm} prompt ({ARM_RULES[arm]})", summary["realistic"])
+    if arm == "legacy":
+        print_realistic("LLM stage, legacy prompt, any validated finding",
+                        summary["realistic_any_finding"])
     print_realistic(
         "Retrieval-only on the same scored items", summary["realistic_retrieval_same_items"]
     )
@@ -1336,7 +1515,13 @@ def run_llm(args, entries: list[dict], router, retrieval_preds: dict[str, bool])
             "token_budget": args.llm_token_budget,
             "cache": _rel(args.llm_cache),
             "top_k": settings.RETRIEVAL_TOP_K,
-            "rule": "vulnerable iff >= 1 validated finding references a retrieved CVE",
+            "prompt": arm,
+            "rule": ARM_RULES[arm],
+            "cves_per_unit": None if arm == "legacy" else (
+                0 if arm == "no_retrieval" else settings.LLM_MAX_CVES_PER_UNIT),
+            "max_prompt_tokens": None if arm == "legacy" else settings.LLM_MAX_PROMPT_TOKENS,
+            "semgrep": semgrep_summary,
+            "guard_diff": "not applicable: snippet mode has no previous version of the code",
         },
         "calls": stage["calls"],
         "tokens_used": stage["tokens_used"],

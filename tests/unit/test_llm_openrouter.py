@@ -226,9 +226,12 @@ def test_openrouter_as_fallback_provider(monkeypatch):
     monkeypatch.setattr(settings, "GROQ_FALLBACK_MODEL", None)
     monkeypatch.setattr(settings, "OPENROUTER_API_KEY", "ork")
     monkeypatch.setattr(settings, "OPENROUTER_MODEL", OR_PRIMARY)
+    monkeypatch.setattr(settings, "OPENROUTER_FALLBACK_MODEL", OR_FB)
+    # The fallback provider brings its own same-provider fallback model too.
     assert [c.label for c in LLMRouter().clients] == [
         "groq:openai/gpt-oss-120b",
         f"openrouter:{OR_PRIMARY}",
+        f"openrouter:{OR_FB}",
     ]
 
 

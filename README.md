@@ -130,7 +130,9 @@ CORS is scoped to `CORS_ORIGINS` (default `localhost:8080`). Opening `index.html
 
 ## Configuration
 
-Settings come from `.env` via Pydantic (`backend/app/config.py`). Highlights:
+Settings come from `.env` via Pydantic (`backend/app/config.py`). Defaults, including LLM
+routing and model choice, live in code, so `.env` only needs secrets (API keys); any setting
+can still be overridden there. Highlights:
 
 | Setting | Default | Notes |
 |---------|---------|-------|
@@ -141,11 +143,11 @@ Settings come from `.env` via Pydantic (`backend/app/config.py`). Highlights:
 | `RERANKER_MODEL` / `RERANKER_MAX_TOKENS` | `BAAI/bge-reranker-v2-m3` / `512` | Used only when enabled; 512 was the best-measured length and half the cost of 1024 |
 | `RERANK_THRESHOLD` | `0.0` | Gate on `sigmoid(logit)`; only applies with `RERANKER_ENABLED`. Keep-all: rerank probability didn't separate vulnerable from fixed at any threshold |
 | `TWIN_MARGIN_MIN` | (off) | Drop CVE matches that look at least as much like the stored fix as like the bug; calibrate with `run_eval --margin-sweep` |
-| `LLM_PROVIDER` / `LLM_FALLBACK_PROVIDER` | `groq` / `gemini` | `groq` \| `gemini` \| `openrouter` \| `mock`; OpenAI-compatible endpoints; primary → fallback |
-| `GROQ_MODEL` / `GROQ_FALLBACK_MODEL` | `openai/gpt-oss-120b` / `qwen/qwen3.8-27b` | With a Groq primary the chain is Groq primary model → Groq fallback model → `LLM_FALLBACK_PROVIDER` (Groq rate-limits per model). The job result's `llm_provider_used` names the model that answered, e.g. `groq:qwen/qwen3.8-27b` |
-| `OPENROUTER_MODEL` / `OPENROUTER_FALLBACK_MODEL` | `qwen/qwen3.8-27b:free` / `google/gemma-4-31b-it:free` | OpenRouter free models (20 req/min, 1,000 req/day with ≥ $10 credits, fewer without; they need "allow free endpoints that may train on inputs" in OpenRouter's privacy settings or return 404; see [openrouter.ai/docs](https://openrouter.ai/docs)). The qwen primary is always sent without `response_format` (it rejects it); set `OPENROUTER_FALLBACK_MODEL=` to disable the gemma fallback. Same chain shape as Groq: OpenRouter primary model → OpenRouter fallback model → `LLM_FALLBACK_PROVIDER`. 429 is retried; 402 (insufficient credits) is not, and skips OpenRouter's other models; a model that rejects `response_format` is retried once without it |
+| `LLM_PROVIDER` / `LLM_FALLBACK_PROVIDER` | `openrouter` / `groq` | `groq` \| `gemini` \| `openrouter` \| `mock`; OpenAI-compatible endpoints. Default chain: `openrouter:qwen/qwen3.8-27b:free` → `openrouter:google/gemma-4-31b-it:free` → `groq:openai/gpt-oss-120b` → `groq:qwen/qwen3.8-27b` (each provider, primary or fallback, tries its own fallback model after its default one). OpenRouter's free models share an upstream pool and often 429 (`upstream_provider_shared_pool`), so the Groq fallback is what keeps reports flowing |
+| `GROQ_MODEL` / `GROQ_FALLBACK_MODEL` | `openai/gpt-oss-120b` / `qwen/qwen3.8-27b` | Groq default model → Groq fallback model (Groq rate-limits per model); set `GROQ_FALLBACK_MODEL=` to disable the second. The job result's `llm_provider_used` names the model that answered, e.g. `groq:qwen/qwen3.8-27b` |
+| `OPENROUTER_MODEL` / `OPENROUTER_FALLBACK_MODEL` | `qwen/qwen3.8-27b:free` / `google/gemma-4-31b-it:free` | OpenRouter free models (20 req/min, 1,000 req/day with ≥ $10 credits, fewer without; they need "allow free endpoints that may train on inputs" in OpenRouter's privacy settings or return 404; see [openrouter.ai/docs](https://openrouter.ai/docs)). The qwen primary is always sent without `response_format` (it rejects it); set `OPENROUTER_FALLBACK_MODEL=` to disable the gemma fallback. OpenRouter default model → OpenRouter fallback model → `LLM_FALLBACK_PROVIDER`. 429 is retried; 402 (insufficient credits) is not, and skips OpenRouter's other models; a model that rejects `response_format` is retried once without it |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | `/chat/completions` is appended |
-| `GROQ_API_KEY` / `GEMINI_API_KEY` / `OPENROUTER_API_KEY` | (none) | A configured provider with a missing key **hard-fails at startup** |
+| `OPENROUTER_API_KEY` / `GROQ_API_KEY` / `GEMINI_API_KEY` | (none) | The only LLM settings `.env` needs. A missing key for `LLM_PROVIDER` **hard-fails at startup**; a missing key for `LLM_FALLBACK_PROVIDER` just logs a warning and that provider is skipped |
 | `REPOSENTINEL_API_KEY` | (none) | `X-RepoSentinel-Key` header, optional in dev, required in production |
 | `HYBRID_ENABLED` | `False` | Dense + sparse (BM25) RRF fusion; off by default (measured F1 gain below the adoption bar) |
 
@@ -261,13 +263,14 @@ tests/            pytest suite (unit + integration; slow eval regression)
 
 ## Notes & gotchas
 
-- **The LLM is Groq/Gemini/OpenRouter, never a silent mock.** Mock output only happens with an
-  explicit `LLM_PROVIDER=mock`. Defaults are `openai/gpt-oss-120b` with `qwen/qwen3.8-27b` as a
-  same-provider Groq fallback before Gemini; a retired model id (HTTP 404) is logged as a
-  "not found or decommissioned" warning naming the model and falls through to the next one.
-  `LLM_PROVIDER=openrouter` targets OpenRouter's free models: an error object inside an HTTP 200
-  is treated as a failed call (not a crash), and replies wrapped in ```` ```json ```` fences or
-  preceded by reasoning text are still parsed.
+- **The LLM is OpenRouter/Groq/Gemini, never a silent mock.** Mock output only happens with an
+  explicit `LLM_PROVIDER=mock`. The default chain is OpenRouter (`qwen/qwen3.8-27b:free`, then
+  `google/gemma-4-31b-it:free`) → Groq (`openai/gpt-oss-120b`, then `qwen/qwen3.8-27b`). OpenRouter's
+  free models share an upstream pool and often 429 (`upstream_provider_shared_pool`), so set
+  `GROQ_API_KEY` too; a retired model id (HTTP 404) is logged as a "not found or decommissioned"
+  warning naming the model and falls through to the next one. For OpenRouter an error object
+  inside an HTTP 200 is treated as a failed call (not a crash), and replies wrapped in
+  ```` ```json ```` fences or preceded by reasoning text are still parsed.
 - **Local Qdrant is single-process.** The API, ingest scripts, and eval can never run at the
   same time; scripts print "stop the API first" on a lock error.
 - **Any embedding-model change requires `--recreate` on both collections.** Payloads carry

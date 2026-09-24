@@ -26,10 +26,17 @@ class Settings(BaseSettings):
     # API Keys
     GITHUB_TOKEN: str | None = None
 
-    # LLM providers (OpenAI-compatible chat-completions endpoints).
-    # A configured provider with a missing key hard-errors at startup — never a silent mock.
-    LLM_PROVIDER: str = "groq"          # groq | gemini | openrouter | mock
-    LLM_FALLBACK_PROVIDER: str | None = "gemini"
+    # LLM providers (OpenAI-compatible chat-completions endpoints). Routing and
+    # model choice are code defaults; .env only needs the API keys (env vars
+    # still override). A primary provider with a missing key hard-errors at
+    # startup — never a silent mock; a fallback provider without a key is skipped.
+    # Chain: openrouter:OPENROUTER_MODEL -> openrouter:OPENROUTER_FALLBACK_MODEL
+    #        -> groq:GROQ_MODEL -> groq:GROQ_FALLBACK_MODEL.
+    # OpenRouter's free models share an upstream pool and often 429 with
+    # "upstream_provider_shared_pool" (seen for both qwen and gemma), so a
+    # cross-provider fallback to our own Groq key is required, not optional.
+    LLM_PROVIDER: str = "openrouter"    # groq | gemini | openrouter | mock
+    LLM_FALLBACK_PROVIDER: str | None = "groq"
     GROQ_API_KEY: str | None = None
     GEMINI_API_KEY: str | None = None
     GROQ_MODEL: str = "openai/gpt-oss-120b"

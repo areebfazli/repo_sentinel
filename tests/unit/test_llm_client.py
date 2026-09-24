@@ -21,6 +21,90 @@ def test_default_models():
     assert Settings.model_fields["GROQ_FALLBACK_MODEL"].default == "qwen/qwen3.8-27b"
 
 
+def test_default_routing_is_openrouter_then_groq():
+    # Routing is a code default (.env only needs keys). OpenRouter's free models
+    # share an upstream pool (429 upstream_provider_shared_pool), so Groq backs it.
+    fields = Settings.model_fields
+    assert fields["LLM_PROVIDER"].default == "openrouter"
+    assert fields["LLM_FALLBACK_PROVIDER"].default == "groq"
+    assert fields["OPENROUTER_MODEL"].default == "qwen/qwen3.8-27b:free"
+    assert fields["OPENROUTER_FALLBACK_MODEL"].default == "google/gemma-4-31b-it:free"
+
+
+def test_routing_defaults_apply_without_env(monkeypatch):
+    # conftest forces LLM_PROVIDER=mock for the suite; drop it to see the defaults.
+    for var in ("LLM_PROVIDER", "LLM_FALLBACK_PROVIDER"):
+        monkeypatch.delenv(var, raising=False)
+    s = Settings(_env_file=None)
+    assert (s.LLM_PROVIDER, s.LLM_FALLBACK_PROVIDER) == ("openrouter", "groq")
+
+
+DEFAULT_CHAIN = [
+    "openrouter:qwen/qwen3.8-27b:free",
+    "openrouter:google/gemma-4-31b-it:free",
+    "groq:openai/gpt-oss-120b",
+    "groq:qwen/qwen3.8-27b",
+]
+
+
+def _pin_default_chain(monkeypatch, groq_key="gk"):
+    """Pin routing/model settings to the Settings code defaults (a local .env or
+    the conftest LLM_PROVIDER=mock can't change them), plus fake keys."""
+    for name in (
+        "LLM_PROVIDER", "LLM_FALLBACK_PROVIDER",
+        "OPENROUTER_MODEL", "OPENROUTER_FALLBACK_MODEL", "OPENROUTER_BASE_URL",
+        "GROQ_MODEL", "GROQ_FALLBACK_MODEL",
+    ):
+        monkeypatch.setattr(settings, name, Settings.model_fields[name].default)
+    monkeypatch.setattr(settings, "OPENROUTER_API_KEY", "ork")
+    monkeypatch.setattr(settings, "GROQ_API_KEY", groq_key)
+    monkeypatch.setattr(settings, "LLM_RETRIES", 0)
+
+
+def test_default_chain_is_four_steps(monkeypatch):
+    _pin_default_chain(monkeypatch)
+    assert [c.label for c in LLMRouter().clients] == DEFAULT_CHAIN
+
+
+def test_default_chain_without_groq_key_is_openrouter_only(monkeypatch):
+    _pin_default_chain(monkeypatch, groq_key=None)
+    assert [c.label for c in LLMRouter().clients] == DEFAULT_CHAIN[:2]
+
+
+def test_default_chain_missing_openrouter_key_fails_fast(monkeypatch):
+    _pin_default_chain(monkeypatch)
+    monkeypatch.setattr(settings, "OPENROUTER_API_KEY", None)
+    with pytest.raises(RuntimeError, match="OPENROUTER_API_KEY"):
+        LLMRouter()
+
+
+def test_default_chain_falls_through_all_four_links(monkeypatch):
+    """Stubbed HTTP: every link but the last fails, in chain order."""
+    _pin_default_chain(monkeypatch)
+    router = LLMRouter()
+    calls: list[str] = []
+    shared_pool_429 = _FakeResp(
+        429, {"error": {"code": 429, "message": "upstream_provider_shared_pool"}},
+    )
+
+    def responder(url, **kwargs):
+        model = kwargs["json"]["model"]
+        provider = "openrouter" if "openrouter.ai" in url else "groq"
+        label = f"{provider}:{model}"
+        calls.append(label)
+        if label == DEFAULT_CHAIN[0] or label == DEFAULT_CHAIN[1]:
+            return shared_pool_429
+        if label == DEFAULT_CHAIN[2]:
+            return _FakeResp(503, {}, text="unavailable")
+        return _FakeResp(200, {"choices": [{"message": {"content": '{"findings": []}'}}]})
+
+    _patch_async_client(monkeypatch, responder)
+    payload, provider = asyncio.run(router.generate("sys", "user"))
+    assert provider == "groq:qwen/qwen3.8-27b"
+    assert payload == {"findings": []}
+    assert calls == DEFAULT_CHAIN
+
+
 def test_mock_mode_returns_canned_response(monkeypatch):
     monkeypatch.setattr(settings, "LLM_PROVIDER", "mock")
     router = LLMRouter()
@@ -73,8 +157,22 @@ def test_groq_fallback_model_skipped_when_unset_or_same_as_primary(monkeypatch, 
     ]
 
 
-def test_groq_fallback_model_not_used_for_non_groq_primary(monkeypatch):
+def test_fallback_provider_also_gets_its_same_provider_fallback_model(monkeypatch):
     _pin_models(monkeypatch)
+    monkeypatch.setattr(settings, "LLM_PROVIDER", "gemini")
+    monkeypatch.setattr(settings, "LLM_FALLBACK_PROVIDER", "groq")
+    monkeypatch.setattr(settings, "GROQ_API_KEY", "gk")
+    monkeypatch.setattr(settings, "GEMINI_API_KEY", "gm")
+    router = LLMRouter()
+    assert [c.label for c in router.clients] == [
+        "gemini:gemini-2.0-flash",
+        "groq:openai/gpt-oss-120b",
+        "groq:qwen/qwen3.8-27b",
+    ]
+
+
+def test_fallback_provider_model_fallback_skipped_when_unset(monkeypatch):
+    _pin_models(monkeypatch, groq_fallback=None)
     monkeypatch.setattr(settings, "LLM_PROVIDER", "gemini")
     monkeypatch.setattr(settings, "LLM_FALLBACK_PROVIDER", "groq")
     monkeypatch.setattr(settings, "GROQ_API_KEY", "gk")

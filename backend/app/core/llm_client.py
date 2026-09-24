@@ -4,9 +4,13 @@ Groq, Gemini and OpenRouter all expose OpenAI-compatible chat-completions
 endpoints, so one thin async client handles them. Each client is one
 (provider, model) pair. LLMRouter's chain is: primary provider/model -> the
 primary provider's same-provider fallback model (groq -> GROQ_FALLBACK_MODEL,
-openrouter -> OPENROUTER_FALLBACK_MODEL) -> LLM_FALLBACK_PROVIDER. Groq and
-OpenRouter's free models rate-limit per model, so the second model is a genuine
-fallback, not a redundant one.
+openrouter -> OPENROUTER_FALLBACK_MODEL) -> LLM_FALLBACK_PROVIDER's model -> that
+provider's own same-provider fallback model. With the defaults:
+openrouter:qwen/qwen3.8-27b:free -> openrouter:google/gemma-4-31b-it:free ->
+groq:openai/gpt-oss-120b -> groq:qwen/qwen3.8-27b. Groq and OpenRouter's free
+models rate-limit per model, so the second model is a genuine fallback, not a
+redundant one; OpenRouter's free models also share an upstream pool (429
+"upstream_provider_shared_pool"), hence the cross-provider step.
 
 A transient failure (429 / 5xx / timeout) is retried on the SAME client up to
 settings.LLM_RETRIES times with backoff, then falls through to the next client; a
@@ -326,24 +330,33 @@ class LLMRouter:
             # Primary must be fully configured (fail fast). The fallback is
             # best-effort: skip it if its key is absent so a valid single-provider
             # setup still boots.
-            primary = LLMClient(settings.LLM_PROVIDER)
-            self.clients.append(primary)
-            # Same-provider model fallback (groq -> GROQ_FALLBACK_MODEL, openrouter
-            # -> OPENROUTER_FALLBACK_MODEL). Shares the primary's key, which was
-            # just validated, so it can't fail the fail-fast check.
-            fb_setting = PROVIDERS[primary.provider].get("fallback_model_setting")
-            fb_model = getattr(settings, fb_setting) if fb_setting else None
-            if fb_model and fb_model != primary.model:
-                self.clients.append(LLMClient(primary.provider, model=fb_model))
+            self.clients.extend(self._provider_clients(settings.LLM_PROVIDER))
             fb = settings.LLM_FALLBACK_PROVIDER
             if fb and fb not in ("mock", settings.LLM_PROVIDER):
                 if _key_configured(_provider_key(fb)):
-                    self.clients.append(LLMClient(fb))
+                    self.clients.extend(self._provider_clients(fb))
                 else:
                     logger.warning(
                         "Fallback provider '{}' has no key configured; "
                         "running primary-only.", fb
                     )
+
+    @staticmethod
+    def _provider_clients(provider: str) -> list[LLMClient]:
+        """The provider's default model, then its same-provider fallback model.
+
+        groq -> GROQ_FALLBACK_MODEL, openrouter -> OPENROUTER_FALLBACK_MODEL
+        (skipped when unset or equal to the default model). Built for the
+        primary and the fallback provider alike. The first LLMClient raises on a
+        missing key; the second shares that key, so it can't fail differently.
+        """
+        first = LLMClient(provider)
+        clients = [first]
+        fb_setting = PROVIDERS[provider].get("fallback_model_setting")
+        fb_model = getattr(settings, fb_setting) if fb_setting else None
+        if fb_model and fb_model != first.model:
+            clients.append(LLMClient(provider, model=fb_model))
+        return clients
 
     async def generate(self, system: str, user: str) -> tuple[dict, str]:
         """Return (parsed_json, provider_used). Raises LLMError if all fail.

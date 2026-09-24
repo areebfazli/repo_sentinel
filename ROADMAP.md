@@ -6,11 +6,11 @@ Decided 2026-09-22. Ordered by expected impact.
 
 1. Record findings (this entry).
 2. Realistic eval: add ordinary (non-security) functions from the same repos as negatives; report FPR and precision at 1/2/5% base rates.
-3. Measure the existing end-to-end LLM prompt in `run_eval` on that set.
-4. Three-arm test: LLM with no retrieval vs top-1 fix diff vs random wrong fix diff (+ ordinary negatives). If equal, CVE retrieval is not useful as evidence -> LLM-first review with Semgrep evidence; keep CVEs for citations/category hints.
-5. Semgrep/Opengrep with full language rule packs (not category-selected: retrieval gets the class wrong 72% of the time on named categories).
-6. PR diff-direction check ("did this PR remove a guard?") — the judge got 0/7 guard-added pairs.
-7. Prompt-injection hardening + per-scan token budget / CVE cap.
+3. ~~Measure the existing end-to-end LLM prompt in `run_eval` on that set.~~ **Done**: TPR 1/14, FPR twin 1/14, FPR ordinary 1/22 (gpt-oss-120b, 50 items).
+4. ~~Three-arm test~~ **Done 2026-09-24** as legacy prompt vs new LLM-first prompt vs the same with no retrieval (see "Results 2026-09-24" below). Retrieval added nothing measurable -> LLM-first review with Semgrep evidence shipped; CVEs stay as optional reference / citations.
+5. ~~Semgrep/Opengrep with full language rule packs~~ **Done** (b946269), wired into scans as prompt evidence (41c855f).
+6. ~~PR diff-direction check~~ **Done** (4567539), wired into files-mode scans (41c855f): `guard_removed` as prompt evidence, `alert` tier as deterministic findings.
+7. ~~Prompt-injection hardening + per-scan token budget / CVE cap.~~ **Done** (663138c, 0bf6274).
 8. Later: embedding speed (findings cache per function hash), neural judge experiments.
 
 ## Findings 2026-09-24 (precision research + adversarial review)
@@ -30,6 +30,41 @@ Decided 2026-09-22. Ordered by expected impact.
 - A per-CVE LLM call would be up to 150 calls / ~134K tokens per PR; Groq free tier for these models is ~30 req/min, 8K tokens/min, 200K tokens/day (https://console.groq.com/docs/rate-limits).
 - No prompt-injection handling exists; third-party fix code and PR code go straight into the prompt.
 - LLM defaults: llama-3.3-70b-versatile retired on Groq (404); now openai/gpt-oss-120b with qwen/qwen3.8-27b same-provider fallback.
+
+## Results 2026-09-24 (LLM-first review)
+
+Changes: the LLM reviews every unit on its own merits (retrieved CVEs are "similar known
+vulnerabilities, may or may not apply"); every finding must quote the offending code (dropped
+if the quote isn't there); Semgrep high/critical hits and guard_diff changes go in as
+evidence; untrusted text is nonce-tagged and sanitised, output escaped; per-scan token budget.
+
+Three arms on ONE model (`groq:qwen/qwen3.8-27b`, `--llm-primary-only`; OpenRouter's
+`qwen/qwen3.8-27b:free` returned 4/4 `upstream_provider_shared_pool` 429s at the start). To stay
+under a 190K-token Groq daily budget across arms the sample was halved, keeping pairs:
+`--sample-kinds vulnerable=8,fixed_twin=8,ordinary=13 --seed 42` (a subset of the earlier 14/14/22
+sample; pypi + npm + ordinary sets). Snippet mode, so guard_diff is N/A. Wilson 95% CIs.
+
+| arm | TPR vulnerable | FPR fixed twin | FPR ordinary | FPR ordinary (length-matched) | precision @1/2/5% (point; with the ordinary-FPR upper 95% bound) | pairs vuln-only / twin-only / both / neither | calls / tokens |
+|---|---|---|---|---|---|---|---|
+| legacy prompt | 1/8 = 0.13 [0.02, 0.47] | 2/8 = 0.25 [0.07, 0.59] | 0/13 [0, 0.23] | 0/7 [0, 0.35] | 1.0 (FPR 0/13); 0.006 / 0.011 / 0.028 | 1 / 2 / 0 / 5 | 29 / 57.2K |
+| current (new prompt + CVEs + Semgrep) | 2/8 = 0.25 [0.07, 0.59] | 1/8 = 0.13 [0.02, 0.47] | 1/13 = 0.08 [0.01, 0.33] | 1/7 = 0.14 [0.03, 0.51] | 0.032 / 0.062 / 0.146; 0.008 / 0.015 / 0.038 | 1 / 0 / 1 / 6 | 29 / 69.0K |
+| no_retrieval (new prompt + Semgrep, 0 CVEs) | 2/8 = 0.25 [0.07, 0.59] | 1/8 = 0.13 [0.02, 0.47] | 1/13 = 0.08 [0.01, 0.33] | 1/7 = 0.14 [0.03, 0.51] | 0.032 / 0.062 / 0.146; 0.008 / 0.015 / 0.038 | 1 / 0 / 1 / 6 | 29 / 38.9K |
+
+- `current` and `no_retrieval` flagged exactly the same four items; retrieval changed no verdict
+  and cost +77% tokens. Only one `current` finding cited a CVE (on an SSRF pair, both twins).
+- The legacy prompt on the same model found 1/8 and flagged 2 fixed twins (twin-only pairs 2 vs
+  0). The new prompt's ordinary FP is a plausible path-join finding in `ckan/lib/uploader.py`.
+- The quote check dropped nothing on this model (no hallucinated quotes observed).
+- Semgrep (snippet mode, high/critical) fired on 1/29 items (pickle, a true vulnerable one, which
+  both new arms flagged). Standalone numbers (506 pairs + 1,000 ordinary): high/critical hit on
+  3.2% vulnerable / 1.4% fixed / 0.5% ordinary. guard_diff standalone (held-out 506 pairs):
+  `guard_removed` TPR 0.227 / FPR 0.030; `alert` TPR 0.032 / FPR 0/506.
+- Caveats: n = 8 pairs + 13 ordinary; every difference above is within the CIs. One model;
+  gpt-oss-120b (the earlier legacy run, TPR 1/14) is not comparable. OSV functions may be in
+  the model's training data. Results: `ml/evaluation/results/llm_arm_{legacy,current,no_retrieval}_groq_qwen_29.json`.
+- Next: a larger run on a request-limited model (OpenRouter when its pool is free) to tighten
+  the CIs; consider dropping CVE context from the default prompt (`LLM_MAX_CVES_PER_UNIT=0`) if
+  the larger run confirms no gain.
 
 ## 1. Detection quality
 

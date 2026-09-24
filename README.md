@@ -263,6 +263,12 @@ Realistic metrics also report the false-positive rate on length-matched ordinary
   sha256, model), so re-running the same command resumes without re-calling.
 - `--llm-primary-only` keeps every answer on one model. Compare arms on the same model.
 
+Measured 2026-09-24 on one model (`groq:qwen/qwen3.8-27b`, 8 vuln/fixed pairs + 13 ordinary
+functions): the new prompt found 2/8 vulnerable functions vs 1/8 for the legacy prompt, flagged
+1/8 fixed twins (legacy 2/8) and 1/13 ordinary functions (legacy 0/13); the `no_retrieval` arm
+flagged exactly the same items as `current` with 44% fewer tokens. All differences are within
+the confidence intervals; see ROADMAP "Results 2026-09-24".
+
 Results go to `--out` only, never to the baseline:
 
 ```bash

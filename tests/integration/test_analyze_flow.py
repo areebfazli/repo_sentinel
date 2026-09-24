@@ -73,7 +73,11 @@ def test_analyze_queues_and_completes():
             assert data["status"] == "completed"
             assert (data["created_at"] or "").endswith("+00:00")  # UTC-designated
             result = data["result"]
-            assert result["is_vulnerable"] is True
+            # The mock LLM's canned finding quotes no code, so review validation
+            # drops it: a mock scan is clean and says no real review happened.
+            assert result["is_vulnerable"] is False
+            assert result["report_findings"] == []
+            assert "LLM_PROVIDER=mock" in result["report_markdown"]
             assert result["ghost_hunter_matches"] == 1
             assert result["team_memory_matches"] == 0
             assert result["llm_provider_used"] == "mock"
@@ -126,6 +130,54 @@ def test_analyze_files_mode_anchors_finding():
             # Only the changed function (risky) is analyzed and anchored.
             assert findings[0]["file_path"] == "app.py"
             assert findings[0]["start_line"] == 4
+    finally:
+        app.dependency_overrides.clear()
+
+
+class QuotingRouter:
+    """Stands in for the LLM: flags the concatenated query line of unit U1."""
+
+    mock = False
+
+    def __init__(self):
+        self.prompts = []
+
+    async def generate(self, system, user):
+        self.prompts.append(user)
+        return {
+            "findings": [
+                {"unit": "U1", "severity": "high", "cwe": "CWE-89", "title": "SQL injection",
+                 "quoted_code": "q = 'SELECT ' + u", "reasoning": "u reaches execute",
+                 "explanation": "Parameterise.", "cve_id": "CVE-2023-28450"},
+                {"unit": "U1", "severity": "high", "title": "made up",
+                 "quoted_code": "os.system(u)"},  # not in the code -> dropped
+            ]
+        }, "groq:stub"
+
+
+@pytest.mark.integration
+def test_files_mode_llm_finding_anchored_to_quoted_line():
+    router = QuotingRouter()
+    app.dependency_overrides[analyze.get_merger] = lambda: StubMerger()
+    app.dependency_overrides[analyze.get_llm_router] = lambda: router
+    try:
+        with TestClient(app) as client:
+            resp = client.post(
+                "/api/v1/analyze/",
+                json={"files": [{"path": "app.py", "content": FILES_CONTENT,
+                                 "changed_lines": [5, 6]}]},
+            )
+            data = client.get(f"/api/v1/analyze/{resp.json()['job_id']}").json()
+            result = data["result"]
+            assert result["is_vulnerable"] is True
+            assert result["llm_provider_used"] == "groq:stub"
+            [f] = result["report_findings"]
+            assert (f["file_path"], f["function_name"], f["start_line"]) == ("app.py", "risky", 4)
+            assert f["line"] == 5 and f["cwe"] == "CWE-89" and f["source"] == "llm"
+            assert f["cve_id"] == "CVE-2023-28450" and f["point_id"] == "pt-cve-1"
+            assert f["dedupe_key"].startswith("llm:")
+            assert "SQL injection" in result["report_markdown"]
+            assert "def risky(u):" in router.prompts[0]
     finally:
         app.dependency_overrides.clear()
 

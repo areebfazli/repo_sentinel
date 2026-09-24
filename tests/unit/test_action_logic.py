@@ -10,6 +10,7 @@ from github_action.scan_pr import (
     extract_marker,
     finding_marker,
     parse_changed_lines,
+    parse_commentable_lines,
     plan_comment_ops,
     severity_gate,
 )
@@ -230,3 +231,27 @@ def test_apply_comment_ops_delete_404_not_counted_as_failure(monkeypatch):
 
     assert posted is True
     assert failures == 0
+
+
+def test_anchor_prefers_exact_line_even_on_context_lines():
+    patch = "@@ -10,4 +10,3 @@\n ctx10\n-removed guard\n ctx11\n+added12\n"
+    changed = parse_changed_lines(patch)
+    commentable = parse_commentable_lines(patch)
+    assert changed == [12] and commentable == [10, 11, 12]
+    # Exact offending line on an unchanged context line next to a deleted guard.
+    assert anchor_line({"line": 11, "start_line": 10}, changed, commentable) == 11
+    # Exact line outside the diff: nearest added line at/after it.
+    assert anchor_line({"line": 5, "start_line": 1}, changed, commentable) == 12
+    # Deletion-only file: fall back to the nearest commentable line.
+    assert anchor_line({"line": 30}, [], [10, 11, 13]) == 13
+    # Older servers (no "line") keep the old behaviour.
+    assert anchor_line({"start_line": 12}, changed) == 12
+
+
+def test_marker_uses_dedupe_key_so_findings_in_one_function_stay_distinct():
+    base = {"file_path": "a.py", "function_name": "f", "start_line": 1, "title": "t"}
+    findings = [{**base, "dedupe_key": "llm:1"}, {**base, "dedupe_key": "llm:2"},
+                {**base, "point_id": "pt-legacy"}]
+    desired, _ = desired_comments(findings, {"a.py": [1]})
+    assert len({d["marker"] for d in desired}) == 3
+    assert desired[2]["marker"] == finding_marker("a.py", "pt-legacy", "f")

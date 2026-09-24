@@ -1,9 +1,10 @@
 """Background scan execution.
 
-Runs the retrieval + LLM pipeline for a queued Scan and persists the result.
-Owns its own DB session (it runs outside the request lifecycle).
+Runs the retrieval + LLM review pipeline for a queued Scan and persists the
+result. Owns its own DB session (it runs outside the request lifecycle).
 """
 import asyncio
+import hashlib
 import json
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -19,7 +20,9 @@ from backend.app.core.markdown_renderer import (
     severity_from_cvss,
     validate_findings,
 )
+from backend.app.core.review_plan import assign_uids, build_review_units, snippet_unit
 from backend.app.core.scoring import relevance
+from backend.app.core.untrusted import new_nonce
 from backend.app.db.models import Finding, Scan
 from backend.app.db.session import SessionLocal
 
@@ -165,21 +168,6 @@ def _get_parser():
     return CodeParser()
 
 
-def _prompt_code_for_files(units: list[dict], raw: dict) -> str:
-    """Build the LLM prompt code from only the functions that produced matches."""
-    matched = {
-        (f.get("anchor_file_path"), f.get("anchor_function_name"))
-        for f in raw.get("ghost_hunter_findings", []) + raw.get("team_memory_findings", [])
-    }
-    parts = []
-    for unit in units:
-        if (unit["file_path"], unit["function_name"]) in matched:
-            fn = unit["function_name"] or ""
-            header = f"# {unit['file_path']}:{unit['start_line']} {fn}".rstrip()
-            parts.append(f"{header}\n{unit['code']}")
-    return "\n\n".join(parts)
-
-
 def _row_snapshot(row: Finding) -> dict:
     """Capture the fields we need from a persisted row before the session commit
     expires its attributes."""
@@ -195,50 +183,67 @@ def _row_snapshot(row: Finding) -> dict:
     }
 
 
-def _build_report_findings(validated: list[dict], row_snaps: list[dict]) -> list[dict]:
-    """Join LLM-validated findings back to persisted retrieval rows so each carries
-    a file/line anchor. A validated finding referencing an id retrieved for several
-    functions yields one report finding per location; generic findings stay
-    unanchored."""
+def _dedupe_key(prefix: str, *parts) -> str:
+    """Stable id of a report finding within its function, for the Action's
+    comment markers (which also hash file + function): survives line shifts and
+    LLM rewording of the title, not a change of the quoted code."""
+    text = "|".join(" ".join(str(p or "").split()) for p in parts)
+    return f"{prefix}:{hashlib.sha1(text.encode()).hexdigest()[:16]}"
+
+
+def _build_report_findings(
+    validated: list[dict], units_by_uid: dict[str, dict], row_snaps: list[dict]
+) -> list[dict]:
+    """Anchor LLM-validated findings (one prompt's, uids per prompt) to their
+    unit's file / function and the exact quoted line. A finding citing a
+    retrieved CVE / team match also links to that match's persisted row (same
+    function), so feedback can target it."""
     report: list[dict] = []
     for f in validated:
-        base = {
-            "severity": f.get("severity"),
-            "cve_id": f.get("cve_id"),
-            "team_pr_id": f.get("team_pr_id"),
-            "title": f.get("title") or "Security finding",
-            "explanation": f.get("explanation") or "",
-            "fix_snippet": f.get("fix_snippet") or "",
-        }
-        matches = [
-            r
-            for r in row_snaps
-            if (f.get("cve_id") and r["cve_id"] == f["cve_id"])
-            or (f.get("team_pr_id") and str(r["team_pr_id"]) == str(f["team_pr_id"]))
-        ]
-        if matches:
-            for r in matches:
-                report.append(
-                    {
-                        **base,
-                        "file_path": r["file_path"],
-                        "start_line": r["start_line"],
-                        "function_name": r["function_name"],
-                        "finding_id": r["finding_id"],
-                        "point_id": r["point_id"],
-                        "source": r["source"],
-                    }
+        unit = units_by_uid[f["unit"]]
+        where = (unit.get("file_path"), unit.get("function_name"))
+        row = next(
+            (
+                r for r in row_snaps
+                if (r["file_path"], r["function_name"]) == where
+                and (
+                    (f.get("cve_id") and r["cve_id"] == f["cve_id"])
+                    or (f.get("team_pr_id") and str(r["team_pr_id"]) == str(f["team_pr_id"]))
                 )
-        else:
-            report.append(
-                {**base, "file_path": None, "start_line": None, "function_name": None,
-                 "finding_id": None, "point_id": None, "source": None}
-            )
+            ),
+            None,
+        )
+        quote_first = (f.get("quoted_code") or "").strip().splitlines()[:1]
+        report.append(
+            {
+                "severity": f.get("severity"),
+                "cve_id": f.get("cve_id"),
+                "team_pr_id": f.get("team_pr_id"),
+                "cwe": f.get("cwe"),
+                "title": f.get("title") or "Security finding",
+                "explanation": f.get("explanation") or "",
+                "reasoning": f.get("reasoning") or "",
+                "quoted_code": f.get("quoted_code") or "",
+                "fix_snippet": f.get("fix_snippet") or "",
+                "file_path": unit.get("file_path"),
+                "start_line": unit.get("start_line"),
+                "function_name": unit.get("function_name"),
+                "line": f.get("line"),
+                "end_line": f.get("end_line"),
+                "finding_id": row["finding_id"] if row else None,
+                "point_id": row["point_id"] if row else None,
+                "source": "llm",
+                "deterministic": False,
+                "dedupe_key": _dedupe_key("llm", quote_first[0] if quote_first else "",
+                                          f.get("cwe") or f.get("title")),
+            }
+        )
     return report
 
 
-async def _analyze_request(merger, request: dict) -> tuple[dict, str, str]:
-    """Run the right retrieval mode. Returns (raw_findings, prompt_code, extra_note)."""
+async def _analyze_request(merger, request: dict) -> dict:
+    """Run the right retrieval mode. Returns {raw, units, notes}: the retrieval
+    result, the analysis units the LLM reviews, and trusted report notes."""
     if request.get("files"):
         from backend.app.core.analysis_planner import plan_units
         from backend.app.models.schemas import FileInput
@@ -249,17 +254,19 @@ async def _analyze_request(merger, request: dict) -> tuple[dict, str, str]:
             plan_units, files, _get_parser(), settings.MAX_UNITS_PER_SCAN
         )
         raw = await merger.analyze_units(units)
-        note = (
-            f"\n\n_Analysis capped at {settings.MAX_UNITS_PER_SCAN} functions; "
-            f"{dropped} not scanned._"
+        notes = (
+            [f"_Analysis capped at {settings.MAX_UNITS_PER_SCAN} functions; "
+             f"{dropped} not scanned._"]
             if dropped
-            else ""
+            else []
         )
-        return raw, _prompt_code_for_files(units, raw), note
+        return {"raw": raw, "units": units, "notes": notes}
 
     code = request["code_snippet"]
-    raw = await merger.analyze_code(code, request.get("language", "python"))
-    return raw, code, ""
+    language = request.get("language")
+    raw = await merger.analyze_code(code, language)
+    units = [snippet_unit(code, language)] if code.strip() else []
+    return {"raw": raw, "units": units, "notes": []}
 
 
 def _mark_failed(session, scan_id: str, error: str) -> None:
@@ -303,7 +310,8 @@ async def _run_scan_guarded(scan_id: str, merger, router) -> None:
         scan = session.get(Scan, scan_id)
 
         request = json.loads(scan.request_json)
-        raw, prompt_code, extra_note = await _analyze_request(merger, request)
+        analysis = await _analyze_request(merger, request)
+        raw, notes = analysis["raw"], analysis["notes"]
         cves = raw.get("ghost_hunter_findings", [])
         team = raw.get("team_memory_findings", [])
 
@@ -315,21 +323,30 @@ async def _run_scan_guarded(scan_id: str, merger, router) -> None:
         row_snaps = [_row_snapshot(r) for r in rows]
         session.commit()
 
+        # The LLM reviews every analysis unit on its own merits; retrieved
+        # matches are reference context, not a precondition for the call.
+        review_units = build_review_units(analysis["units"], raw)
         provider_used = None
         report_findings: list[dict] = []
-        if raw.get("is_vulnerable"):
+        if review_units:
             allowed_cves = {c.get("cve_id") for c in cves if c.get("cve_id")}
             allowed_prs = {str(t.get("pr_id")) for t in team if t.get("pr_id")}
-            user_prompt = build_user_prompt(prompt_code, cves, team)
+            batch = assign_uids(review_units)
+            user_prompt = build_user_prompt(batch, new_nonce())
             llm_json, provider_used = await router.generate(SYSTEM_PROMPT, user_prompt)
-            validated = validate_findings(llm_json.get("findings", []), allowed_cves, allowed_prs)
-            report_findings = _build_report_findings(validated, row_snaps)
-            report_markdown = render_markdown(validated, len(cves), len(team)) + extra_note
-        else:
-            report_markdown = render_markdown([], len(cves), len(team)) + extra_note
+            raw_findings = llm_json.get("findings") if isinstance(llm_json, dict) else None
+            validated = validate_findings(raw_findings, batch, allowed_cves, allowed_prs)
+            report_findings = _build_report_findings(
+                validated, {u["uid"]: u for u in batch}, row_snaps
+            )
+        if provider_used == "mock":
+            notes.append("_LLM_PROVIDER=mock: no real review was performed._")
+        report_markdown = render_markdown(
+            report_findings, len(cves), len(team), units_reviewed=len(review_units), notes=notes
+        )
 
-        # is_vulnerable reflects the LLM verdict (the precision filter), not the
-        # raw high-recall retrieval — so it agrees with the report + report_findings.
+        # is_vulnerable reflects the reviewed findings (the precision filter), not
+        # the raw high-recall retrieval — so it agrees with the report.
         result = {
             "is_vulnerable": bool(report_findings),
             "report_markdown": report_markdown,

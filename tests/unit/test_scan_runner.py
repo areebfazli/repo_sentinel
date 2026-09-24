@@ -1,50 +1,50 @@
 """Unit tests for the pure report-building logic in scan_runner."""
 from backend.app.services.scan_runner import _build_report_findings
 
-
-def test_build_report_findings_carries_function_name_for_matched_row():
-    validated = [{"cve_id": "CVE-1", "title": "SQLi", "explanation": "bad", "fix_snippet": ""}]
-    row_snaps = [
-        {
-            "finding_id": 1,
-            "point_id": "pt-1",
-            "source": "cve",
-            "cve_id": "CVE-1",
-            "team_pr_id": None,
-            "file_path": "app.py",
-            "start_line": 10,
-            "function_name": "handle_login",
-        }
-    ]
-    report = _build_report_findings(validated, row_snaps)
-    assert len(report) == 1
-    assert report[0]["function_name"] == "handle_login"
-    assert report[0]["file_path"] == "app.py"
-    assert report[0]["start_line"] == 10
+_ROW = {
+    "finding_id": 1,
+    "point_id": "pt-1",
+    "source": "cve",
+    "cve_id": "CVE-1",
+    "team_pr_id": None,
+    "file_path": "app.py",
+    "start_line": 10,
+    "function_name": "handle_login",
+}
+_UNITS = {"U1": {"uid": "U1", "file_path": "app.py", "function_name": "handle_login",
+                 "start_line": 10}}
 
 
-def test_build_report_findings_unanchored_finding_has_no_function_name():
-    # A validated finding that doesn't match any retrieval row (generic finding)
-    # falls back to the unanchored branch, which must set function_name to None.
-    validated = [
-        {"cve_id": "CVE-UNMATCHED", "title": "generic", "explanation": "", "fix_snippet": ""}
-    ]
-    row_snaps = [
-        {
-            "finding_id": 1,
-            "point_id": "pt-1",
-            "source": "cve",
-            "cve_id": "CVE-OTHER",
-            "team_pr_id": None,
-            "file_path": "app.py",
-            "start_line": 10,
-            "function_name": "handle_login",
-        }
-    ]
-    report = _build_report_findings(validated, row_snaps)
-    assert len(report) == 1
-    assert report[0]["function_name"] is None
-    assert report[0]["file_path"] is None
+def _validated(**kw):
+    return {"unit": "U1", "cve_id": None, "title": "SQLi", "explanation": "bad",
+            "fix_snippet": "", "quoted_code": "q = 'x' + u", "line": 12, "end_line": 12,
+            "cwe": "CWE-89", **kw}
+
+
+def test_build_report_findings_anchors_to_unit_and_links_cited_row():
+    [f] = _build_report_findings([_validated(cve_id="CVE-1")], _UNITS, [_ROW])
+    assert (f["file_path"], f["function_name"], f["start_line"]) == ("app.py", "handle_login", 10)
+    assert f["line"] == 12 and f["source"] == "llm" and f["deterministic"] is False
+    assert (f["finding_id"], f["point_id"]) == (1, "pt-1")
+    assert f["dedupe_key"].startswith("llm:")
+
+
+def test_build_report_findings_without_citation_is_still_anchored():
+    [f] = _build_report_findings([_validated()], _UNITS, [_ROW])
+    assert f["file_path"] == "app.py" and f["function_name"] == "handle_login"
+    assert f["finding_id"] is None and f["point_id"] is None
+    # A cited CVE retrieved for a DIFFERENT function doesn't link to its row.
+    other = {**_ROW, "function_name": "other"}
+    [g] = _build_report_findings([_validated(cve_id="CVE-1")], _UNITS, [other])
+    assert g["finding_id"] is None
+
+
+def test_dedupe_key_stable_across_rewording_distinct_across_issues():
+    a = _build_report_findings([_validated(title="SQL injection")], _UNITS, [])[0]
+    b = _build_report_findings([_validated(title="Injectable SQL", line=40)], _UNITS, [])[0]
+    c = _build_report_findings([_validated(quoted_code="os.system(c)", cwe="CWE-78")],
+                               _UNITS, [])[0]
+    assert a["dedupe_key"] == b["dedupe_key"] != c["dedupe_key"]
 
 
 def test_finding_out_exposes_twin_scores_from_payload():

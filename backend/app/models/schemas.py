@@ -71,24 +71,37 @@ class FindingOut(BaseModel):
 
 
 class ReportFinding(BaseModel):
-    """An LLM-confirmed finding — what the GitHub Action gates on and comments.
+    """A reviewed finding — what the GitHub Action gates on and comments.
 
-    Unlike FindingOut (every raw retrieval match, for the dashboard), these have
-    passed the LLM's applicability judgment + allowlist validation.
+    Unlike FindingOut (every raw retrieval match, for the dashboard), these are
+    either LLM review findings (``source`` "llm") that quote code actually in the
+    reviewed unit, or deterministic checks (``source`` "guard_diff",
+    ``deterministic`` true). cve_id / team_pr_id are set only when the finding
+    cites a retrieved match (allowlist-checked); finding_id / point_id then link
+    to that match's row. Text fields are plain text: escape them when rendering.
     """
 
     severity: str | None = None
     cve_id: str | None = None
     team_pr_id: str | None = None
+    cwe: str | None = None
     title: str
     explanation: str = ""
+    reasoning: str = ""
+    quoted_code: str = ""
     fix_snippet: str = ""
     file_path: str | None = None
-    start_line: int | None = None
+    start_line: int | None = None  # the unit's (function's) first line
     function_name: str | None = None
+    line: int | None = None  # the offending line itself (first quoted line)
+    end_line: int | None = None
     finding_id: int | None = None
     point_id: str | None = None
     source: str | None = None
+    deterministic: bool = False
+    # Stable per-function identity for comment dedupe (the Action hashes it with
+    # file + function); falls back to point_id for older servers.
+    dedupe_key: str | None = None
 
 
 class AnalyzeResult(BaseModel):

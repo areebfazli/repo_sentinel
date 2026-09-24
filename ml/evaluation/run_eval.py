@@ -85,13 +85,13 @@ from backend.app.core.cve_retriever import passes_twin_margin  # noqa: E402
 from backend.app.core.embedder import Embedder  # noqa: E402
 from backend.app.core.embedding_cache import EmbeddingCache  # noqa: E402
 from backend.app.core.llm_client import LLMRouter  # noqa: E402
-from backend.app.core.markdown_renderer import (  # noqa: E402
+from backend.app.core.reranker import Reranker  # noqa: E402
+from backend.app.core.vector_store import VectorStore  # noqa: E402
+from ml.evaluation.legacy_prompt import (  # noqa: E402
     SYSTEM_PROMPT,
     build_user_prompt,
     validate_findings,
 )
-from backend.app.core.reranker import Reranker  # noqa: E402
-from backend.app.core.vector_store import VectorStore  # noqa: E402
 
 DEFAULT_DATASET = BASE_DIR / "ml" / "evaluation" / "datasets" / "detection_eval.jsonl"
 BASELINE_PATH = BASE_DIR / "ml" / "evaluation" / "baseline.json"

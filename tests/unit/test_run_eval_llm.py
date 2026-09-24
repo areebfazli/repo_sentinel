@@ -9,9 +9,9 @@ import pytest
 
 from backend.app.core.cve_retriever import CVERetriever
 from backend.app.core.llm_client import LLMError
-from backend.app.core.markdown_renderer import SYSTEM_PROMPT, build_user_prompt
 from backend.app.core.reranker import _sigmoid
 from ml.evaluation import run_eval
+from ml.evaluation.legacy_prompt import SYSTEM_PROMPT, build_user_prompt
 
 # --- stubs ------------------------------------------------------------------
 

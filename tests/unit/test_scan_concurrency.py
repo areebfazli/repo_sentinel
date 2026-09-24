@@ -63,6 +63,19 @@ def single_slot_gate(monkeypatch):
     reset_scan_semaphore()
 
 
+class NoFindingsRouter:
+    """The LLM reviews every scan now (not only ones with retrieval matches), so
+    scans need a router; this one never finds anything and never hits a network."""
+
+    mock = False
+
+    async def generate(self, system, user):
+        return {"findings": []}, "stub"
+
+
+_ROUTER = NoFindingsRouter()
+
+
 def _scan(job_id: str) -> Scan | None:
     with SessionLocal() as session:
         scan = session.get(Scan, job_id)
@@ -110,9 +123,9 @@ def test_second_scan_stays_queued_until_the_gate_frees_up(make_scan, single_slot
             # Set before awaiting: run_scan then runs synchronously up to the
             # semaphore, so once this resumes the waiter, it really is waiting.
             second_started.set()
-            await run_scan(second, merger, None)
+            await run_scan(second, merger, _ROUTER)
 
-        task_a = asyncio.create_task(run_scan(first, merger, None))
+        task_a = asyncio.create_task(run_scan(first, merger, _ROUTER))
         task_b = asyncio.create_task(run_second())
         await asyncio.wait_for(merger.entered.wait(), timeout=10)
         await asyncio.wait_for(second_started.wait(), timeout=10)
@@ -145,11 +158,11 @@ def test_failed_scan_is_sanitized_and_frees_the_gate(make_scan, single_slot_gate
     failing, following = make_scan(), make_scan()
 
     async def scenario():
-        await run_scan(failing, BoomMerger(), None)
+        await run_scan(failing, BoomMerger(), _ROUTER)
         merger = GatedMerger()
         merger.proceed.set()
         # Would hang if the failed scan had leaked its permit.
-        await asyncio.wait_for(run_scan(following, merger, None), timeout=10)
+        await asyncio.wait_for(run_scan(following, merger, _ROUTER), timeout=10)
 
     asyncio.run(scenario())
 
@@ -164,7 +177,7 @@ def test_cancelled_scan_is_marked_failed_and_frees_the_gate(make_scan, single_sl
 
     async def scenario():
         merger = GatedMerger()
-        task = asyncio.create_task(run_scan(cancelled, merger, None))
+        task = asyncio.create_task(run_scan(cancelled, merger, _ROUTER))
         await asyncio.wait_for(merger.entered.wait(), timeout=10)
 
         task.cancel()
@@ -172,7 +185,7 @@ def test_cancelled_scan_is_marked_failed_and_frees_the_gate(make_scan, single_sl
             await task
 
         merger.proceed.set()
-        await asyncio.wait_for(run_scan(following, merger, None), timeout=10)
+        await asyncio.wait_for(run_scan(following, merger, _ROUTER), timeout=10)
 
     asyncio.run(scenario())
 

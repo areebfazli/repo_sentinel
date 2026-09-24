@@ -1,10 +1,11 @@
 # RepoSentinel
 
-**An AI security reviewer for pull requests.** RepoSentinel embeds a developer's code and
-runs it concurrently against two vector collections: **Ghost Hunter** (known CVE
-vulnerable-code snippets) and **Team Memory** (the team's own past PR review discussions),
-ranks the matches (by similarity by default; an optional cross-encoder rerank is available),
-then asks an LLM to write a structured, actionable PR comment.
+**An AI security reviewer for pull requests.** An LLM reviews each changed function for
+vulnerabilities on its own merits, with evidence attached: matches from two vector
+collections, **Ghost Hunter** (known CVE vulnerable-code snippets, with how each was fixed) and
+**Team Memory** (the team's own past PR review discussions), ranked by similarity (an optional
+cross-encoder rerank is available). Every finding must quote the offending code, and the
+structured result is rendered into an actionable PR comment.
 
 It ships as three surfaces:
 
@@ -48,11 +49,11 @@ POST /api/v1/analyze/  ──▶  Scan row (queued)  ──▶  202 + job_id
    → feedback suppression / downweight → top-k
                      └──────────────┬──────────────┘
                                     ▼
-            LLM report (Groq gpt-oss-120b → Groq qwen3.8-27b → Gemini)
-                   structured JSON, allowlist-validated
+     LLM review of every unit (OpenRouter → Groq), CVE/team matches as reference
+       untrusted text in nonce-tagged blocks; findings must quote the code
                                     │
                                     ▼
-                     deterministic server-side Markdown
+          deterministic server-side Markdown (all LLM text escaped)
 
 GET /api/v1/analyze/{job_id}  ◀── clients poll for the result
 ```
@@ -62,12 +63,24 @@ GET /api/v1/analyze/{job_id}  ◀── clients poll for the result
 - **Async jobs.** `POST /api/v1/analyze/` returns `202 + job_id` immediately and runs the work
   in a background task; clients poll `GET /api/v1/analyze/{job_id}`. Findings are persisted so
   the feedback loop works regardless of who's polling.
-- **Retrieval is tuned for recall, the LLM is the precision filter.** Embedding similarity
-  alone can't reliably separate a safe snippet from its vulnerable twin (they embed alike), so
-  the similarity gate is deliberately low (`SIM_THRESHOLD_CVE=0.25`) and the LLM report does the
-  final precision filtering.
-- **Anti-hallucination.** The LLM prompt embeds an allowlist of the retrieved CVE / PR IDs;
-  any finding that references an ID outside that list is dropped server-side.
+- **The LLM reviews the code; retrieval is reference context.** Embedding similarity can't
+  separate a safe snippet from its vulnerable twin (they embed alike) and picks the right bug
+  class only ~28% of the time on named categories, so retrieved CVEs are shown to the LLM as
+  "similar known vulnerabilities, may or may not apply" (with the fix diff where stored), not
+  as the only findings it may report. The old retrieval-only prompt found 1 of 14 vulnerable
+  functions end to end (ROADMAP, Findings 2026-09-24).
+- **Anti-hallucination.** Each finding must quote the offending line(s) verbatim; a finding
+  whose quote isn't in the reviewed code is dropped server-side, and its line anchors the PR
+  comment. A cited CVE / team-PR id outside the retrieved allowlist is removed from the finding
+  (the finding stays).
+- **Prompt-injection hardening.** PR code, file names, corpus code, advisory text and team
+  comments are untrusted: each goes into a `<untrusted_<nonce>>` block with a per-prompt random
+  nonce, after HTML comments and zero-width / bidi characters are made visible, backtick
+  fences and tag look-alikes are defused and length is capped; the system prompt says
+  instructions inside those blocks are data. On the way out, every LLM-written field is
+  escaped when rendered (server report and the Action's inline comments), so a finding can't
+  inject links, images, HTML, @-mentions or `<!-- reposentinel:... -->` markers
+  (`backend/app/core/untrusted.py`).
 - **Feedback loop.** Every finding ties back to a specific vector (`point_id`). Thumbs-up/down
   votes are aggregated across scans and used to suppress or downweight noisy matches.
 - **Files mode.** Changed files are split into functions with tree-sitter; only functions that
@@ -159,9 +172,11 @@ See `.env.example` for the full list.
 
 `.github/workflows/repo_sentinel.yml` runs `github_action/scan_pr.py` on pull requests. It
 collects the PR's changed files, POSTs them in files mode, and posts **inline review comments**
-anchored to changed lines (deduped across pushes via hidden
-`<!-- reposentinel:f:<sha1> -->` markers), plus a summary comment and a configurable severity
-gate.
+anchored to the finding's quoted line when it is in the diff (added or context line), else the
+nearest changed line. Comments are deduped across pushes via hidden
+`<!-- reposentinel:f:<sha1> -->` markers (hash of file, function and the finding's
+`dedupe_key`; only a marker at the very end of a comment counts). It also posts a summary
+comment and applies a configurable severity gate. Finding text is escaped before it is posted.
 
 Configure two repository secrets:
 

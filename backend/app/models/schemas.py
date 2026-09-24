@@ -168,7 +168,14 @@ class AnalyzeResult(BaseModel):
     static_analysis: list[StaticAnalysisHit] = []
     guard_diff: list[GuardDiffOut] = []
     # LLM review coverage: prompts sent, and units left out (never silently).
+    # review_status: "complete" | "partial" (units not reviewed, or reviewed with
+    # changed code cut) | "failed" (no unit reviewed: every LLM call failed);
+    # None on results stored before the field existed.
     llm_calls: int = 0
+    review_status: str | None = None
+    units_total: int | None = None
+    units_reviewed: int | None = None
+    units_partially_reviewed: int | None = None
     units_not_reviewed: list[UnitNotReviewed] = []
 
 

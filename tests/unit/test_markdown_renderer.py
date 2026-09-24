@@ -252,6 +252,22 @@ def test_render_clean_when_no_findings():
     assert "3 unit(s) reviewed" in md
 
 
+def test_render_partial_or_failed_review_is_never_clean():
+    md = render_markdown([], 0, 0, units_reviewed=5, review_status="partial", units_total=7,
+                         units_not_reviewed=2, units_partial=1)
+    assert "✅" not in md and "No security findings in the reviewed code" not in md
+    assert "⚠️ Partial review: 2 of 7 unit(s) not reviewed, 1 only partly reviewed" in md
+    assert "5 of 7 unit(s) reviewed" in md
+    md = render_markdown([], 0, 0, units_reviewed=0, review_status="failed", units_total=3,
+                         units_not_reviewed=3)
+    assert md.startswith("## ❌") and "LLM review failed: none of the 3 unit(s)" in md
+    finding = {"severity": "high", "title": "t", "source": "guard_diff", "file_path": "a.py"}
+    md = render_markdown([finding], 0, 0, review_status="failed", units_total=3,
+                         units_not_reviewed=3)
+    assert md.startswith("## 🔴") and "LLM review failed" in md and "Removed security" in md
+    assert "✅" in render_markdown([], 0, 0, review_status="complete", units_total=3)
+
+
 def test_render_findings_with_refs_and_deterministic_section():
     findings = [
         {"severity": "medium", "title": "weak check", "source": "llm", "file_path": "a.py",

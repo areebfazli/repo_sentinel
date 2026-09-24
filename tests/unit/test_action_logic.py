@@ -255,3 +255,53 @@ def test_marker_uses_dedupe_key_so_findings_in_one_function_stay_distinct():
     desired, _ = desired_comments(findings, {"a.py": [1]})
     assert len({d["marker"] for d in desired}) == 3
     assert desired[2]["marker"] == finding_marker("a.py", "pt-legacy", "f")
+
+
+def test_review_status_and_backward_compatibility():
+    assert scan_pr.review_status({"review_status": "failed"}) == "failed"
+    # Older servers: no review_status -> derived from units_not_reviewed.
+    assert scan_pr.review_status({"units_not_reviewed": [{"reason": "budget"}]}) == "partial"
+    assert scan_pr.review_status({"units_not_reviewed": []}) == "complete"
+    assert scan_pr.review_status({}) == "complete"  # oldest servers: as before
+
+
+def test_coverage_gate_is_configurable():
+    partial = {"review_status": "partial", "units_not_reviewed": [{}], "units_total": 4}
+    assert scan_pr.coverage_gate(partial, True) == 1
+    assert scan_pr.coverage_gate(partial, False) == 0
+    assert scan_pr.coverage_gate({"review_status": "failed"}, True) == 1
+    assert scan_pr.coverage_gate({"review_status": "complete"}, True) == 0
+
+
+def test_summary_shows_partial_review(monkeypatch):
+    partial = {"review_status": "partial", "units_not_reviewed": [{}, {}], "units_total": 5,
+               "units_partially_reviewed": 1}
+    md = build_summary("", "high", partial, True)
+    assert "✅" not in md.split("Review coverage")[0]
+    assert "⚠️ Review coverage: `partial` (2 of 5 unit(s) not reviewed, 1 only partly reviewed)" \
+        in md
+    assert "fails on partial review" in md
+    assert extract_marker(md) == "reposentinel:summary"
+
+
+def test_main_fails_on_partial_review_by_default(monkeypatch, tmp_path):
+    import json
+
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps({"pull_request": {"number": 7, "head": {"sha": "a" * 40}}}))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+    monkeypatch.setenv("INPUT_FAIL_ON_SEVERITY", "high")
+    monkeypatch.setattr(scan_pr.sys, "argv", ["scan_pr.py", "--dry-run"])
+    monkeypatch.setattr(scan_pr, "collect_changed_files",
+                        lambda *a: [{"path": "a.py", "content": "x", "patch": None}])
+    result = {"report_findings": [], "report_markdown": "## r", "review_status": "partial",
+              "units_not_reviewed": [{"reason": "budget"}], "units_total": 2}
+    monkeypatch.setattr(scan_pr, "run_analysis", lambda *a: result)
+    assert scan_pr.main() == 1
+    monkeypatch.setenv("INPUT_FAIL_ON_PARTIAL", "false")
+    assert scan_pr.main() == 0
+    monkeypatch.delenv("INPUT_FAIL_ON_PARTIAL")
+    result["review_status"] = "complete"
+    result["units_not_reviewed"] = []
+    assert scan_pr.main() == 0

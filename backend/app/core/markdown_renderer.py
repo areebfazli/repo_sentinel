@@ -515,6 +515,25 @@ def _render_finding(f: dict[str, Any]) -> list[str]:
     return block
 
 
+def coverage_banner(
+    review_status: str | None, units_total: int, units_not_reviewed: int, units_partial: int
+) -> str | None:
+    """The report's review-coverage line, or None for a complete review."""
+    if review_status == "failed":
+        return (f"**❌ LLM review failed: none of the {units_total} unit(s) was reviewed.** "
+                "Only the deterministic checks ran; no findings here does NOT mean the code "
+                "is clean.")
+    if review_status == "partial":
+        bits = []
+        if units_not_reviewed:
+            bits.append(f"{units_not_reviewed} of {units_total} unit(s) not reviewed")
+        if units_partial:
+            bits.append(f"{units_partial} only partly reviewed")
+        return (f"**⚠️ Partial review: {', '.join(bits) or 'coverage incomplete'}.** "
+                "Findings cover the reviewed code only.")
+    return None
+
+
 def render_markdown(
     findings: list[dict],
     cve_count: int,
@@ -523,14 +542,24 @@ def render_markdown(
     units_reviewed: int | None = None,
     static_hits: int = 0,
     notes: list[str] | None = None,
+    review_status: str | None = None,
+    units_total: int = 0,
+    units_not_reviewed: int = 0,
+    units_partial: int = 0,
 ) -> str:
     """Render the PR comment from validated structured findings (deterministic;
     every LLM-written field escaped). ``findings`` from the LLM carry
     ``source`` "llm" (or none); deterministic ones "guard_diff". ``notes`` are
-    our own trusted lines (budget / cap notices)."""
+    our own trusted lines (budget / cap notices). ``review_status``
+    ("complete" | "partial" | "failed", see ``scan_runner.review_coverage``)
+    decides whether an empty report may say "no findings": only a complete
+    review gets the clean ✅."""
     footer_bits = []
     if units_reviewed is not None:
-        footer_bits.append(f"{units_reviewed} unit(s) reviewed")
+        footer_bits.append(
+            f"{units_reviewed} of {units_total} unit(s) reviewed" if units_total
+            else f"{units_reviewed} unit(s) reviewed"
+        )
     footer_bits.append(
         f"{cve_count} similar CVE(s) and {team_count} team-memory match(es) as reference"
     )
@@ -538,18 +567,26 @@ def render_markdown(
         footer_bits.append(f"{static_hits} static-analysis hit(s) as evidence")
     footer = f"_{'; '.join(footer_bits)}._"
     tail = [footer, *(notes or [])]
+    banner = coverage_banner(review_status, units_total, units_not_reviewed, units_partial)
 
     if not findings:
-        return "\n\n".join(
-            ["## ✅ RepoSentinel Security Report", "No security findings in the reviewed code.",
-             *tail]
-        )
+        if banner is None:
+            return "\n\n".join(
+                ["## ✅ RepoSentinel Security Report",
+                 "No security findings in the reviewed code.", *tail]
+            )
+        icon = "❌" if review_status == "failed" else "⚠️"
+        empty = ("No deterministic findings." if review_status == "failed"
+                 else "No security findings in the code that was reviewed.")
+        return "\n\n".join([f"## {icon} RepoSentinel Security Report", banner, empty, *tail])
 
     findings = sorted(findings, key=lambda f: SEVERITY_ORDER.get(f.get("severity"), 4))
     reviewed = [f for f in findings if f.get("source") != "guard_diff"]
     deterministic = [f for f in findings if f.get("source") == "guard_diff"]
 
     out = ["## 🔴 RepoSentinel Security Report", ""]
+    if banner:
+        out.extend([banner, ""])
     if reviewed:
         out.append("### 🔍 Review findings")
         for f in reviewed:

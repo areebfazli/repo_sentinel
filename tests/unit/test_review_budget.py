@@ -217,6 +217,8 @@ def test_scan_reports_units_beyond_the_call_cap(monkeypatch):
     assert "1 unit(s) NOT reviewed by the LLM (LLM budget: 2 call(s)" in result["report_markdown"]
     assert len(result["report_findings"]) == 2  # one per successful call
     assert result["llm_provider_used"] == "groq:stub"
+    assert result["review_status"] == "partial"
+    assert (result["units_total"], result["units_reviewed"]) == (5, 4)
 
 
 def test_partial_llm_failure_keeps_the_rest_and_says_so(monkeypatch):
@@ -226,12 +228,19 @@ def test_partial_llm_failure_keeps_the_rest_and_says_so(monkeypatch):
     assert [u["reason"] for u in result["units_not_reviewed"]] == ["llm_error", "llm_error"]
     assert "LLM call failed" in result["report_markdown"]
     assert len(result["report_findings"]) == 1
+    assert result["review_status"] == "partial"
+    assert "Partial review: 2 of 4 unit(s) not reviewed" in result["report_markdown"]
 
 
-def test_all_llm_calls_failing_fails_the_scan(monkeypatch):
-    status, _ = _run_files(2, ScriptedRouter(fail={0, 1}), monkeypatch,
-                           LLM_MAX_UNITS_PER_PROMPT=1)
-    assert status == "failed"
+def test_all_llm_calls_failing_completes_with_review_status_failed(monkeypatch):
+    status, result = _run_files(2, ScriptedRouter(fail={0, 1}), monkeypatch,
+                                LLM_MAX_UNITS_PER_PROMPT=1)
+    assert status == "completed"
+    assert result["review_status"] == "failed"
+    assert (result["units_total"], result["units_reviewed"]) == (2, 0)
+    assert "LLM review failed: none of the 2 unit(s) was reviewed" in result["report_markdown"]
+    assert "✅" not in result["report_markdown"]
+    assert result["llm_provider_used"] is None and result["is_vulnerable"] is False
 
 
 @pytest.mark.parametrize("n_units", [1, 6])
@@ -240,6 +249,7 @@ def test_scan_that_fits_is_one_call(monkeypatch, n_units):
     status, result = _run_files(n_units, router, monkeypatch)
     assert status == "completed" and result["llm_calls"] == 1
     assert result["units_not_reviewed"] == []
+    assert result["review_status"] == "complete"
 
 
 class DeadlineRouter:
@@ -283,3 +293,17 @@ def test_rate_budget_past_the_deadline_marks_units_time_budget(monkeypatch):
     status, result = _run_files(3, router, monkeypatch, LLM_MAX_UNITS_PER_PROMPT=1)
     assert status == "completed"
     assert [u["reason"] for u in result["units_not_reviewed"]] == ["time_budget"] * 2
+    assert result["review_status"] == "partial"
+
+
+def test_review_coverage_status():
+    from backend.app.services.scan_runner import review_coverage
+
+    ok, cut, windowed = {"x": 1}, {"partial": True}, {"truncated": "t", "partial": False}
+    assert review_coverage(0, [], [])["review_status"] == "complete"  # nothing to review
+    assert review_coverage(2, [ok, windowed], [])["review_status"] == "complete"
+    assert review_coverage(2, [ok, cut], [])["review_status"] == "partial"
+    assert review_coverage(2, [ok], [{"not_reviewed_reason": "budget"}])["review_status"] \
+        == "partial"
+    assert review_coverage(1, [], [{"not_reviewed_reason": "too_large"}])["review_status"] \
+        == "failed"

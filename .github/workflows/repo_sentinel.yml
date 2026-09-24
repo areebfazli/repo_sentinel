@@ -35,4 +35,7 @@ jobs:
           # Fail the check when a finding is at/above this severity
           # (none | low | medium | high | critical).
           INPUT_FAIL_ON_SEVERITY: high
+          # Fail the check when the LLM review was partial or failed (units not
+          # reviewed: budget, rate limits, errors), instead of passing as clean.
+          INPUT_FAIL_ON_PARTIAL: "true"
         run: python github_action/scan_pr.py

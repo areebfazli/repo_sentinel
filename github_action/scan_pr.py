@@ -3,7 +3,9 @@
 Runs in a PR workflow: collects the PR's changed files, sends them to the
 RepoSentinel API (files mode), then posts findings as inline review comments —
 deduped across pushes via hidden markers — plus a summary comment, and sets the
-check status via a configurable severity gate.
+check status via a configurable severity gate and a review-coverage gate
+(INPUT_FAIL_ON_PARTIAL, default true: a scan whose LLM review was partial or
+failed fails the check rather than passing as clean).
 
 Standalone (only `requests` required); backend modules are NOT importable here, so
 the diff parser is duplicated. The decision-making logic (comment planning,
@@ -90,6 +92,41 @@ def severity_gate(findings: list[dict], threshold: str) -> int:
         if sev and SEVERITY_RANK.get(sev, 0) >= thr:
             return 1
     return 0
+
+
+def review_status(result: dict) -> str:
+    """The scan's LLM review coverage: "complete" | "partial" | "failed".
+    Older servers don't send ``review_status``: a non-empty
+    ``units_not_reviewed`` then means partial, and a server without either
+    field is taken as complete (as before)."""
+    status = result.get("review_status")
+    if status in ("complete", "partial", "failed"):
+        return status
+    return "partial" if result.get("units_not_reviewed") else "complete"
+
+
+def coverage_gate(result: dict, fail_on_partial: bool) -> int:
+    """Exit code: 1 if the review was partial or failed and the gate is on."""
+    return 1 if fail_on_partial and review_status(result) != "complete" else 0
+
+
+def coverage_line(result: dict) -> str:
+    """One Markdown line on the review coverage (trusted numbers only)."""
+    status = review_status(result)
+    missing = len(result.get("units_not_reviewed") or [])
+    total = result.get("units_total")
+    detail = ""
+    if status != "complete":
+        parts = []
+        if missing:
+            parts.append(f"{missing} of {total} unit(s) not reviewed" if isinstance(total, int)
+                         else f"{missing} unit(s) not reviewed")
+        partly = result.get("units_partially_reviewed")
+        if isinstance(partly, int) and partly:
+            parts.append(f"{partly} only partly reviewed")
+        detail = f" ({', '.join(parts)})" if parts else ""
+    icon = {"complete": "✅", "partial": "⚠️", "failed": "❌"}[status]
+    return f"{icon} Review coverage: `{status}`{detail}"
 
 
 def anchor_line(
@@ -262,11 +299,20 @@ def plan_comment_ops(existing: list[dict], desired: list[dict]) -> dict:
     return {"create": create, "update": update, "delete": delete}
 
 
-def build_summary(report_markdown: str, gate_threshold: str) -> str:
+def build_summary(report_markdown: str, gate_threshold: str, result: dict | None = None,
+                  fail_on_partial: bool = True) -> str:
     """The summary comment is the server-rendered report (deterministic Markdown,
-    LLM text already escaped there), plus the gate footer and the dedup marker."""
-    body = report_markdown.strip() or "## ✅ RepoSentinel\nNo findings."
-    footer = f"\n\n<sub>Severity gate: `{gate_threshold}`</sub>"
+    LLM text already escaped there), plus the review-coverage line, the gate
+    footer and the dedup marker. An empty report is only called clean when the
+    review was complete."""
+    result = result or {}
+    status = review_status(result)
+    fallback = ("## ✅ RepoSentinel\nNo findings." if status == "complete"
+                else "## ⚠️ RepoSentinel\nNo findings in the reviewed code.")
+    body = report_markdown.strip() or fallback
+    gates = f"Severity gate: `{gate_threshold}`"
+    gates += "; fails on partial review" if fail_on_partial else "; partial review allowed"
+    footer = f"\n\n{coverage_line(result)}\n\n<sub>{gates}</sub>"
     return f"{body}{footer}\n<!-- reposentinel:summary -->"
 
 
@@ -459,12 +505,20 @@ def _upsert_summary(repo, pr_number, token, body) -> bool:
     return _check(r, "POST summary comment")
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 def main() -> int:
     dry_run = "--dry-run" in sys.argv
     token = os.environ.get("GITHUB_TOKEN", "")
     api_base = os.environ.get("REPOSENTINEL_URL", "").rstrip("/")
     api_key = os.environ.get("REPOSENTINEL_API_KEY", "")
     gate = os.environ.get("INPUT_FAIL_ON_SEVERITY", "none").lower()
+    fail_on_partial = _env_flag("INPUT_FAIL_ON_PARTIAL", True)
     repo = os.environ["GITHUB_REPOSITORY"]
 
     with open(os.environ["GITHUB_EVENT_PATH"]) as f:
@@ -484,14 +538,15 @@ def main() -> int:
     # Gate + inline comments use the REVIEWED findings (LLM findings that quote
     # the code, plus deterministic guard checks) — not the raw retrieval matches.
     findings = result.get("report_findings", [])
-    print(f"{len(findings)} confirmed finding(s); is_vulnerable={result.get('is_vulnerable')}")
+    print(f"{len(findings)} confirmed finding(s); is_vulnerable={result.get('is_vulnerable')}; "
+          f"review {review_status(result)}")
 
     changed_by_file = {file["path"]: parse_changed_lines(file.get("patch") or "") for file in files}
     commentable_by_file = {
         file["path"]: parse_commentable_lines(file.get("patch") or "") for file in files
     }
     desired, unanchored = desired_comments(findings, changed_by_file, commentable_by_file)
-    summary = build_summary(result.get("report_markdown", ""), gate)
+    summary = build_summary(result.get("report_markdown", ""), gate, result, fail_on_partial)
 
     if dry_run:
         print("DRY RUN — planned inline comments:")
@@ -515,7 +570,10 @@ def main() -> int:
 
     exit_code = severity_gate(findings, gate)
     print(f"Severity gate ({gate}) -> exit {exit_code}")
-    return exit_code
+    coverage_exit = coverage_gate(result, fail_on_partial)
+    print(f"Coverage gate (fail_on_partial={fail_on_partial}, review "
+          f"{review_status(result)}) -> exit {coverage_exit}")
+    return max(exit_code, coverage_exit)
 
 
 if __name__ == "__main__":

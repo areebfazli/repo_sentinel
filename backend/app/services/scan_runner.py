@@ -332,17 +332,19 @@ async def _analyze_request(merger, request: dict) -> dict:
 async def _review_batches(
     batches: list[list[dict]], router, row_snaps: list[dict], report_findings: list[dict],
     not_reviewed: list[dict],
-) -> tuple[list[str], int]:
+) -> tuple[list[str], int, list[dict]]:
     """One LLM call per batch, sequentially (free tiers rate-limit per minute;
     the router paces calls by tokens per model). Appends each batch's anchored
     findings to ``report_findings``. The whole stage gets LLM_SCAN_MAX_WALL_S:
     a batch whose call can't start in time is not sent, and its units join
     ``not_reviewed`` with reason "time_budget"; a failed call's units get
-    "llm_error". If every call fails the error propagates and the scan fails.
-    Returns (distinct provider labels that answered, calls made)."""
+    "llm_error". Never raises for LLM failures, even when every call fails:
+    the deterministic evidence is still reported and the review status says
+    what happened (``review_coverage``).
+    Returns (distinct provider labels that answered, calls made, units reviewed)."""
     providers: list[str] = []
-    last_error: Exception | None = None
-    failed = calls = 0
+    reviewed: list[dict] = []
+    calls = 0
     clock = getattr(router, "clock", time.monotonic)
     deadline = clock() + settings.LLM_SCAN_MAX_WALL_S
     for batch in batches:
@@ -360,41 +362,67 @@ async def _review_batches(
             )
         except LLMError as exc:
             logger.warning("LLM review call failed for {} unit(s): {}", len(batch), exc)
-            last_error = exc
-            failed += 1
             reason = "time_budget" if getattr(exc, "deadline_exceeded", False) else "llm_error"
             not_reviewed.extend({**u, "not_reviewed_reason": reason} for u in batch)
             continue
         if provider not in providers:
             providers.append(provider)
+        reviewed.extend(batch)
         raw_findings = llm_json.get("findings") if isinstance(llm_json, dict) else None
         validated = validate_findings(raw_findings, batch, allowed_cves, allowed_prs)
         report_findings += _build_report_findings(
             validated, {u["uid"]: u for u in batch}, row_snaps
         )
-    if calls and failed == calls:
-        raise last_error
-    return providers, calls
+    return providers, calls, reviewed
 
 
-def _count_failed(not_reviewed: list[dict]) -> int:
-    """Units that were in a planned batch but didn't get reviewed."""
-    return sum(u["not_reviewed_reason"] in ("llm_error", "time_budget") for u in not_reviewed)
+def review_coverage(n_units: int, reviewed: list[dict], not_reviewed: list[dict]) -> dict:
+    """The LLM review's coverage of a scan's units.
+
+    ``review_status``: "complete" (every unit reviewed, or nothing to review),
+    "failed" (units to review but none was: every call failed, or none could be
+    made) or "partial" (some units not reviewed, or reviewed with part of the
+    code the review is for cut, ``partial`` from ``review_plan._shrink_to_fit``).
+    A unit only elided away from its changed lines counts as reviewed.
+    """
+    partial = sum(bool(u.get("partial")) for u in reviewed)
+    if n_units == 0:
+        status = "complete"
+    elif not reviewed:
+        status = "failed"
+    elif not_reviewed or partial:
+        status = "partial"
+    else:
+        status = "complete"
+    return {"review_status": status, "units_total": n_units, "units_reviewed": len(reviewed),
+            "units_partially_reviewed": partial}
 
 
 def _unit_label(u: dict) -> str:
     return f"{u.get('file_path') or 'snippet'}:{u.get('function_name') or u.get('start_line')}"
 
 
-def _coverage_notes(batches: list[list[dict]], not_reviewed: list[dict]) -> list[str]:
+def _labels(units: list[dict]) -> str:
+    more = f" and {len(units) - 10} more" if len(units) > 10 else ""
+    return f"{', '.join(md_code_span(_unit_label(u)) for u in units[:10])}{more}"
+
+
+def _coverage_notes(reviewed: list[dict], not_reviewed: list[dict]) -> list[str]:
     """Trusted report lines for units the LLM saw only partly or not at all
     (labels are file/function names: shown as code)."""
     notes = []
-    truncated = [u for b in batches for u in b if u.get("truncated")]
-    if truncated:
+    elided = [u for u in reviewed if u.get("truncated")]
+    partial = [u for u in elided if u.get("partial")]
+    windowed = [u for u in elided if not u.get("partial")]
+    if partial:
         notes.append(
-            f"_{len(truncated)} unit(s) only partly reviewed (too long for one prompt): "
-            f"{', '.join(md_code_span(_unit_label(u)) for u in truncated[:10])}._"
+            f"_⚠️ {len(partial)} unit(s) only partly reviewed (too long for one prompt; "
+            f"some of the changed code was cut): {_labels(partial)}._"
+        )
+    if windowed:
+        notes.append(
+            f"_{len(windowed)} unit(s) too long for one prompt, reviewed around their changed "
+            f"lines only: {_labels(windowed)}._"
         )
     for reason, why in (
         ("budget", f"LLM budget: {settings.LLM_MAX_CALLS_PER_SCAN} call(s) of "
@@ -406,10 +434,8 @@ def _coverage_notes(batches: list[list[dict]], not_reviewed: list[dict]) -> list
     ):
         units = [u for u in not_reviewed if u["not_reviewed_reason"] == reason]
         if units:
-            more = f" and {len(units) - 10} more" if len(units) > 10 else ""
             notes.append(
-                f"_⚠️ {len(units)} unit(s) NOT reviewed by the LLM ({why}): "
-                f"{', '.join(md_code_span(_unit_label(u)) for u in units[:10])}{more}._"
+                f"_⚠️ {len(units)} unit(s) NOT reviewed by the LLM ({why}): {_labels(units)}._"
             )
     return notes
 
@@ -492,21 +518,27 @@ async def _run_scan_guarded(scan_id: str, merger, router) -> None:
         )
         # Deterministic guard_diff alerts are reported whatever the LLM says.
         report_findings: list[dict] = guard_alert_findings(analysis["guard"])
-        providers, llm_calls = await _review_batches(batches, router, row_snaps,
-                                                     report_findings, not_reviewed)
+        providers, llm_calls, reviewed = await _review_batches(
+            batches, router, row_snaps, report_findings, not_reviewed
+        )
+        coverage = review_coverage(len(review_units), reviewed, not_reviewed)
         provider_used = ",".join(providers) or None
         if "mock" in providers:
             notes.append("_LLM_PROVIDER=mock: no real review was performed._")
-        notes.extend(_coverage_notes(batches, not_reviewed))
+        notes.extend(_coverage_notes(reviewed, not_reviewed))
         static_out = _static_out(analysis["semgrep"])
         report_markdown = render_markdown(
             report_findings, len(cves), len(team),
-            units_reviewed=sum(len(b) for b in batches) - _count_failed(not_reviewed),
+            units_reviewed=coverage["units_reviewed"],
             static_hits=len(static_out), notes=notes,
+            review_status=coverage["review_status"], units_total=coverage["units_total"],
+            units_not_reviewed=len(not_reviewed),
+            units_partial=coverage["units_partially_reviewed"],
         )
 
         # is_vulnerable reflects the reviewed findings (the precision filter), not
-        # the raw high-recall retrieval — so it agrees with the report.
+        # the raw high-recall retrieval — so it agrees with the report. A
+        # "partial" / "failed" review_status means False is not a clean bill.
         result = {
             "is_vulnerable": bool(report_findings),
             "report_markdown": report_markdown,
@@ -518,6 +550,7 @@ async def _run_scan_guarded(scan_id: str, merger, router) -> None:
             "static_analysis": static_out,
             "guard_diff": list(analysis["guard"].values()),
             "llm_calls": llm_calls,
+            **coverage,
             "units_not_reviewed": [
                 {"file_path": u.get("file_path"), "function_name": u.get("function_name"),
                  "start_line": u.get("start_line"), "reason": u["not_reviewed_reason"]}

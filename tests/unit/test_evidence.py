@@ -157,7 +157,16 @@ class CapturingRouter:
         return {"findings": []}, "groq:stub"
 
 
-def _run(request, monkeypatch, scanner):
+class FailingRouter:
+    mock = False
+
+    async def generate(self, system, user, **kwargs):
+        from backend.app.core.llm_client import LLMError
+
+        raise LLMError("All LLM clients failed (stub): HTTP 500")
+
+
+def _run(request, monkeypatch, scanner, router=None):
     """Run one scan end to end through run_scan and return (result, router)."""
     import json
     import uuid
@@ -172,7 +181,7 @@ def _run(request, monkeypatch, scanner):
         session.add(Scan(id=job_id, status="queued", mode="files",
                          request_json=json.dumps(request)))
         session.commit()
-    router = CapturingRouter()
+    router = router or CapturingRouter()
     scan_runner.reset_scan_semaphore()
     asyncio.run(scan_runner.run_scan(job_id, NoRetrievalMerger(), router))
     with SessionLocal() as session:
@@ -216,3 +225,17 @@ def test_snippet_scan_runs_semgrep_on_the_snippet_without_guard(monkeypatch):
     assert "Change-direction evidence" not in router.prompts[0]
     assert result["guard_diff"] == [] and result["is_vulnerable"] is False
     assert len(result["static_analysis"]) == 1
+
+
+def test_llm_failure_still_reports_semgrep_and_guard_evidence(monkeypatch):
+    scanner = StubScanner({("cfg.py", "load", 3): [_hit("python_deserialization_rule-yaml",
+                                                         "high", line=5)]})
+    request = {"files": [{"path": "cfg.py", "content": YAML_NEW, "patch": YAML_PATCH}]}
+    result, _ = _run(request, monkeypatch, scanner, FailingRouter())
+    AnalyzeResult(**result)
+    assert result["review_status"] == "failed" and result["llm_provider_used"] is None
+    [finding] = result["report_findings"]  # the deterministic alert survives
+    assert finding["source"] == "guard_diff" and result["is_vulnerable"] is True
+    assert [s["rule_id"] for s in result["static_analysis"]] == ["python_deserialization_rule-yaml"]
+    assert result["guard_diff"] and "LLM review failed" in result["report_markdown"]
+    assert [u["reason"] for u in result["units_not_reviewed"]] == ["llm_error"]

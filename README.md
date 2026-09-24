@@ -494,3 +494,18 @@ python scripts/build_ordinary_negatives.py        # --seed 42 --eval-fraction 0.
   `infer_kind` in the script implements this.
 - **Caveat.** These functions are not known to be bug-free. They were only never changed by a
   known security fix.
+
+### Dev/test split and static-first candidate recall
+
+`ml/evaluation/splits/v1.json` (built by `scripts/build_eval_split.py`, offline, seed 42) is
+the fixed dev/test split. Dev has 151 pairs + 498 ordinary functions; test has 100 pairs + 500
+ordinary functions. Items are grouped by advisory (including OSV aliases), repository and
+near-duplicate code, so no advisory, repo or near-duplicate function straddles the two splits.
+Pairs are stratified by the year the fix became public and by language. See
+`ml/evaluation/splits/README.md` for strata, leakage checks and why 500 ordinary functions
+can't certify an FPR ≤ 0.5%.
+
+`python -m ml.evaluation.analyze_candidates` (about 10 s, offline) asks: if only Semgrep hits
+and guard_diff `guard_removed` changes reached the LLM, what share of vulnerabilities would it
+ever see? It reuses the per-item rows in `results/semgrep_eval.json` and recomputes guard_diff,
+then writes `results/candidate_recall.json`.

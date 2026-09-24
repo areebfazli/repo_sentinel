@@ -100,6 +100,44 @@ All done; fast suite + ruff green; no API calls or model loads were needed to ve
    sets), and the results above (`ml/evaluation/results/`, now versioned) used the old ids, so
    a `--seed 42` sample drawn now is not the same sample.
 
+## Eval split + static-first candidate recall (2026-09-24)
+
+- **Split** `ml/evaluation/splits/v1.json` (`scripts/build_eval_split.py`, seed 42):
+  - dev: 151 pairs + 498 ordinary functions (161 length-matched);
+  - test: 100 pairs + 500 ordinary functions (163 length-matched);
+  - 251 pairs held in reserve.
+  - Grouped by advisory, OSV aliases, repo and near-duplicate code: 0 advisories, repos, exact
+    or near-duplicate bodies in both splits.
+  - Stratified by the year the fix became public × language. `by_advisory` dates allow a split
+    at any training cutoff.
+  - 500 ordinary functions can't certify FPR ≤ 0.5%: 0/500 still has a 0.76% upper bound. A
+    larger pool (3,377) is in `detection_eval_ordinary_ext.jsonl`. See
+    `ml/evaluation/splits/README.md`.
+- **Static-first candidate recall** (`python -m ml.evaluation.analyze_candidates`, offline, all
+  502 held-out pairs):
+  - Candidate = Semgrep evidence hit (high+, production exclusions) on the new code, or
+    guard_diff `guard_removed`.
+  - Reverse fix (simulated vulnerability-introducing PR): Semgrep 16/502 = 0.032, guard_diff
+    0.227, union **117/502 = 0.233 [0.198, 0.272]**. At the advisory level the union is 86/276
+    = 0.312.
+  - Overlap: guard_diff alone 101, Semgrep alone 3, both 13. Semgrep adds 3 pairs to
+    guard_diff. Semgrep at any severity: union 0.235.
+  - Fix direction (benign): union FPR 20/502 = 0.040.
+  - Ordinary functions: Semgrep 5/1000 = 0.005. guard_diff can't run without a diff; its proxy
+    is 0 on synthetic edits and 0.021 on real bystander edits.
+  - By category, union recall is 0.38 cmd_injection, 0.38 xss, 0.32 path_traversal, 0.23
+    redos, 0.19 ssrf, 0.21 authz, 0.16 "other" and 0/5 sqli.
+  - Before vs after 2025-01-01: 0.231 vs 0.236.
+- **Implication.** Static-first can never recall more than ~23% of these vulnerabilities, even
+  with a perfect LLM verifier. In exchange it sends ~1–4 functions per 100 to the LLM instead
+  of 100.
+  - If the verifier's TPR (0.25, n = 8) were independent of candidacy, recall would be ~0.06.
+  - It may not be independent: in the 8-item LLM arm, both LLM hits were static candidates and
+    the other 6 were not. n is tiny.
+  - Next measurement: LLM-first on the test split's 100 vulnerable functions (22 are candidates,
+    78 not). If the LLM's hits fall almost entirely inside the candidates, static-first loses
+    little recall for ~25x fewer calls.
+
 ## 1. Detection quality
 
 ### 1a. Grow the corpus (25 entries -> thousands of fix-commit pairs)

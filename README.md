@@ -69,14 +69,18 @@ GET /api/v1/analyze/{job_id}  ◀── clients poll for the result
   "similar known vulnerabilities, may or may not apply" (with the fix diff where stored), not
   as the only findings it may report. The old retrieval-only prompt found 1 of 14 vulnerable
   functions end to end (ROADMAP, Findings 2026-09-24).
-- **Anti-hallucination.** Each finding must quote the offending line(s) verbatim; a finding
-  whose quote isn't in the reviewed code is dropped server-side, and its line anchors the PR
-  comment. A cited CVE / team-PR id outside the retrieved allowlist is removed from the finding
+- **Anti-hallucination.** Each finding must quote the offending line(s); a finding whose
+  quote isn't in the reviewed code is dropped server-side, and its line anchors the PR
+  comment. The check is whitespace-insensitive (a multi-line statement quoted on one line, a
+  list of lines, or text as it appeared after sanitising all match) but every quoted
+  character sequence must be in the code. A cited CVE / team-PR id outside the retrieved allowlist is removed from the finding
   (the finding stays).
 - **Prompt-injection hardening.** PR code, file names, corpus code, advisory text and team
   comments are untrusted: each goes into a `<untrusted_<nonce>>` block with a per-prompt random
-  nonce, after HTML comments and zero-width / bidi characters are made visible, backtick
-  fences and tag look-alikes are defused and length is capped; the system prompt says
+  nonce, after HTML-comment openers are defused in place (never stripped: stripping hid code
+  between `# <!--` and `# -->`), zero-width / bidi characters are made visible, and backtick
+  fences and tag look-alikes are defused. Nothing in the code under review is deleted and
+  line numbers stay 1:1 with the file; the system prompt says
   instructions inside those blocks are data. On the way out, every LLM-written field is
   escaped when rendered (server report and the Action's inline comments), so a finding can't
   inject links, images, HTML, @-mentions or `<!-- reposentinel:... -->` markers
@@ -161,7 +165,10 @@ can still be overridden there. Highlights:
 | `OPENROUTER_MODEL` / `OPENROUTER_FALLBACK_MODEL` | `qwen/qwen3.8-27b:free` / `google/gemma-4-31b-it:free` | OpenRouter free models (20 req/min, 1,000 req/day with ≥ $10 credits, fewer without; they need "allow free endpoints that may train on inputs" in OpenRouter's privacy settings or return 404; see [openrouter.ai/docs](https://openrouter.ai/docs)). The qwen primary is always sent without `response_format` (it rejects it); set `OPENROUTER_FALLBACK_MODEL=` to disable the gemma fallback. OpenRouter default model → OpenRouter fallback model → `LLM_FALLBACK_PROVIDER`. 429 is retried; 402 (insufficient credits) is not, and skips OpenRouter's other models; a model that rejects `response_format` is retried once without it |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | `/chat/completions` is appended |
 | `OPENROUTER_API_KEY` / `GROQ_API_KEY` / `GEMINI_API_KEY` | (none) | The only LLM settings `.env` needs. A missing key for `LLM_PROVIDER` **hard-fails at startup**; a missing key for `LLM_FALLBACK_PROVIDER` just logs a warning and that provider is skipped |
-| `LLM_MAX_PROMPT_TOKENS` / `LLM_MAX_UNITS_PER_PROMPT` / `LLM_MAX_CALLS_PER_SCAN` | `6000` / `6` / `6` | Per-scan LLM budget. Units are ordered by evidence (guard_diff alert, Semgrep hit, `guard_removed`, then retrieval similarity) and packed into as few prompts as fit (one call when everything fits). Tokens are estimated as chars / 4 × 1.25; 6000 keeps a prompt plus a reasoning model's answer under Groq's free-tier 8K tokens/min. An oversized unit loses its references, then the tail of its code; units beyond the call cap are listed in `units_not_reviewed` and in the report, never dropped silently |
+| `LLM_MAX_PROMPT_TOKENS` / `LLM_MAX_UNITS_PER_PROMPT` / `LLM_MAX_CALLS_PER_SCAN` | `6000` / `6` / `6` | Per-scan LLM budget. Units are ordered by evidence (guard_diff alert, Semgrep hit, `guard_removed`, then retrieval similarity) and packed into as few prompts as fit (one call when everything fits). Tokens are estimated as chars / 4 × 1.25; 6000 keeps a prompt plus a reasoning model's answer under Groq's free-tier 8K tokens/min. An oversized unit loses its references, then its code is elided around its changed lines (head and tail without a diff) with explicit `[... N line(s) omitted ...]` markers and real line numbers; units beyond the call cap are listed in `units_not_reviewed` and in the report, never dropped silently |
+| `LLM_TPM_LIMITS` / `LLM_OUTPUT_TOKENS_ESTIMATE` | `{"groq": 8000, "openrouter": null}` / `1500` | Per-model tokens per rolling minute (key: provider or `provider:model`). Each call reserves its estimated prompt tokens plus the output allowance and waits for room, so back-to-back calls stay under Groq's free-tier 8K tokens/min |
+| `LLM_MAX_WAIT_S` / `LLM_SCAN_MAX_WALL_S` | `60` / `480` | Longest single wait (rate budget or `Retry-After`, which is honoured in full) before trying the next client; wall-time budget of a scan's LLM stage (units that can't be sent in time: `units_not_reviewed`, reason `time_budget`) |
+| `GUARD_ALERT_SEVERITY` | `medium` | Severity of deterministic guard_diff alert findings (evidence, not a verdict) |
 | `LLM_MAX_CVES_PER_UNIT` | `2` | Retrieved CVE matches shown per unit (team matches likewise) |
 | `SEMGREP_ENABLED` / `SEMGREP_MIN_SEVERITY` | `True` / `high` | Static-analysis evidence for the review (see below); a missing engine only logs a warning |
 | `REPOSENTINEL_API_KEY` | (none) | `X-RepoSentinel-Key` header, optional in dev, required in production |
@@ -178,20 +185,37 @@ collects the PR's changed files, POSTs them in files mode, and posts **inline re
 anchored to the finding's quoted line when it is in the diff (added or context line), else the
 nearest changed line. Comments are deduped across pushes via hidden
 `<!-- reposentinel:f:<sha1> -->` markers (hash of file, function and the finding's
-`dedupe_key`; only a marker at the very end of a comment counts). It also posts a summary
-comment and applies a configurable severity gate. Finding text is escaped before it is posted.
+`dedupe_key`; only a marker at the very end of a comment counts). An LLM finding's
+`dedupe_key` is its source plus the code line it is anchored to (whitespace-insensitive), never
+LLM wording, so CWE / title drift between runs updates the same comment. Findings also carry
+`legacy_dedupe_keys` (the previous key formula): on the first run after upgrading, a comment
+posted under an old marker is adopted and updated in place instead of deleted and re-posted
+(one whose CWE / title had already drifted can't be matched and is replaced once). It also
+posts a summary comment and applies a configurable severity gate. Finding text is escaped
+before it is posted.
 
 The job result also carries the review's inputs and coverage: `static_analysis` (Semgrep
-evidence), `guard_diff` (units whose diff removed or added a guard), `llm_calls`, and
-`units_not_reviewed` (units left out by the token budget, too large for a prompt, or whose LLM
-call failed; the report lists them too).
+evidence), `guard_diff` (units whose diff removed or added a guard), `llm_calls`,
+`review_status` (`complete` | `partial` | `failed`) with `units_total` / `units_reviewed` /
+`units_partially_reviewed`, and `units_not_reviewed` (units left out by the token budget, too
+large for a prompt, the LLM time budget, or a failed LLM call; the report lists them too). Only
+a complete review is reported as clean; a partial one leads with "Partial review: N of M
+unit(s) not reviewed". If every LLM call fails the scan still completes (`review_status:
+failed`) with its Semgrep and guard_diff results.
 
 Configure two repository secrets:
 
 - `REPOSENTINEL_URL`: where your API is reachable
 - `REPOSENTINEL_API_KEY`: matches the backend's `REPOSENTINEL_API_KEY`
 
-`INPUT_FAIL_ON_SEVERITY` (default `high`) controls when the check fails the build.
+Gates (workflow `env`):
+
+- `INPUT_FAIL_ON_SEVERITY` (default `high`): fail on a finding at/above this severity.
+- `INPUT_FAIL_ON_PARTIAL` (default `true`): fail when the review was `partial` or `failed`
+  (older servers without `review_status`: partial when `units_not_reviewed` is non-empty).
+- `INPUT_GATE_ON_DETERMINISTIC` (default `false`): let a deterministic-only finding (guard_diff
+  alert) fail the severity gate on its own; by default it needs the LLM review or Semgrep to
+  flag the same spot (`corroborated_by`).
 
 ---
 
@@ -324,8 +348,10 @@ count. The vocabularies are module-level tables. Files mode already has what it 
 change is a deleted guard is analysed), each unit's old code is rebuilt, and units with
 `risk: guard_removed` get their removed / weakened changes in the prompt as *change-direction
 evidence*. The `alert` tier is also reported as its own deterministic finding (`source:
-"guard_diff"`, severity high, rendered under "Removed security guards (deterministic check, no
-LLM)"), whatever the LLM says. Every unit with a signal is listed in the result's `guard_diff`.
+"guard_diff"`, severity `GUARD_ALERT_SEVERITY` (default medium), rendered under "Removed
+security guards (deterministic check, no LLM)"), whatever the LLM says, with `corroborated_by`
+listing `llm` / `semgrep` when either flags the same spot (within 3 lines); only a corroborated
+one fails the Action's severity gate by default. Every unit with a signal is listed in the result's `guard_diff`.
 
 `python -m ml.evaluation.eval_guard_diff` treats real fix commits as benign changes and their
 reversal as vulnerability-introducing PRs. On 506 held-out pairs: TPR 0.227 and fix-direction
@@ -388,7 +414,10 @@ python scripts/build_corpus_from_osv.py --ecosystem PyPI --ecosystem npm --max-a
   `fixed_code`/`repo`/`commit`/`file_path`/`function_name`) — feed it to
   `scripts/ingest_cve_corpus.py` like any other corpus file.
 - Writes `ml/evaluation/datasets/detection_eval_osv_{pypi,npm}.jsonl` (two lines per held-out pair: one
-  `vulnerable`, one `safe`), in the same format as `detection_eval.jsonl`.
+  `vulnerable`, one `safe`), in the same format as `detection_eval.jsonl`. Ids are
+  `<advisory>_<function>_<hash8>_{vuln,safe}` (the hash is of the pair's code, so ids are unique;
+  an exact duplicate pair is written once). `scripts/migrate_eval_ids.py` applies that scheme
+  to files built before it, offline.
 - Caches the OSV zip and every raw GitHub API response under `data/osv_cache/` (gitignored),
   keyed by request URL, so re-runs — especially `--resume` — make zero redundant API calls.
 - Without `GITHUB_TOKEN` set, GitHub's unauthenticated rate limit (60 requests/hour) is the

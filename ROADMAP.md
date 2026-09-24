@@ -66,6 +66,40 @@ sample; pypi + npm + ordinary sets). Snippet mode, so guard_diff is N/A. Wilson 
   the CIs; consider dropping CVE context from the default prompt (`LLM_MAX_CVES_PER_UNIT=0`) if
   the larger run confirms no gain.
 
+## Fixes 2026-09-24 (adversarial review of the LLM-first pipeline)
+
+All done; fast suite + ruff green; no API calls or model loads were needed to verify them.
+
+1. ~~HIGH: code hidden from the LLM.~~ **Done** (32db980): `sanitize_untrusted` stripped HTML
+   comments from the code under review (`# <!--` ... `# -->` hid `os.system(cmd)`; a `"<!--"`
+   literal blanked the rest of the function). Openers are now defused in place, nothing is
+   deleted, U+2028/U+2029 and lone CRs become placeholders so line numbers stay 1:1. Output:
+   prose fields still drop complete comments, code fields keep everything.
+2. ~~Oversized units truncated from the end.~~ **Done** (5c7845d): elided around the changed
+   lines (head + tail without a diff), explicit omission markers, real line numbers, `partial`
+   flag when changed code was cut.
+3. ~~Partial reviews reported as clean.~~ **Done** (f8bcdd3): `review_status`
+   complete / partial / failed + counts; "Partial review: N of M unit(s) not reviewed" instead
+   of the clean message; Action summary shows coverage, `INPUT_FAIL_ON_PARTIAL` (default true).
+4. ~~Quote check too strict.~~ **Done** (1635e0a): whitespace-insensitive, sanitiser-aware,
+   list quotes, trailing comments / punctuation; hallucinated quotes still rejected.
+5. ~~Deterministic guard alerts fail the build unvetoed.~~ **Done** (e9365a9):
+   `GUARD_ALERT_SEVERITY` (medium), `corroborated_by` llm / semgrep, Action gates on them only
+   when corroborated or `INPUT_GATE_ON_DETERMINISTIC`.
+6. ~~Groq TPM overrun.~~ **Done** (fa15521): per-model token pacing (`LLM_TPM_LIMITS`),
+   Retry-After honoured up to `LLM_MAX_WAIT_S`, `LLM_SCAN_MAX_WALL_S` (unsent units:
+   `time_budget`). Not yet measured against the live Groq limits.
+7. ~~Dedupe key drift.~~ **Done** (cfadf88): key = source + anchored code line; old comments
+   adopted via `legacy_dedupe_keys`.
+8. ~~All LLM calls failing discards deterministic evidence.~~ **Done** (f8bcdd3): the scan
+   completes with `review_status: failed` and its Semgrep / guard_diff results.
+9. ~~Duplicate eval ids.~~ **Done** (01905e8): ids carry a code hash, migrated offline
+   (`scripts/migrate_eval_ids.py`: 1,012 -> 1,004 OSV items, 4 exact duplicate pairs dropped),
+   `run_eval` pairs robustly. **Open:** `baseline.json` still records the old dataset sha256
+   (the slow regression test fails until `run_eval --write-baseline` is re-run on the three
+   sets), and the results above (`ml/evaluation/results/`, now versioned) used the old ids, so
+   a `--seed 42` sample drawn now is not the same sample.
+
 ## 1. Detection quality
 
 ### 1a. Grow the corpus (25 entries -> thousands of fix-commit pairs)

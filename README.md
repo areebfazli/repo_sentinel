@@ -49,8 +49,10 @@ POST /api/v1/analyze/  ──▶  Scan row (queued)  ──▶  202 + job_id
    → feedback suppression / downweight → top-k
                      └──────────────┬──────────────┘
                                     ▼
-     LLM review of every unit (OpenRouter → Groq), CVE/team matches as reference
-       untrusted text in nonce-tagged blocks; findings must quote the code
+  files mode (REVIEW_MODE=pr): PR-level audit of the whole change (diff + changed
+    functions before/after + leads), context rounds, then one verifier call per candidate
+  snippet mode / REVIEW_MODE=units: LLM review of every unit, CVE/team matches as reference
+       (OpenRouter → Groq; untrusted text in nonce-tagged blocks; findings must quote the code)
                                     │
                                     ▼
           deterministic server-side Markdown (all LLM text escaped)
@@ -90,6 +92,11 @@ GET /api/v1/analyze/{job_id}  ◀── clients poll for the result
 - **Files mode.** Changed files are split into functions with tree-sitter; only functions that
   overlap changed lines are analyzed (`# reposentinel-ignore` skips one). Findings are anchored
   to file + line for inline PR comments.
+- **PR-level review in files mode.** The model is asked what the *change* newly introduces,
+  over the unified diff and each changed function before and after, with leads (guard_diff,
+  permissive Semgrep, sensitive sinks on added lines) to focus attention; it can ask for code
+  defined elsewhere in the PR, and every candidate is re-judged by a separate verifier call
+  before it is reported. See [PR-level review](#pr-level-review-files-mode).
 
 ---
 
@@ -169,8 +176,13 @@ can still be overridden there. Highlights:
 | `LLM_TPM_LIMITS` / `LLM_OUTPUT_TOKENS_ESTIMATE` | `{"groq": 8000, "openrouter": null}` / `1500` | Per-model tokens per rolling minute (key: provider or `provider:model`). Each call reserves its estimated prompt tokens plus the output allowance and waits for room, so back-to-back calls stay under Groq's free-tier 8K tokens/min |
 | `LLM_MAX_WAIT_S` / `LLM_SCAN_MAX_WALL_S` | `60` / `480` | Longest single wait (rate budget or `Retry-After`, which is honoured in full) before trying the next client; wall-time budget of a scan's LLM stage (units that can't be sent in time: `units_not_reviewed`, reason `time_budget`) |
 | `GUARD_ALERT_SEVERITY` | `medium` | Severity of deterministic guard_diff alert findings (evidence, not a verdict) |
-| `LLM_MAX_CVES_PER_UNIT` | `2` | Retrieved CVE matches shown per unit (team matches likewise) |
+| `LLM_MAX_CVES_PER_UNIT` | `2` | Retrieved CVE matches shown per unit (team matches likewise); `0` also skips retrieval (and its embedding cost) entirely |
 | `SEMGREP_ENABLED` / `SEMGREP_MIN_SEVERITY` | `True` / `high` | Static-analysis evidence for the review (see below); a missing engine only logs a warning |
+| `REVIEW_MODE` | `pr` | Files mode: `pr` = PR-level audit + verification (below); `units` = the per-function review (kept for comparison). Snippet mode always uses the per-unit review |
+| `PR_REVIEW_MAX_PROMPT_TOKENS` / `PR_REVIEW_MAX_AUDIT_CALLS` / `PR_REVIEW_CONTEXT_ROUNDS` / `PR_REVIEW_CONTEXT_MAX_TOKENS` | `6000` / `4` / `2` / `1500` | Audit budget: prompt size (estimated tokens, incl. the context reserve), audit calls per scan (context rounds included; a PR too big for one prompt is split by file), extra rounds answering the model's context requests, tokens of requested context per prompt |
+| `PR_REVIEW_MAX_VERIFIER_CALLS` / `PR_REVIEW_MIN_CONFIDENCE` / `PR_REVIEW_MIN_AUDIT_CONFIDENCE` | `8` / `8` / `5` | One verifier call per candidate, at most this many; a finding is reported only when confirmed with confidence ≥ 8/10; candidates the audit itself rates below 5 are not verified. An unverified candidate is not reported and makes the review `partial` |
+| `PR_REVIEW_SEMGREP_LEAD_MIN_SEVERITY` / `PR_REVIEW_SINK_LEADS` / `PR_REVIEW_HARD_EXCLUSIONS` | `low` / `True` / `True` | Semgrep hits shown as leads (marked "lead only" below `SEMGREP_MIN_SEVERITY`), sensitive-sink leads on added lines, regex hard exclusions before verification |
+| `PR_REVIEW_FIX_EXAMPLES` / `VERIFIER_MODEL` | `0` / (none) | Retrieved "how a similar bug was fixed" examples in the audit prompt (off); `<provider>:<model>` tried first for verifier calls (the normal chain stays the fallback; each finding records `verifier`) |
 | `REPOSENTINEL_API_KEY` | (none) | `X-RepoSentinel-Key` header, optional in dev, required in production |
 | `HYBRID_ENABLED` | `False` | Dense + sparse (BM25) RRF fusion; off by default (measured F1 gain below the adoption bar) |
 
@@ -400,6 +412,68 @@ reversal as vulnerability-introducing PRs. On 506 held-out pairs: TPR 0.227 and 
 FPR 0.030. The `alert` tier has TPR 0.032 and FPR 0/506. Synthetic benign edits of 994 ordinary
 functions produce 0 flags. Results are written to `ml/evaluation/results/guard_diff_eval.json`.
 
+## PR-level review (files mode)
+
+`backend/app/core/pr_review.py` (default `REVIEW_MODE=pr`) reviews a PR the way a security
+reviewer reads one, not function by function:
+
+1. **Bundle** (`core/pr_context.py`): per changed file the unified diff (new-file line
+   numbers), and per changed function its version after and before the change (old content is
+   rebuilt by reverse-applying the patch; a patch is synthesised when only old + new are
+   given). A tree-sitter symbol index over the PR's files (definitions, methods, module-level
+   variables, call sites; Python / JS / Go / Java) adds direct callers / callees of the changed
+   functions when they fit.
+2. **Leads**, which focus attention and are never findings: guard_diff changes in every
+   direction, Semgrep hits down to `PR_REVIEW_SEMGREP_LEAD_MIN_SEVERITY` (medium / low marked
+   "lead only"), and sensitive sinks on the diff's added lines (exec / eval / subprocess /
+   `os.system` / pickle / `yaml.load` / formatted SQL / file paths / redirects / outbound
+   requests / `innerHTML` / `dangerouslySetInnerHTML` / `child_process` / `fs` / `new Function`).
+3. **Audit**: "identify vulnerabilities NEWLY INTRODUCED by this change", data flow from
+   attacker-controlled sources to sinks; each finding gives file, new-file line, CWE, severity,
+   `source`, `sink`, `missing_control`, `exploit_scenario`, a verbatim quote and a 1–10
+   confidence. The PR title / body are never in the prompt (descriptions framing a change as
+   safe can collapse detection) and commit messages are called untrustworthy. Files are packed
+   by lead strength into prompts of `PR_REVIEW_MAX_PROMPT_TOKENS`; a file too big alone loses
+   neighbouring context, then before-versions, then after-code away from the changes, then
+   (partial) diff lines.
+4. **Context loop**: instead of answering, the model may send `{"need_context": [{"symbol",
+   "file", "want": "definition|callers"}]}`; symbols are resolved from the PR's own files,
+   appended and the audit re-asked (≤ `PR_REVIEW_CONTEXT_ROUNDS`, ≤
+   `PR_REVIEW_CONTEXT_MAX_TOKENS`, stops early when nothing new resolves).
+5. **Validation + filters**: the quote must be in the NEW file (searched near the claimed line
+   first; diff markers tolerated), then regex hard exclusions (DoS, rate limiting, resource
+   leaks, memory safety outside C/C++, docs, tests) and the audit-confidence floor.
+6. **Verification**: one fresh-context call per candidate with the file after the change
+   (whole, or a window around the finding plus its function), its diff and the claim; it must
+   establish source, control, sink, reachable path and counterevidence, with precedents for
+   Python / JS web code (React XSS only via `dangerouslySetInnerHTML`, no SSRF / path traversal
+   in client-side JS, env vars trusted, ReDoS only with an attacker-controlled pattern, ...).
+   Kept only if `confirmed` with confidence ≥ `PR_REVIEW_MIN_CONFIDENCE`.
+
+Deterministic guard_diff alerts, Semgrep evidence, `review_status` and `units_not_reviewed`
+work as in the per-unit review. The result adds `review_mode`, a `pr_review` block (audit /
+verifier calls, context rounds and requests, candidates → excluded / rejected / confirmed,
+estimated prompt tokens) and per-finding `taint_source`, `sink`, `missing_control`,
+`exploit_scenario`, `confidence`, `audit_confidence`, `verifier` (all optional; the Action and
+dashboard ignore fields they don't know). `review_pr(files, router, ...)` runs the whole stage
+on plain `{path, old_content, new_content, patch}` dicts without the API or DB (the eval's
+entry point).
+
+**Cost per PR** (estimated tokens = chars / 4 × 1.25, plus `LLM_OUTPUT_TOKENS_ESTIMATE` = 1500
+per call): a typical PR (1–5 files, one audit prompt) makes 1 audit call, +0–2 context rounds,
++1 verifier call per candidate (usually 0–3): **~1–6 calls, ~5K–40K tokens**. The ceiling is
+`PR_REVIEW_MAX_AUDIT_CALLS` + `PR_REVIEW_MAX_VERIFIER_CALLS` = 12 calls (~90K tokens). On
+Groq's free tier (8K tokens/min per model) each call takes about a minute of one model's
+budget, so a 6-call review needs a few minutes; `LLM_SCAN_MAX_WALL_S` (480 s) bounds it and
+anything cut is reported (`time_budget`). The per-unit review makes at most
+`LLM_MAX_CALLS_PER_SCAN` = 6 calls.
+
+Adapted text: the audit prompt, the verifier's exclusions / precedents and the hard-exclusion
+regexes come from [anthropics/claude-code-security-review](https://github.com/anthropics/claude-code-security-review)
+(MIT); the data-flow method and verification steps from
+[openai/codex-security](https://github.com/openai/codex-security) (Apache-2.0). Both are
+modified; notices and licence texts: `backend/app/core/prompts/THIRD_PARTY_NOTICES.md`.
+
 ---
 
 ## Project layout
@@ -551,3 +625,74 @@ can't certify an FPR ≤ 0.5%.
 and guard_diff `guard_removed` changes reached the LLM, what share of vulnerabilities would it
 ever see? It reuses the per-item rows in `results/semgrep_eval.json` and recomputes guard_diff,
 then writes `results/candidate_recall.json`.
+
+### PR-shaped eval (`pr_eval_v1`)
+
+The function-level sets ask "is this function vulnerable?". The product sees a PR (changed
+files with full content and a unified diff) and must answer "does this change introduce a
+vulnerability?". `scripts/build_pr_eval.py` rebuilds the 276 held-out fix commits behind the
+OSV eval sets as PRs, offline from `data/osv_cache/` (about 30 s, 330 MB peak, no API calls,
+no models):
+
+```bash
+python scripts/build_pr_eval.py            # -> ml/evaluation/datasets/pr_eval/
+python scripts/build_pr_eval.py --check    # summary only
+```
+
+- **Items** (one JSON object per line): `id`, `kind`, `language`, `repo`, `advisory_id`,
+  `cve_id`, `category`, `cwe`, `split`, `pr_title`, `pr_body`, `files` (`path`,
+  `old_content`, `new_content`, `patch`), `target` (`path`, `vuln_lines_new`,
+  `changed_lines_new`), `source`, `notes`, plus a `meta` provenance object.
+- **Kinds.**
+  - `vuln_introducing`: the fix commit reversed (`source: reversed_fix`).
+    `vuln_lines_new` holds the vulnerable-file lines, inside the eval set's vulnerable
+    functions, that the fix deleted or changed. For an insertion-only fix it holds the
+    insertion point ±2 (`meta.vuln_lines_mode`).
+  - `vuln_fix`: the real fix (`real_fix`). The correct verdict is "nothing introduced".
+  - `benign`: bystander edits (`bystander`). These are the files of a fix commit that hold no
+    function the corpus builder paired as changed by the fix. They come from the eval commits
+    first, then from other mined fix commits in the same repos (at most 5 per repo).
+- **Files.** Each PR has every `.py`/`.js`/`.ts` file the commit changed, minus
+  test/doc/example paths. It is capped at 6 files and 2,000 changed lines, vulnerable files
+  first, and truncation is noted in `notes`.
+  - A side missing from the cache is rebuilt from GitHub's patch when the patch applies
+    exactly. Renamed files are omitted, because their contents were never fetched.
+  - Patches are regenerated with difflib: standard `@@` headers, 3 context lines, `a/`/`b/`
+    paths. `apply_patch(old, patch) == new` holds for all 2,537 files. `changed_lines_new`
+    matches `diff_utils.parse_patch_changed_lines`.
+- **PR text.** Titles and bodies are synthetic and neutral ("Update <path> and N other
+  files"). They never use the commit message or advisory text. In
+  `pr_eval_v1_misleading.jsonl`, the 276 `vuln_introducing` items (id suffix `_misleading`)
+  instead say "Refactor: simplify input handling, no behaviour change".
+- **Split.** Each item takes the v1 side of its eval pair ids, and bystanders take their
+  repo's side. No advisory or repo is in both dev and test. `meta.repo_side` records the
+  repo's v1 side even for `reserve` items.
+- **Counts.** 1,212 items in total:
+
+  | | vuln_introducing | vuln_fix | benign |
+  |---|---|---|---|
+  | dev | 82 | 82 | 134 |
+  | test | 60 | 60 | 117 |
+  | reserve | 134 | 134 | 409 |
+
+  - 276 of 276 `vuln_introducing` items have `vuln_lines_new`: 219 from deleted/changed lines,
+    57 from an insertion point.
+  - The median PR has 1 file and 21–22 changed lines.
+  - `pr_eval_v1_sample_dev.jsonl` is the first-run sample: 60 `vuln_introducing` items
+    stratified by language × category, their 60 `vuln_fix` twins and 80 benign items (at most
+    3 per repo).
+- **Storage.** The JSONL files hold full file contents (130 MB), so they are gitignored.
+  `pr_eval_v1_manifest.json` is committed. It pins each file's sha256, the counts and every
+  id by split, and the build is deterministic.
+- **Caveat.** Bystander benigns come from security-adjacent commits, so they don't give a
+  realistic benign base rate. `scripts/fetch_benign_commits.py` fetches real benign commits
+  from the same repos through the GitHub API. It skips known fix commits, merges, bots, and
+  any message or linked PR that matches a wide security-keyword net. It caches every
+  response, honours rate limits and `--max-api-calls`, and writes
+  `pr_eval_benign_commits_v1.jsonl` in the same format (`source: benign_commit`).
+  `--dry-run` prints the plan and a call estimate without touching the network:
+
+  ```bash
+  python scripts/fetch_benign_commits.py --dry-run --max-commits 300 --per-repo 3
+  python scripts/fetch_benign_commits.py --max-commits 300 --per-repo 3 --wait-on-rate-limit
+  ```

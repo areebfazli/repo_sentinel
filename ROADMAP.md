@@ -12,6 +12,10 @@ Decided 2026-09-22. Ordered by expected impact.
 6. ~~PR diff-direction check~~ **Done** (4567539), wired into files-mode scans (41c855f): `guard_removed` as prompt evidence, `alert` tier as deterministic findings.
 7. ~~Prompt-injection hardening + per-scan token budget / CVE cap.~~ **Done** (663138c, 0bf6274).
 8. Later: embedding speed (findings cache per function hash), neural judge experiments.
+9. **PR-level review** (2026-09-30, design below): files mode now audits the change as a whole
+   and verifies each candidate separately (`REVIEW_MODE=pr`, default; `units` kept). Next:
+   measure it against the per-unit review on the PR eval set (`ml/evaluation/datasets/pr_eval/`)
+   before tuning any threshold.
 
 ## Findings 2026-09-24 (precision research + adversarial review)
 
@@ -137,6 +141,50 @@ All done; fast suite + ruff green; no API calls or model loads were needed to ve
   - Next measurement: LLM-first on the test split's 100 vulnerable functions (22 are candidates,
     78 not). If the LLM's hits fall almost entirely inside the candidates, static-first loses
     little recall for ~25x fewer calls.
+
+## PR-level review (2026-09-30)
+
+**Why.** Tools that produce useful PR security reviews (claude-code-security-review, Codex
+Security, vulnhuntr, Semgrep Assistant, ZeroPath) share: PR-level framing ("what does this
+change newly introduce?", diff + changed files), context pulled on demand, a separate
+per-finding verification pass with false-positive precedents, evidence-carrying findings
+(source -> control -> sink, exploit scenario, counterevidence), and static tools as leads.
+Diff-only prompting reaches ~6-9% recall in the literature; structured context + verification
+~48% recall at 70% precision (VIC-RAGENT). A PR description framing a change as safe can
+collapse detection (97% -> 4%). Ours so far: per-function prompt ~1/8 on the right lines, CVE
+retrieval added nothing, guard_diff ~23% of simulated vulnerability-introducing diffs at ~3-4%
+FP, Semgrep >= high fires rarely.
+
+**Design** (`core/pr_context.py`, `core/pr_review.py`, `core/prompts/`):
+- Bundle: per file the diff with new-file line numbers; per changed function after + before
+  (old content from the reverse-applied patch); tree-sitter symbol index of the PR's files
+  (definitions, methods, module variables, call sites) for context requests and auto-included
+  direct callers / callees. Token-budgeted: drop neighbours, then before-versions, then narrow
+  the after-code to the changes, then diff-only, then clip the diff (partial).
+- Leads (not findings): guard_diff in every direction, Semgrep down to `low` (marked "lead
+  only" below `SEMGREP_MIN_SEVERITY`), sensitive sinks on added lines.
+- Audit prompt adapted from claude-code-security-review (MIT) + codex-security (Apache-2.0)
+  guidance; PR title/body never included; JSON findings with source / sink / missing_control /
+  exploit_scenario / quote / confidence 1-10.
+- Context loop: `need_context` requests resolved on PR files only, <= 2 rounds, <= 1500 tokens,
+  early stop when nothing new resolves (one final call). Our own code; nothing from vulnhuntr
+  (AGPL).
+- Validation: quote must be in the NEW file; regex hard exclusions (DoS, rate limiting, leaks,
+  memory safety outside C/C++, docs, tests; ReDoS left to the verifier's "attacker-controlled
+  pattern" precedent; open redirects kept); audit confidence >= 5.
+- Verifier: one fresh call per candidate (<= 8), whole new file or a window + the diff + the
+  claim as untrusted text; keep only `confirmed` with confidence >= 8; `VERIFIER_MODEL` can put
+  another model first. Unverified candidates are not reported and make the review partial.
+- Cost: typical PR 1-6 calls (~5K-40K estimated tokens); ceiling 12 calls.
+
+**Open questions / to measure (eval integration is a separate step):**
+- Recall / FPR vs the per-unit review on the PR eval set, per stage (audit-only candidates vs
+  verified), so the verifier's cost in recall is known. `review_pr` returns every candidate
+  with its status for this.
+- `PR_REVIEW_MIN_CONFIDENCE` 8 and the audit floor 5 are uncalibrated defaults.
+- Whether the sink leads help or just add noise (off switch: `PR_REVIEW_SINK_LEADS`).
+- Whether a stronger verifier model (`VERIFIER_MODEL`) is worth its rate budget.
+- Free-tier throughput: a 6-call review is a few minutes on Groq's 8K TPM.
 
 ## 1. Detection quality
 

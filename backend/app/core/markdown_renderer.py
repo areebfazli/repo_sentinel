@@ -509,6 +509,13 @@ def _render_finding(f: dict[str, Any]) -> list[str]:
         block.append(f"  - Code: {md_code_span(f['quoted_code'])}")
     if f.get("reasoning"):
         block.append(f"  - Why: {md_inline(f['reasoning'])}")
+    if f.get("exploit_scenario") and f.get("exploit_scenario") != f.get("explanation"):
+        block.append(f"  - Exploit scenario: {md_inline(f['exploit_scenario'])}")
+    if f.get("verifier"):
+        conf = f.get("confidence")
+        conf_text = f", confidence {int(conf)}/10" if isinstance(conf, (int, float)) else ""
+        block.append(f"  - Confirmed by an independent verification pass "
+                     f"({md_code_span(str(f['verifier']))}{conf_text}).")
     if f.get("fix_snippet"):
         block.append("  - Suggested fix:")
         block.extend(md_code_block(f["fix_snippet"].strip(), indent="    "))
@@ -553,6 +560,7 @@ def render_markdown(
     units_total: int = 0,
     units_not_reviewed: int = 0,
     units_partial: int = 0,
+    show_reference_counts: bool = True,
 ) -> str:
     """Render the PR comment from validated structured findings (deterministic;
     every LLM-written field escaped). ``findings`` from the LLM carry
@@ -560,16 +568,19 @@ def render_markdown(
     our own trusted lines (budget / cap notices). ``review_status``
     ("complete" | "partial" | "failed", see ``scan_runner.review_coverage``)
     decides whether an empty report may say "no findings": only a complete
-    review gets the clean ✅."""
+    review gets the clean ✅. ``show_reference_counts`` False leaves the
+    retrieval counts out of the footer (the PR-level review doesn't show
+    retrieved matches to the model)."""
     footer_bits = []
     if units_reviewed is not None:
         footer_bits.append(
             f"{units_reviewed} of {units_total} unit(s) reviewed" if units_total
             else f"{units_reviewed} unit(s) reviewed"
         )
-    footer_bits.append(
-        f"{cve_count} similar CVE(s) and {team_count} team-memory match(es) as reference"
-    )
+    if show_reference_counts:
+        footer_bits.append(
+            f"{cve_count} similar CVE(s) and {team_count} team-memory match(es) as reference"
+        )
     if static_hits:
         footer_bits.append(f"{static_hits} static-analysis hit(s) as evidence")
     footer = f"_{'; '.join(footer_bits)}._"

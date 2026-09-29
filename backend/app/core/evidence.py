@@ -236,13 +236,15 @@ CORROBORATION_LINES = 3
 
 
 def corroborate_deterministic(
-    findings: list[dict[str, Any]], semgrep: dict[UnitKey, list[dict]]
+    findings: list[dict[str, Any]], semgrep: dict[UnitKey, list[dict]], by_file: bool = False
 ) -> None:
     """Set ``corroborated_by`` (in place) on each deterministic finding: "llm"
     when an LLM finding in the same unit spans a line within
     CORROBORATION_LINES of the change, "semgrep" likewise for a (non-regex)
     Semgrep hit. A change without a new-side line (a pure deletion) is
-    corroborated by any such finding / hit in its unit."""
+    corroborated by any such finding / hit in its unit. ``by_file``: an LLM
+    finding only needs the same file (the PR-level review anchors findings to
+    lines, not to planner units)."""
     llm = [f for f in findings if f.get("source") == "llm"]
 
     def near(line, first, last) -> bool:
@@ -258,7 +260,8 @@ def corroborate_deterministic(
             continue
         key = (d.get("file_path"), d.get("function_name"), int(d.get("start_line") or 1))
         by = []
-        if any(unit_key(f) == key and near(d.get("line"), f.get("line"), f.get("end_line"))
+        if any((f.get("file_path") == key[0] if by_file else unit_key(f) == key)
+               and near(d.get("line"), f.get("line"), f.get("end_line"))
                for f in llm):
             by.append("llm")
         if any(not h.get("low_confidence") and near(d.get("line"), h.get("line"),
@@ -266,3 +269,14 @@ def corroborate_deterministic(
                for h in semgrep.get(key, [])):
             by.append("semgrep")
         d["corroborated_by"] = by
+
+
+def static_out(semgrep: dict[UnitKey, list[dict]]) -> list[dict[str, Any]]:
+    """Semgrep hits as the result's ``static_analysis`` list."""
+    return [
+        {"file_path": key[0], "function_name": key[1], "start_line": key[2],
+         "rule_id": h["rule_id"], "severity": h.get("severity"), "cwe": h.get("cwe") or [],
+         "line": h.get("line"), "message": h.get("message") or ""}
+        for key, hits in semgrep.items()
+        for h in hits
+    ]

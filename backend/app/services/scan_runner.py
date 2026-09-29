@@ -4,7 +4,6 @@ Runs the retrieval + LLM review pipeline for a queued Scan and persists the
 result. Owns its own DB session (it runs outside the request lifecycle).
 """
 import asyncio
-import hashlib
 import json
 import time
 from datetime import UTC, datetime
@@ -21,10 +20,16 @@ from backend.app.core.evidence import (
     guess_language,
     plan_with_touched_lines,
     semgrep_evidence,
+    static_out,
+)
+from backend.app.core.finding_keys import dedupe_key as _dedupe_key  # noqa: F401
+from backend.app.core.finding_keys import (
+    disambiguate_dedupe_keys,
+    legacy_llm_dedupe_key,
+    llm_dedupe_key,
 )
 from backend.app.core.llm_client import LLMError
 from backend.app.core.markdown_renderer import (
-    SEVERITY_ORDER,
     SYSTEM_PROMPT,
     build_user_prompt,
     render_markdown,
@@ -38,7 +43,7 @@ from backend.app.core.review_plan import (
     snippet_unit,
 )
 from backend.app.core.scoring import relevance
-from backend.app.core.untrusted import match_form, md_code_span, new_nonce
+from backend.app.core.untrusted import md_code_span, new_nonce
 from backend.app.db.models import Finding, Scan
 from backend.app.db.session import SessionLocal
 
@@ -197,64 +202,6 @@ def _row_snapshot(row: Finding) -> dict:
         "start_line": row.start_line,
         "function_name": row.function_name,
     }
-
-
-def _dedupe_key(prefix: str, *parts) -> str:
-    """Stable id of a report finding within its function, for the Action's
-    comment markers (which also hash file + function)."""
-    text = "|".join(" ".join(str(p or "").split()) for p in parts)
-    return f"{prefix}:{hashlib.sha1(text.encode()).hexdigest()[:16]}"
-
-
-def _anchored_line_text(unit: dict, line: int | None) -> str:
-    """The unit's code line at real line ``line`` (as shown to the model), or ""."""
-    if line is None:
-        return ""
-    lines = (unit.get("prompt_code") or "").splitlines()
-    numbers = unit.get("line_numbers")
-    if numbers:
-        idx = numbers.index(line) if line in numbers else -1
-    else:
-        idx = line - int(unit.get("start_line") or 1)
-    return lines[idx] if 0 <= idx < len(lines) else ""
-
-
-def llm_dedupe_key(unit: dict, finding: dict) -> str:
-    """Comment identity of an LLM finding: the source plus the code line it is
-    anchored to (``untrusted.match_form``: whitespace-insensitive), falling back
-    to the quote's first line. Only stable fields: the Action's marker adds the
-    file path and function name, and nothing the LLM words differently from run
-    to run (title, CWE, explanation) is part of it, so a re-run with the same
-    code updates the same comment. Survives line shifts and re-indentation;
-    changes only when the offending line itself changes."""
-    text = _anchored_line_text(unit, finding.get("line"))
-    if not match_form(text):
-        text = ((finding.get("quoted_code") or "").strip().splitlines() or [""])[0]
-    return _dedupe_key("llm", match_form(text))
-
-
-def legacy_llm_dedupe_key(finding: dict) -> str:
-    """The key older servers used (quote's first line + CWE or title). Sent as
-    ``legacy_dedupe_keys`` so the Action can adopt comments posted by them
-    instead of deleting and re-posting them."""
-    quote_first = (finding.get("quoted_code") or "").strip().splitlines()[:1]
-    return _dedupe_key("llm", quote_first[0] if quote_first else "",
-                       finding.get("cwe") or finding.get("title"))
-
-
-def disambiguate_dedupe_keys(findings: list[dict]) -> None:
-    """Two findings on the same line of the same function (say SQLi and XSS)
-    share a key; number the later ones ("#2", ...) in a stable order
-    (severity, CWE, title), so each keeps its own comment."""
-    groups: dict[tuple, list[dict]] = {}
-    for f in findings:
-        groups.setdefault((f.get("file_path"), f.get("function_name"), f.get("dedupe_key")),
-                          []).append(f)
-    for group in groups.values():
-        group.sort(key=lambda f: (SEVERITY_ORDER.get(f.get("severity"), 4), f.get("cwe") or "",
-                                  f.get("title") or ""))
-        for n, f in enumerate(group[1:], start=2):
-            f["dedupe_key"] = f"{f['dedupe_key']}#{n}"
 
 
 def _build_report_findings(
@@ -491,16 +438,6 @@ def _coverage_notes(reviewed: list[dict], not_reviewed: list[dict]) -> list[str]
     return notes
 
 
-def _static_out(semgrep: dict) -> list[dict]:
-    return [
-        {"file_path": key[0], "function_name": key[1], "start_line": key[2],
-         "rule_id": h["rule_id"], "severity": h.get("severity"), "cwe": h.get("cwe") or [],
-         "line": h.get("line"), "message": h.get("message") or ""}
-        for key, hits in semgrep.items()
-        for h in hits
-    ]
-
-
 def _mark_failed(session, scan_id: str, error: str) -> None:
     """Flip a scan to failed with a sanitized message (the real cause is logged)."""
     session.rollback()
@@ -581,11 +518,11 @@ async def _run_scan_guarded(scan_id: str, merger, router) -> None:
         if "mock" in providers:
             notes.append("_LLM_PROVIDER=mock: no real review was performed._")
         notes.extend(_coverage_notes(reviewed, not_reviewed))
-        static_out = _static_out(analysis["semgrep"])
+        statics = static_out(analysis["semgrep"])
         report_markdown = render_markdown(
             report_findings, len(cves), len(team),
             units_reviewed=coverage["units_reviewed"],
-            static_hits=len(static_out), notes=notes,
+            static_hits=len(statics), notes=notes,
             review_status=coverage["review_status"], units_total=coverage["units_total"],
             units_not_reviewed=len(not_reviewed),
             units_partial=coverage["units_partially_reviewed"],
@@ -602,7 +539,7 @@ async def _run_scan_guarded(scan_id: str, merger, router) -> None:
             "ghost_hunter_matches": len(cves),
             "team_memory_matches": len(team),
             "llm_provider_used": provider_used,
-            "static_analysis": static_out,
+            "static_analysis": statics,
             "guard_diff": list(analysis["guard"].values()),
             "llm_calls": llm_calls,
             **coverage,

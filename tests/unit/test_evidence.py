@@ -55,6 +55,15 @@ YAML_PATCH = (
 )
 
 
+@pytest.fixture(autouse=True)
+def _units_review_mode(monkeypatch):
+    """The scans here exercise the per-unit review (REVIEW_MODE=units); the
+    PR-level review's evidence handling is in tests/unit/test_pr_review.py."""
+    from backend.app.config import settings
+
+    monkeypatch.setattr(settings, "REVIEW_MODE", "units")
+
+
 @pytest.fixture(scope="module")
 def parser():
     return CodeParser()

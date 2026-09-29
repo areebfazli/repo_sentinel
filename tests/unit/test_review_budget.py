@@ -22,6 +22,13 @@ from backend.app.core.review_plan import (
 )
 from backend.app.services import scan_runner
 
+
+@pytest.fixture(autouse=True)
+def _units_review_mode(monkeypatch):
+    """These tests cover the per-unit review (REVIEW_MODE=units); the PR-level
+    review has its own (tests/unit/test_pr_review.py)."""
+    monkeypatch.setattr(settings, "REVIEW_MODE", "units")
+
 BUDGET = {"max_prompt_tokens": 6000, "max_units_per_prompt": 6, "max_calls": 6,
           "max_refs_per_unit": 2}
 

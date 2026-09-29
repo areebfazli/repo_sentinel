@@ -267,15 +267,30 @@ def _get_semgrep():
     )
 
 
-def _semgrep_task(units: list[dict], sources: dict[str, str] | None) -> asyncio.Task:
+def _semgrep_task(units: list[dict], sources: dict[str, str] | None,
+                  min_severity: str | None = None) -> asyncio.Task:
     """Start Semgrep in a worker thread (a subprocess: runs alongside the
-    embedding / retrieval work instead of after it)."""
+    embedding / retrieval work instead of after it). ``min_severity`` defaults
+    to SEMGREP_MIN_SEVERITY (the PR review asks for its lower lead floor)."""
     return asyncio.create_task(
         asyncio.to_thread(
-            semgrep_evidence, _get_semgrep(), units, sources, settings.SEMGREP_MIN_SEVERITY,
+            semgrep_evidence, _get_semgrep(), units, sources,
+            min_severity or settings.SEMGREP_MIN_SEVERITY,
             frozenset(settings.SEMGREP_EXCLUDED_RULES),
         )
     )
+
+
+NO_RETRIEVAL = {"ghost_hunter_findings": [], "team_memory_findings": [], "is_vulnerable": False}
+
+
+async def _retrieve(work) -> dict:
+    """``await work()`` (a merger call), unless LLM_MAX_CVES_PER_UNIT <= 0:
+    then no reference is ever shown, so retrieval (and its embedding cost) is
+    skipped."""
+    if settings.LLM_MAX_CVES_PER_UNIT <= 0:
+        return dict(NO_RETRIEVAL)
+    return await work()
 
 
 async def _with_semgrep(semgrep: asyncio.Task, work):
@@ -289,25 +304,43 @@ async def _with_semgrep(semgrep: asyncio.Task, work):
     return result, await semgrep
 
 
+def pr_mode_enabled() -> bool:
+    """Files mode uses the PR-level review unless REVIEW_MODE=units."""
+    return settings.REVIEW_MODE.strip().lower() != "units"
+
+
 async def _analyze_request(merger, request: dict) -> dict:
     """Run the right retrieval mode plus the deterministic evidence. Returns
-    {raw, units, semgrep, guard, notes}: the retrieval result, the analysis
-    units the LLM reviews, Semgrep hits and guard_diff results per unit key,
-    and trusted report notes."""
+    {raw, units, semgrep, guard, notes, bundle}: the retrieval result, the
+    analysis units the LLM reviews, Semgrep hits and guard_diff results per
+    unit key, trusted report notes, and (files mode with REVIEW_MODE=pr) the
+    PR bundle; its Semgrep hits then go down to the PR review's lead floor."""
     if request.get("files"):
         from backend.app.core.analysis_planner import plan_units
         from backend.app.models.schemas import FileInput
 
         files = [FileInput(**f) for f in request["files"]]
-        # Deletion points count as changes, so a function whose only change is
-        # a removed guard is analysed. tree-sitter parsing is CPU-bound; keep it
-        # off the event loop.
-        units, dropped = await asyncio.to_thread(
-            plan_units, plan_with_touched_lines(files), _get_parser(),
-            settings.MAX_UNITS_PER_SCAN,
-        )
-        semgrep = _semgrep_task(units, {f.path: f.content for f in files})
-        raw, semgrep_hits = await _with_semgrep(semgrep, merger.analyze_units(units))
+        bundle = None
+        min_severity = None
+        if pr_mode_enabled():
+            from backend.app.core.pr_context import build_pr_bundle
+
+            bundle = await asyncio.to_thread(build_pr_bundle, files, _get_parser(),
+                                             max_units=settings.MAX_UNITS_PER_SCAN)
+            units, dropped = bundle.units, bundle.dropped_units
+            files = [f for f in bundle.files if f.new_content is not None]
+            min_severity = settings.PR_REVIEW_SEMGREP_LEAD_MIN_SEVERITY
+        else:
+            # Deletion points count as changes, so a function whose only change
+            # is a removed guard is analysed. tree-sitter parsing is CPU-bound;
+            # keep it off the event loop.
+            units, dropped = await asyncio.to_thread(
+                plan_units, plan_with_touched_lines(files), _get_parser(),
+                settings.MAX_UNITS_PER_SCAN,
+            )
+        semgrep = _semgrep_task(units, {f.path: f.content for f in files}, min_severity)
+        raw, semgrep_hits = await _with_semgrep(
+            semgrep, _retrieve(lambda: merger.analyze_units(units)))
         guard = await asyncio.to_thread(guard_evidence, files, units, _get_parser())
         notes = (
             [f"_Analysis capped at {settings.MAX_UNITS_PER_SCAN} functions; "
@@ -316,15 +349,17 @@ async def _analyze_request(merger, request: dict) -> dict:
             else []
         )
         return {"raw": raw, "units": units, "semgrep": semgrep_hits, "guard": guard,
-                "notes": notes}
+                "notes": notes, "bundle": bundle}
 
     code = request["code_snippet"]
     language = request.get("language")
     units = [snippet_unit(code, language or guess_language(code))] if code.strip() else []
     semgrep = _semgrep_task(units, None)
-    raw, semgrep_hits = await _with_semgrep(semgrep, merger.analyze_code(code, language))
+    raw, semgrep_hits = await _with_semgrep(
+        semgrep, _retrieve(lambda: merger.analyze_code(code, language)))
     # guard_diff needs the previous version of the code: not applicable to a snippet.
-    return {"raw": raw, "units": units, "semgrep": semgrep_hits, "guard": {}, "notes": []}
+    return {"raw": raw, "units": units, "semgrep": semgrep_hits, "guard": {}, "notes": [],
+            "bundle": None}
 
 
 async def _review_batches(
@@ -449,6 +484,90 @@ def _mark_failed(session, scan_id: str, error: str) -> None:
         session.commit()
 
 
+async def _units_review_result(analysis: dict, raw: dict, router,
+                               row_snaps: list[dict]) -> dict:
+    """The per-unit review (snippet mode; files mode with REVIEW_MODE=units):
+    the LLM reviews every analysis unit on its own merits; retrieved matches
+    are reference context, not a precondition for the call."""
+    notes = analysis["notes"]
+    cves = raw.get("ghost_hunter_findings", [])
+    team = raw.get("team_memory_findings", [])
+    review_units = build_review_units(
+        analysis["units"], raw, analysis["semgrep"], analysis["guard"]
+    )
+    batches, not_reviewed = plan_review_prompts(
+        review_units,
+        max_prompt_tokens=settings.LLM_MAX_PROMPT_TOKENS,
+        max_units_per_prompt=settings.LLM_MAX_UNITS_PER_PROMPT,
+        max_calls=settings.LLM_MAX_CALLS_PER_SCAN,
+        max_refs_per_unit=settings.LLM_MAX_CVES_PER_UNIT,
+    )
+    # Deterministic guard_diff alerts are reported whatever the LLM says.
+    report_findings: list[dict] = guard_alert_findings(
+        analysis["guard"], settings.GUARD_ALERT_SEVERITY
+    )
+    providers, llm_calls, reviewed = await _review_batches(
+        batches, router, row_snaps, report_findings, not_reviewed
+    )
+    corroborate_deterministic(report_findings, analysis["semgrep"])
+    disambiguate_dedupe_keys(report_findings)
+    coverage = review_coverage(len(review_units), reviewed, not_reviewed)
+    if "mock" in providers:
+        notes.append("_LLM_PROVIDER=mock: no real review was performed._")
+    notes.extend(_coverage_notes(reviewed, not_reviewed))
+    statics = static_out(analysis["semgrep"])
+    report_markdown = render_markdown(
+        report_findings, len(cves), len(team),
+        units_reviewed=coverage["units_reviewed"],
+        static_hits=len(statics), notes=notes,
+        review_status=coverage["review_status"], units_total=coverage["units_total"],
+        units_not_reviewed=len(not_reviewed),
+        units_partial=coverage["units_partially_reviewed"],
+    )
+    # is_vulnerable reflects the reviewed findings (the precision filter), not
+    # the raw high-recall retrieval, so it agrees with the report. A "partial" /
+    # "failed" review_status means False is not a clean bill.
+    return {
+        "is_vulnerable": bool(report_findings),
+        "report_markdown": report_markdown,
+        "report_findings": report_findings,
+        "llm_provider_used": ",".join(providers) or None,
+        "static_analysis": statics,
+        "guard_diff": list(analysis["guard"].values()),
+        "llm_calls": llm_calls,
+        **coverage,
+        "units_not_reviewed": [
+            {"file_path": u.get("file_path"), "function_name": u.get("function_name"),
+             "start_line": u.get("start_line"), "reason": u["not_reviewed_reason"]}
+            for u in not_reviewed
+        ],
+        "review_mode": "units",
+    }
+
+
+async def _pr_review_result(analysis: dict, raw: dict, router) -> dict:
+    """The PR-level review (files mode, REVIEW_MODE=pr): audit with context
+    rounds, then per-candidate verification (``core.pr_review``)."""
+    from backend.app.core.evidence import filter_semgrep_hits
+    from backend.app.core.llm_client import verifier_router_for
+    from backend.app.core.pr_review import PRReviewConfig, assemble_pr_result, run_pr_review
+
+    config = PRReviewConfig.from_settings()
+    outcome = await run_pr_review(
+        analysis["bundle"], router, semgrep_leads=analysis["semgrep"],
+        guard=analysis["guard"], config=config, verifier_router=verifier_router_for(router),
+        retrieval=raw,
+    )
+    evidence_hits = filter_semgrep_hits(analysis["semgrep"], settings.SEMGREP_MIN_SEVERITY,
+                                        frozenset(settings.SEMGREP_EXCLUDED_RULES))
+    return assemble_pr_result(
+        outcome, analysis["guard"], evidence_hits, n_units=len(analysis["units"]),
+        notes=analysis["notes"], cve_count=len(raw.get("ghost_hunter_findings", [])),
+        team_count=len(raw.get("team_memory_findings", [])),
+        guard_alert_severity=settings.GUARD_ALERT_SEVERITY,
+    )
+
+
 async def run_scan(scan_id: str, merger, router) -> None:
     """Execute a queued scan end-to-end and persist the outcome.
 
@@ -480,7 +599,7 @@ async def _run_scan_guarded(scan_id: str, merger, router) -> None:
 
         request = json.loads(scan.request_json)
         analysis = await _analyze_request(merger, request)
-        raw, notes = analysis["raw"], analysis["notes"]
+        raw = analysis["raw"]
         cves = raw.get("ghost_hunter_findings", [])
         team = raw.get("team_memory_findings", [])
 
@@ -492,63 +611,14 @@ async def _run_scan_guarded(scan_id: str, merger, router) -> None:
         row_snaps = [_row_snapshot(r) for r in rows]
         session.commit()
 
-        # The LLM reviews every analysis unit on its own merits; retrieved
-        # matches are reference context, not a precondition for the call.
-        review_units = build_review_units(
-            analysis["units"], raw, analysis["semgrep"], analysis["guard"]
-        )
-        batches, not_reviewed = plan_review_prompts(
-            review_units,
-            max_prompt_tokens=settings.LLM_MAX_PROMPT_TOKENS,
-            max_units_per_prompt=settings.LLM_MAX_UNITS_PER_PROMPT,
-            max_calls=settings.LLM_MAX_CALLS_PER_SCAN,
-            max_refs_per_unit=settings.LLM_MAX_CVES_PER_UNIT,
-        )
-        # Deterministic guard_diff alerts are reported whatever the LLM says.
-        report_findings: list[dict] = guard_alert_findings(
-            analysis["guard"], settings.GUARD_ALERT_SEVERITY
-        )
-        providers, llm_calls, reviewed = await _review_batches(
-            batches, router, row_snaps, report_findings, not_reviewed
-        )
-        corroborate_deterministic(report_findings, analysis["semgrep"])
-        disambiguate_dedupe_keys(report_findings)
-        coverage = review_coverage(len(review_units), reviewed, not_reviewed)
-        provider_used = ",".join(providers) or None
-        if "mock" in providers:
-            notes.append("_LLM_PROVIDER=mock: no real review was performed._")
-        notes.extend(_coverage_notes(reviewed, not_reviewed))
-        statics = static_out(analysis["semgrep"])
-        report_markdown = render_markdown(
-            report_findings, len(cves), len(team),
-            units_reviewed=coverage["units_reviewed"],
-            static_hits=len(statics), notes=notes,
-            review_status=coverage["review_status"], units_total=coverage["units_total"],
-            units_not_reviewed=len(not_reviewed),
-            units_partial=coverage["units_partially_reviewed"],
-        )
-
-        # is_vulnerable reflects the reviewed findings (the precision filter), not
-        # the raw high-recall retrieval — so it agrees with the report. A
-        # "partial" / "failed" review_status means False is not a clean bill.
-        result = {
-            "is_vulnerable": bool(report_findings),
-            "report_markdown": report_markdown,
-            "findings": findings_out,
-            "report_findings": report_findings,
-            "ghost_hunter_matches": len(cves),
-            "team_memory_matches": len(team),
-            "llm_provider_used": provider_used,
-            "static_analysis": statics,
-            "guard_diff": list(analysis["guard"].values()),
-            "llm_calls": llm_calls,
-            **coverage,
-            "units_not_reviewed": [
-                {"file_path": u.get("file_path"), "function_name": u.get("function_name"),
-                 "start_line": u.get("start_line"), "reason": u["not_reviewed_reason"]}
-                for u in not_reviewed
-            ],
-        }
+        if analysis["bundle"] is not None:
+            result = await _pr_review_result(analysis, raw, router)
+        else:
+            result = await _units_review_result(analysis, raw, router, row_snaps)
+        result.update(findings=findings_out, ghost_hunter_matches=len(cves),
+                      team_memory_matches=len(team))
+        report_markdown = result["report_markdown"]
+        provider_used = result["llm_provider_used"]
 
         scan.is_vulnerable = result["is_vulnerable"]
         scan.report_markdown = report_markdown

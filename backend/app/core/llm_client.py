@@ -542,3 +542,36 @@ class LLMRouter:
             f"All LLM clients failed ({', '.join(c.label for c in self.clients)}): {last_error}",
             deadline_exceeded=deadline_hit,
         )
+
+
+def verifier_router_for(router):
+    """The router for the PR review's verifier calls.
+
+    With ``VERIFIER_MODEL`` ("<provider>:<model>") set, a router that tries
+    that model first and then ``router``'s own chain, sharing its pacer (one
+    token budget per model across both). Otherwise, for a mock router, or for
+    anything that isn't an ``LLMRouter`` (test stubs), ``router`` itself. A
+    malformed spec or a provider without a key logs a warning and falls back
+    to ``router``. Cached on ``router``."""
+    spec = (settings.VERIFIER_MODEL or "").strip()
+    if not spec or not isinstance(router, LLMRouter) or router.mock:
+        return router
+    cached = getattr(router, "_verifier_router", None)
+    if cached is not None and cached[0] == spec:
+        return cached[1]
+    provider, _, model = spec.partition(":")
+    if provider not in PROVIDERS or not model:
+        logger.warning("VERIFIER_MODEL={!r} is not '<provider>:<model>'; verifying with the "
+                       "normal chain.", spec)
+        return router
+    if not _key_configured(_provider_key(provider)):
+        logger.warning("VERIFIER_MODEL provider '{}' has no key configured; verifying with the "
+                       "normal chain.", provider)
+        return router
+    client = LLMClient(provider, model=model)
+    derived = LLMRouter.__new__(LLMRouter)
+    derived.mock = False
+    derived.pacer = router.pacer
+    derived.clients = [client] + [c for c in router.clients if c.label != client.label]
+    router._verifier_router = (spec, derived)
+    return derived

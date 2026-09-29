@@ -84,6 +84,53 @@ class Settings(BaseSettings):
     # for 15 minutes in total.
     LLM_SCAN_MAX_WALL_S: float = 480.0
 
+    # Files-mode review (core/pr_review.py). "pr": one PR-level audit ("what
+    # does this change newly introduce?") over the diff + changed functions
+    # before/after + leads, a bounded context loop (the model names symbols it
+    # needs, resolved from the PR's own files), then a separate verifier call per
+    # candidate. "units": the older per-function review (review_plan), kept for
+    # comparison. Snippet mode always uses the per-unit review.
+    REVIEW_MODE: str = "pr"                   # pr | units
+    # Audit prompt budget (estimated tokens, like LLM_MAX_PROMPT_TOKENS); 6000
+    # keeps one call + its answer under Groq's free-tier 8K tokens/min.
+    PR_REVIEW_MAX_PROMPT_TOKENS: int = 6000
+    # All audit calls of a scan, context rounds included. A PR too big for one
+    # prompt is split by file into several audit prompts; files beyond this
+    # budget are listed as not reviewed ("budget").
+    PR_REVIEW_MAX_AUDIT_CALLS: int = 4
+    # Extra audit calls per prompt answering the model's context requests.
+    PR_REVIEW_CONTEXT_ROUNDS: int = 2
+    # Estimated tokens of requested context appended per audit prompt (all
+    # rounds together); reserved out of PR_REVIEW_MAX_PROMPT_TOKENS.
+    PR_REVIEW_CONTEXT_MAX_TOKENS: int = 1500
+    # One verifier call per candidate finding, at most this many per scan.
+    PR_REVIEW_MAX_VERIFIER_CALLS: int = 8
+    # A finding is reported only when the verifier confirms it with at least
+    # this confidence (1-10).
+    PR_REVIEW_MIN_CONFIDENCE: int = 8
+    # Candidates the audit itself rates below this (1-10) are not verified.
+    PR_REVIEW_MIN_AUDIT_CONFIDENCE: int = 5
+    # Semgrep hits at/above this severity are shown to the audit as LEADS
+    # (marked with their severity; leads focus attention, they are not findings).
+    # Evidence-grade hits (static_analysis, corroboration) still use
+    # SEMGREP_MIN_SEVERITY.
+    PR_REVIEW_SEMGREP_LEAD_MIN_SEVERITY: str = "low"
+    # Diff-scoped heuristic leads: added lines touching sensitive sinks (exec,
+    # eval, subprocess, pickle, yaml.load, SQL execute with formatting, file
+    # paths, redirects, outbound requests, innerHTML, child_process, ...).
+    PR_REVIEW_SINK_LEADS: bool = True
+    # Regex hard exclusions (DoS, rate limiting, resource leaks, memory safety
+    # in non-C code, findings in docs / tests) applied before verification.
+    PR_REVIEW_HARD_EXCLUSIONS: bool = True
+    # Retrieved similar CVE fixes shown in the audit prompt as "how a similar
+    # bug was fixed" examples (0 = off; retrieval added nothing measurable).
+    PR_REVIEW_FIX_EXAMPLES: int = 0
+    # "<provider>:<model>" to try first for verifier calls (e.g.
+    # "groq:openai/gpt-oss-120b"); the normal chain remains the fallback.
+    # None = the same chain as the audit. The model that answered is recorded
+    # per finding (``verifier``).
+    VERIFIER_MODEL: str | None = None
+
     # Service URLs (for production)
     DATABASE_URL: str | None = None
     QDRANT_HOST: str | None = None

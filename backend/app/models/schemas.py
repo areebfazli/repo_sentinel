@@ -110,6 +110,20 @@ class ReportFinding(BaseModel):
     # Keys earlier server versions gave the same finding: the Action adopts a
     # comment carrying one of them instead of deleting and re-posting it.
     legacy_dedupe_keys: list[str] = []
+    # PR-level review (REVIEW_MODE=pr) only; None otherwise. ``source`` above is
+    # the finding's origin (llm / guard_diff), so the attacker-controlled input
+    # is ``taint_source``. ``confidence`` (1-10) is the verifier's,
+    # ``audit_confidence`` the audit's; ``verifier`` the "<provider>:<model>"
+    # that confirmed it.
+    taint_source: str | None = None
+    sink: str | None = None
+    missing_control: str | None = None
+    exploit_scenario: str | None = None
+    confidence: int | None = None
+    audit_confidence: int | None = None
+    verifier: str | None = None
+    verifier_reason: str | None = None
+    counterevidence: str | None = None
 
 
 class StaticAnalysisHit(BaseModel):
@@ -151,13 +165,47 @@ class GuardDiffOut(BaseModel):
 
 class UnitNotReviewed(BaseModel):
     """An analysis unit the LLM did not review: ``reason`` is "budget" (beyond
-    LLM_MAX_CALLS_PER_SCAN prompts), "too_large", "llm_error" or "time_budget"
-    (LLM_SCAN_MAX_WALL_S ran out, e.g. waiting on provider rate limits)."""
+    LLM_MAX_CALLS_PER_SCAN prompts, or PR_REVIEW_MAX_AUDIT_CALLS in the PR
+    review), "too_large", "llm_error" or "time_budget" (LLM_SCAN_MAX_WALL_S ran
+    out, e.g. waiting on provider rate limits)."""
 
     file_path: str | None = None
     function_name: str | None = None
     start_line: int | None = None
     reason: str
+
+
+class PRReviewLeads(BaseModel):
+    guard: int = 0
+    semgrep: int = 0
+    sinks: int = 0
+
+
+class PRReviewStats(BaseModel):
+    """The PR-level review's funnel and cost (``core.pr_review``)."""
+
+    audit_calls: int = 0
+    audit_prompts_planned: int = 0
+    verifier_calls: int = 0
+    context_rounds_used: int = 0
+    context_requested: int = 0
+    context_resolved: int = 0
+    candidates: int = 0  # validated audit findings (quote found in the new file)
+    quote_not_found: int = 0
+    hard_excluded: int = 0
+    below_audit_confidence: int = 0
+    verified: int = 0
+    confirmed: int = 0
+    rejected: int = 0
+    uncertain: int = 0
+    below_min_confidence: int = 0  # confirmed, but under PR_REVIEW_MIN_CONFIDENCE
+    unverified: int = 0  # verifier budget / time / errors: not reported
+    prompt_tokens_est: int = 0
+    files_total: int = 0
+    files_reviewed: int = 0
+    leads: PRReviewLeads = PRReviewLeads()
+    verifier_models: list[str] = []
+    min_confidence: int | None = None
 
 
 class AnalyzeResult(BaseModel):
@@ -185,6 +233,10 @@ class AnalyzeResult(BaseModel):
     units_reviewed: int | None = None
     units_partially_reviewed: int | None = None
     units_not_reviewed: list[UnitNotReviewed] = []
+    # "pr" (PR-level audit + verification, files mode) or "units" (per-unit
+    # review: snippet mode, or REVIEW_MODE=units); None on older results.
+    review_mode: str | None = None
+    pr_review: PRReviewStats | None = None
 
 
 class JobStatusResponse(BaseModel):

@@ -156,7 +156,10 @@ class QuotingRouter:
 
 
 @pytest.mark.integration
-def test_files_mode_llm_finding_anchored_to_quoted_line():
+def test_files_mode_llm_finding_anchored_to_quoted_line(monkeypatch):
+    from backend.app.config import settings
+
+    monkeypatch.setattr(settings, "REVIEW_MODE", "units")  # the per-unit review path
     router = QuotingRouter()
     app.dependency_overrides[analyze.get_merger] = lambda: StubMerger()
     app.dependency_overrides[analyze.get_llm_router] = lambda: router
@@ -195,5 +198,51 @@ def test_rejects_both_snippet_and_files():
                 json={"code_snippet": "x", "files": [{"path": "a.py", "content": "y"}]},
             )
             assert resp.status_code == 422  # validator: exactly one mode
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.integration
+def test_files_mode_pr_review_through_the_api(monkeypatch):
+    """REVIEW_MODE=pr (the default): audit + verifier through the real API."""
+    from backend.app.config import settings
+    from backend.app.core.prompts.pr_audit import AUDIT_SYSTEM_PROMPT
+
+    class PRStubRouter:
+        mock = False
+
+        def __init__(self):
+            self.systems = []
+
+        async def generate(self, system, user, **kwargs):
+            self.systems.append(system)
+            if system == AUDIT_SYSTEM_PROMPT:
+                return {"findings": [{
+                    "file": "app.py", "line": 5, "severity": "high", "cwe": "CWE-89",
+                    "title": "SQL injection", "source": "u", "sink": "db.execute",
+                    "missing_control": "no parameterisation",
+                    "exploit_scenario": "u = \"' OR 1=1 --\"",
+                    "quoted_code": "q = 'SELECT ' + u", "confidence": 9}]}, "groq:audit"
+            return {"verdict": "confirmed", "confidence": 9, "reason": "r"}, "groq:verify"
+
+    monkeypatch.setattr(settings, "REVIEW_MODE", "pr")
+    router = PRStubRouter()
+    app.dependency_overrides[analyze.get_merger] = lambda: StubMerger()
+    app.dependency_overrides[analyze.get_llm_router] = lambda: router
+    try:
+        with TestClient(app) as client:
+            resp = client.post(
+                "/api/v1/analyze/",
+                json={"files": [{"path": "app.py", "content": FILES_CONTENT,
+                                 "changed_lines": [5, 6]}]},
+            )
+            result = client.get(f"/api/v1/analyze/{resp.json()['job_id']}").json()["result"]
+            assert result["review_mode"] == "pr" and result["is_vulnerable"] is True
+            [f] = result["report_findings"]
+            assert (f["function_name"], f["line"], f["verifier"]) == ("risky", 5, "groq:verify")
+            assert f["taint_source"] == "u" and f["confidence"] == 9
+            assert result["pr_review"]["confirmed"] == 1
+            assert result["llm_provider_used"] == "groq:audit,groq:verify"
+            assert len(router.systems) == 2
     finally:
         app.dependency_overrides.clear()

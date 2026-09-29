@@ -364,7 +364,7 @@ async def _analyze_request(merger, request: dict) -> dict:
 
 async def _review_batches(
     batches: list[list[dict]], router, row_snaps: list[dict], report_findings: list[dict],
-    not_reviewed: list[dict],
+    not_reviewed: list[dict], nonce_factory=new_nonce,
 ) -> tuple[list[str], int, list[dict]]:
     """One LLM call per batch, sequentially (free tiers rate-limit per minute;
     the router paces calls by tokens per model). Appends each batch's anchored
@@ -373,7 +373,8 @@ async def _review_batches(
     ``not_reviewed`` with reason "time_budget"; a failed call's units get
     "llm_error". Never raises for LLM failures, even when every call fails:
     the deterministic evidence is still reported and the review status says
-    what happened (``review_coverage``).
+    what happened (``review_coverage``). ``nonce_factory`` makes each
+    prompt's untrusted-block nonce (the eval passes a deterministic one).
     Returns (distinct provider labels that answered, calls made, units reviewed)."""
     providers: list[str] = []
     reviewed: list[dict] = []
@@ -391,7 +392,7 @@ async def _review_batches(
         calls += 1
         try:
             llm_json, provider = await router.generate(
-                SYSTEM_PROMPT, build_user_prompt(batch, new_nonce()), deadline=deadline
+                SYSTEM_PROMPT, build_user_prompt(batch, nonce_factory()), deadline=deadline
             )
         except LLMError as exc:
             logger.warning("LLM review call failed for {} unit(s): {}", len(batch), exc)
@@ -485,10 +486,11 @@ def _mark_failed(session, scan_id: str, error: str) -> None:
 
 
 async def _units_review_result(analysis: dict, raw: dict, router,
-                               row_snaps: list[dict]) -> dict:
+                               row_snaps: list[dict], nonce_factory=new_nonce) -> dict:
     """The per-unit review (snippet mode; files mode with REVIEW_MODE=units):
     the LLM reviews every analysis unit on its own merits; retrieved matches
-    are reference context, not a precondition for the call."""
+    are reference context, not a precondition for the call. Needs no DB
+    (``row_snaps`` may be empty): the PR eval runs it in-process."""
     notes = analysis["notes"]
     cves = raw.get("ghost_hunter_findings", [])
     team = raw.get("team_memory_findings", [])
@@ -507,7 +509,7 @@ async def _units_review_result(analysis: dict, raw: dict, router,
         analysis["guard"], settings.GUARD_ALERT_SEVERITY
     )
     providers, llm_calls, reviewed = await _review_batches(
-        batches, router, row_snaps, report_findings, not_reviewed
+        batches, router, row_snaps, report_findings, not_reviewed, nonce_factory
     )
     corroborate_deterministic(report_findings, analysis["semgrep"])
     disambiguate_dedupe_keys(report_findings)

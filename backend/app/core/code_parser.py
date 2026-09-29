@@ -77,6 +77,7 @@ class CodeParser:
         captures = cursor.captures(tree.root_node)  # dict[str, list[Node]]
 
         functions: list[dict[str, Any]] = []
+        positions: list[tuple[int, int]] = []
         for node in captures.get("function", []):
             func_text = source_bytes[node.start_byte:node.end_byte].decode("utf-8", "replace")
             name_node = node.child_by_field_name("name")
@@ -94,10 +95,14 @@ class CodeParser:
                     "code": func_text,
                 }
             )
+            positions.append((node.start_byte, node.end_byte))
 
-        # Deterministic order by position.
-        functions.sort(key=lambda f: (f["start_line"], f["end_line"]))
-        return functions
+        # Deterministic order by position (byte offsets break ties between
+        # functions on one line, e.g. minified JS: the capture list's order
+        # is not stable across processes).
+        order = sorted(range(len(functions)), key=lambda i: (
+            functions[i]["start_line"], functions[i]["end_line"], positions[i]))
+        return [functions[i] for i in order]
 
     def parse_file(self, file_path: Path) -> list[dict[str, Any]]:
         """Parse a single file and extract all functions (with file_path attached)."""

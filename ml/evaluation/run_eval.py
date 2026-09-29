@@ -110,15 +110,12 @@ import asyncio
 import difflib
 import hashlib
 import json
-import math
 import random
 import re
 import sys
 import time
 from collections import Counter
 from pathlib import Path
-
-import httpx
 
 _ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(_ROOT))
@@ -129,12 +126,7 @@ from backend.app.core.cve_retriever import passes_twin_margin  # noqa: E402
 from backend.app.core.embedder import Embedder  # noqa: E402
 from backend.app.core.embedding_cache import EmbeddingCache  # noqa: E402
 from backend.app.core.evidence import semgrep_evidence  # noqa: E402
-from backend.app.core.llm_client import (  # noqa: E402
-    PROVIDERS,
-    LLMClient,
-    LLMRouter,
-    TokenPacer,
-)
+from backend.app.core.llm_client import LLMRouter  # noqa: E402
 from backend.app.core.reranker import Reranker  # noqa: E402
 from backend.app.core.review_plan import (  # noqa: E402
     assign_uids,
@@ -148,6 +140,42 @@ from ml.evaluation.legacy_prompt import (  # noqa: E402
     SYSTEM_PROMPT,
     build_user_prompt,
     validate_findings,
+)
+from ml.evaluation.llm_eval_common import (  # noqa: E402, F401 (re-exported)
+    BASE_RATES,
+    DAILY_LIMIT_MARKERS,
+    DAILY_LIMIT_RETRY_AFTER_S,
+    DEFAULT_EVAL_TEMPERATURE,
+    DEFAULT_LLM_MAX_RATE_LIMIT_ERRORS,
+    DEFAULT_LLM_SLEEP,
+    DEFAULT_LLM_TPM,
+    LEGACY_CACHE_TEMPERATURE,
+    TEST_SPLIT_FLAG,
+    HttpUsageTap,
+    LLMCache,
+    PinnedRouter,
+    _binom_cdf,
+    _cache_key,
+    _exact_rate,
+    _fmt_exact,
+    _fmt_rate,
+    _http_event,
+    _rate,
+    _usage_totals,
+    build_llm_router,
+    build_pinned_router,
+    classify_llm_error,
+    clopper_pearson,
+    estimate_tokens,
+    eval_nonce,
+    llm_model_key,
+    mcnemar_exact,
+    openrouter_routing,
+    parse_llm_model,
+    precision_at_base_rate,
+    router_temperature,
+    set_router_temperature,
+    wilson_interval,
 )
 
 DEFAULT_DATASET = BASE_DIR / "ml" / "evaluation" / "datasets" / "detection_eval.jsonl"
@@ -168,7 +196,6 @@ KIND_ORDINARY = "ordinary"
 KIND_HANDWRITTEN = "handwritten"
 KINDS = (KIND_VULNERABLE, KIND_FIXED_TWIN, KIND_ORDINARY, KIND_HANDWRITTEN)
 PAIR_KINDS = (KIND_VULNERABLE, KIND_FIXED_TWIN)
-BASE_RATES = (0.01, 0.02, 0.05)
 
 # Candidate payload fields kept by gather() so the LLM stage can rebuild the
 # production prompt (build_user_prompt reads cve_id/severity/category/
@@ -179,20 +206,7 @@ PROMPT_FIELDS = (
 )
 
 LLM_MAX_CALLS_CAP = 200
-DEFAULT_LLM_SLEEP = 2.5
-DEFAULT_LLM_TPM = 8000  # Groq free tier tokens/minute per model
-DEFAULT_LLM_MAX_RATE_LIMIT_ERRORS = 3
 DEFAULT_LLM_CACHE = RESULTS_DIR / "llm_cache.jsonl"
-# Groq names the exhausted window in its 429 body ("... tokens per day (TPD)");
-# OpenRouter's free tier says "Rate limit exceeded: free-models-per-day" (its
-# per-minute throttle is "free-models-per-min", which matches none of these).
-DAILY_LIMIT_MARKERS = ("per day", "(TPD)", "(RPD)", "free-models-per-day")
-# A Retry-After this long only happens once a daily (not per-minute) window is spent.
-DAILY_LIMIT_RETRY_AFTER_S = 300.0
-# Eval calls default to greedy decoding; production keeps settings.LLM_TEMPERATURE.
-DEFAULT_EVAL_TEMPERATURE = 0.0
-# Every LLM cache entry written before the temperature was recorded used this.
-LEGACY_CACHE_TEMPERATURE = 0.2
 
 # Localised scoring (see the module docstring).
 DEFAULT_LOCALISE_TOLERANCE = 2
@@ -210,7 +224,6 @@ LEGACY_NOT_LOCALISABLE = (
 )
 
 SPLIT_NAMES = ("dev", "test")
-TEST_SPLIT_FLAG = "--i-know-this-is-the-test-set"
 # OSV eval ids since 01905e8 carry a code hash: "<prefix>_<hash8>_{vuln,safe}";
 # results written before that name the pair "<prefix>_{vuln,safe}".
 _HASHED_PAIR_ID = re.compile(r"^(.*)_([0-9a-f]{8})_(vuln|safe)$")
@@ -798,35 +811,6 @@ def operating_cves(
 # --- realistic metrics ------------------------------------------------------
 
 
-def wilson_interval(k: int, n: int, z: float = 1.96) -> list[float] | None:
-    """Wilson score interval for k successes out of n (None when n == 0)."""
-    if n == 0:
-        return None
-    p = k / n
-    denom = 1 + z * z / n
-    center = (p + z * z / (2 * n)) / denom
-    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
-    return [round(max(0.0, center - half), 4), round(min(1.0, center + half), 4)]
-
-
-def _rate(preds: list[bool]) -> dict:
-    k, n = sum(preds), len(preds)
-    return {
-        "k": k, "n": n,
-        "rate": round(k / n, 4) if n else None,
-        "ci95": wilson_interval(k, n),
-    }
-
-
-def precision_at_base_rate(tpr: float | None, fpr: float | None, pi: float) -> float | None:
-    """Expected precision when a fraction ``pi`` of scanned functions is
-    vulnerable: TPR*pi / (TPR*pi + FPR*(1-pi)). None if undefined."""
-    if tpr is None or fpr is None:
-        return None
-    denom = tpr * pi + fpr * (1 - pi)
-    return round(tpr * pi / denom, 4) if denom else None
-
-
 def realistic_metrics(records: list[dict], base_rates=BASE_RATES) -> dict:
     """Per-kind metrics from ``records`` ({id, kind, label, pred}); items with
     ``pred`` None (LLM error / not run) are excluded and counted.
@@ -911,13 +895,6 @@ def realistic_metrics(records: list[dict], base_rates=BASE_RATES) -> dict:
             "recall": round(tp / (tp + fn), 4) if tp + fn else None,
         },
     }
-
-
-def _fmt_rate(r: dict) -> str:
-    if r["rate"] is None:
-        return "n/a (n=0)"
-    lo, hi = r["ci95"]
-    return f"{r['rate']:.3f} [{lo:.3f}, {hi:.3f}] ({r['k']}/{r['n']})"
 
 
 def print_realistic(title: str, m: dict) -> None:
@@ -1049,56 +1026,6 @@ def repeat_summary(runs: list[list[dict]], localisable: bool) -> dict:
 # --- exact paired statistics (offline --compare) ------------------------------
 
 
-def mcnemar_exact(b: int, c: int) -> float:
-    """Two-sided exact McNemar p-value from the discordant counts ``b`` (only A
-    positive) and ``c`` (only B positive): 2 * P(X <= min(b, c)), X ~
-    Binomial(b + c, 1/2), capped at 1. 1.0 when there is no discordant pair."""
-    n = b + c
-    if n == 0:
-        return 1.0
-    tail = sum(math.comb(n, i) for i in range(min(b, c) + 1))
-    return min(1.0, 2 * tail / 2**n)
-
-
-def _binom_cdf(k: int, n: int, p: float) -> float:
-    """P(X <= k), X ~ Binomial(n, p), summed in log space (no overflow)."""
-    if k < 0:
-        return 0.0
-    if k >= n or p <= 0.0:
-        return 1.0
-    if p >= 1.0:
-        return 0.0
-    lp, lq, lg = math.log(p), math.log1p(-p), math.lgamma(n + 1)
-    return min(1.0, sum(
-        math.exp(lg - math.lgamma(i + 1) - math.lgamma(n - i + 1) + i * lp + (n - i) * lq)
-        for i in range(k + 1)
-    ))
-
-
-def clopper_pearson(k: int, n: int, alpha: float = 0.05) -> list[float] | None:
-    """Exact (Clopper-Pearson) 1 - ``alpha`` interval for k of n (None if n == 0),
-    by bisection on the binomial CDF."""
-    if n == 0:
-        return None
-
-    def solve(f) -> float:  # f increasing in p, f(0) < 0 < f(1)
-        lo, hi = 0.0, 1.0
-        for _ in range(100):
-            mid = (lo + hi) / 2
-            lo, hi = (mid, hi) if f(mid) < 0 else (lo, mid)
-        return (lo + hi) / 2
-
-    lower = 0.0 if k == 0 else solve(lambda p: (1 - _binom_cdf(k - 1, n, p)) - alpha / 2)
-    upper = 1.0 if k == n else solve(lambda p: alpha / 2 - _binom_cdf(k, n, p))
-    return [round(lower, 4), round(upper, 4)]
-
-
-def _exact_rate(preds: list[bool]) -> dict:
-    k, n = sum(preds), len(preds)
-    return {"k": k, "n": n, "rate": round(k / n, 4) if n else None,
-            "ci95_exact": clopper_pearson(k, n)}
-
-
 def paired_outcomes(a_recs: list[dict], b_recs: list[dict], kind: str, key: str) -> dict:
     """Paired 2x2 of ``key`` over items of ``kind`` scored (``key`` not None)
     in both A and B (matched by id), with the exact McNemar p-value."""
@@ -1147,13 +1074,6 @@ def compare_items(a_recs: list[dict], b_recs: list[dict]) -> dict:
     }
 
 
-def _fmt_exact(r: dict) -> str:
-    if r["rate"] is None:
-        return "n/a (n=0)"
-    lo, hi = r["ci95_exact"]
-    return f"{r['rate']:.3f} [{lo:.3f}, {hi:.3f}] ({r['k']}/{r['n']})"
-
-
 def print_comparison(label_a: str, label_b: str, cmp: dict) -> None:
     print(f"\nPaired comparison  A = {label_a}\n                   B = {label_b}")
     print(f"  common ids {cmp['n_common_ids']} (only in A {cmp['n_only_in_a']}, "
@@ -1175,12 +1095,6 @@ def print_comparison(label_a: str, label_b: str, cmp: dict) -> None:
 
 
 # --- LLM report stage -------------------------------------------------------
-
-
-def estimate_tokens(text: str) -> int:
-    """Rough token count (~4 chars/token) — used for budgeting only when the
-    provider response carries no ``usage``."""
-    return math.ceil(len(text) / 4)
 
 
 def prompt_sha256(user_prompt: str, system_prompt: str = SYSTEM_PROMPT) -> str:
@@ -1259,12 +1173,6 @@ ARM_RULES = {
 }
 
 
-def eval_nonce(item_id: str) -> str:
-    """Deterministic stand-in for untrusted.new_nonce(), so the prompt (and its
-    cache key) is reproducible across runs."""
-    return hashlib.sha256(f"eval-nonce:{item_id}".encode()).hexdigest()[:16]
-
-
 def review_prompt_for(e: dict, arm: str) -> tuple[list[dict] | None, str | None]:
     """(batch, user prompt) exactly as scan_runner builds them for a snippet
     scan of ``e``: one unit with its Semgrep evidence (``e["semgrep"]``) and,
@@ -1312,158 +1220,6 @@ def attach_semgrep(entries: list[dict], scanner) -> dict:
     }
 
 
-def _cache_key(item_id: str, sha: str, model: str, temperature, repeat) -> tuple:
-    return (item_id, sha, model, round(float(temperature), 4), int(repeat))
-
-
-class LLMCache:
-    """Append-only JSONL of successful LLM results keyed by (item id, prompt
-    sha256, model, temperature, repeat index). Entries written before the
-    temperature / repeat were recorded count as LEGACY_CACHE_TEMPERATURE /
-    repeat 0 (what they were). Errors are never cached, so a re-run retries
-    them."""
-
-    def __init__(self, path: Path | str):
-        self.path = Path(path)
-        self._entries: dict[tuple, dict] = {}
-        if self.path.exists():
-            with open(self.path, encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        rec = json.loads(line)
-                        self._entries[self._key(rec)] = rec
-                    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                        continue  # a torn last line from an interrupted run
-
-    @staticmethod
-    def _key(rec: dict) -> tuple:
-        return _cache_key(rec["id"], rec["prompt_sha256"], rec["model"],
-                          rec.get("temperature", LEGACY_CACHE_TEMPERATURE), rec.get("repeat", 0))
-
-    def __len__(self) -> int:
-        return len(self._entries)
-
-    def get(self, item_id: str, sha: str, model: str,
-            temperature: float = LEGACY_CACHE_TEMPERATURE, repeat: int = 0) -> dict | None:
-        return self._entries.get(_cache_key(item_id, sha, model, temperature, repeat))
-
-    def put(self, rec: dict) -> None:
-        rec = {"temperature": LEGACY_CACHE_TEMPERATURE, "repeat": 0, **rec}
-        self._entries[self._key(rec)] = rec
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec) + "\n")
-            f.flush()
-
-
-def _http_event(resp: httpx.Response) -> dict:
-    event = {"status": resp.status_code, "usage": None, "retry_after": None, "daily_limit": False}
-    if resp.status_code == 200:
-        try:
-            data = resp.json()
-            usage = data.get("usage")
-            event["usage"] = usage if isinstance(usage, dict) else None
-            # OpenRouter names the upstream that served the request (and the
-            # exact model); logged so a silent upstream change is visible.
-            if isinstance(data.get("provider"), str):
-                event["upstream_provider"] = data["provider"]
-            if isinstance(data.get("model"), str):
-                event["response_model"] = data["model"]
-            # OpenRouter can put an error (incl. an upstream 429) in a 200 body.
-            err = data.get("error")
-            if isinstance(err, dict):
-                event["error_code"] = err.get("code")
-                if err.get("code") == 429:
-                    message = str(err.get("message", ""))
-                    event["daily_limit"] = any(m in message for m in DAILY_LIMIT_MARKERS)
-        except (ValueError, AttributeError):
-            pass
-    else:
-        try:
-            event["retry_after"] = float(resp.headers.get("Retry-After"))
-        except (TypeError, ValueError):
-            pass
-        if resp.status_code == 429:
-            body = resp.text
-            event["daily_limit"] = any(m in body for m in DAILY_LIMIT_MARKERS) or (
-                event["retry_after"] is not None
-                and event["retry_after"] >= DAILY_LIMIT_RETRY_AFTER_S
-            )
-    return event
-
-
-class HttpUsageTap:
-    """While active, records every httpx.AsyncClient.post response's token
-    ``usage`` and rate-limit signals. LLMClient returns only the message text and
-    folds a 429 into "HTTP 429", so this is how the eval sees real token counts
-    (including reasoning tokens) and tells a daily limit from a per-minute one.
-    Only the LLM stage runs inside it (no other httpx traffic in the eval).
-
-    ``inject`` fields are merged into the JSON body of every request whose URL
-    starts with ``inject_url_prefix`` (the eval pins OpenRouter's upstream
-    routing this way: ``{"provider": {"allow_fallbacks": false}}``) without
-    changing the production client."""
-
-    def __init__(self, inject: dict | None = None, inject_url_prefix: str | None = None):
-        self.events: list[dict] = []
-        self._orig = None
-        self.inject = dict(inject or {})
-        self.inject_url_prefix = inject_url_prefix
-
-    def __enter__(self):
-        self._orig = orig = httpx.AsyncClient.post
-        tap = self
-
-        async def post(client, *args, **kwargs):
-            if tap.inject and tap.inject_url_prefix:
-                url = str(args[0] if args else kwargs.get("url", ""))
-                body = kwargs.get("json")
-                if url.startswith(tap.inject_url_prefix) and isinstance(body, dict):
-                    kwargs["json"] = {**body, **tap.inject}
-            resp = await orig(client, *args, **kwargs)
-            tap.events.append(_http_event(resp))
-            return resp
-
-        httpx.AsyncClient.post = post
-        return self
-
-    def __exit__(self, *exc):
-        httpx.AsyncClient.post = self._orig
-        return False
-
-    def take(self) -> list[dict]:
-        events, self.events = self.events, []
-        return events
-
-
-def _usage_totals(events: list[dict]) -> dict | None:
-    usages = [e["usage"] for e in events if e.get("usage")]
-    if not usages:
-        return None
-    return {
-        k: sum(int(u.get(k) or 0) for u in usages)
-        for k in ("prompt_tokens", "completion_tokens", "total_tokens")
-    }
-
-
-def classify_llm_error(exc: BaseException, events: list[dict]) -> str:
-    """'daily_limit' | 'rate_limit' | 'other' for a failed router.generate."""
-    text = str(exc)
-    if any(e.get("daily_limit") for e in events) or any(m in text for m in DAILY_LIMIT_MARKERS):
-        return "daily_limit"
-    if (
-        any(e.get("status") == 429 or e.get("error_code") == 429 for e in events)
-        or "HTTP 429" in text
-    ):
-        return "rate_limit"
-    return "other"
-
-
-def llm_model_key(router) -> str:
-    """Cache/model key: the router's primary "<provider>:<model>" (or "mock")."""
-    return "mock" if getattr(router, "mock", False) else router.clients[0].label
-
-
 def build_llm_entries(
     gathered: list[dict], sim_t: float, rerank_t: float, margin_t: float | None, top_k: int
 ) -> list[dict]:
@@ -1483,13 +1239,6 @@ def build_llm_entries(
         }
         for g in gathered
     ]
-
-
-def router_temperature(router) -> float:
-    """The temperature the router's primary client sends (settings default)."""
-    clients = getattr(router, "clients", None) or []
-    value = getattr(clients[0], "temperature", None) if clients else None
-    return float(settings.LLM_TEMPERATURE if value is None else value)
 
 
 async def run_llm_stage(
@@ -2134,68 +1883,6 @@ def parse_args(argv=None) -> argparse.Namespace:
     elif args.rerank_sweep is None:
         args.rerank_sweep = DEFAULT_RERANK_SWEEP
     return args
-
-
-def build_llm_router(primary_only: bool = False) -> LLMRouter:
-    """The production router (fails fast on a missing key), optionally trimmed
-    to its primary client."""
-    # No per-minute token pacing in the router: the eval paces its own calls
-    # (--llm-sleep / --llm-tpm), and pacing twice would double every wait.
-    # Retry-After is still honoured.
-    router = LLMRouter(pacer=TokenPacer({}))
-    if primary_only and not router.mock:
-        router.clients = router.clients[:1]
-    return router
-
-
-def parse_llm_model(spec: str) -> tuple[str, str]:
-    """'groq:qwen/qwen3.8-27b' -> ('groq', 'qwen/qwen3.8-27b'); the model part
-    may itself contain ':' (OpenRouter's ':free'). ValueError otherwise."""
-    provider, sep, model = spec.partition(":")
-    if not sep or not model.strip() or provider not in PROVIDERS:
-        raise ValueError(f"expected PROVIDER:MODEL with PROVIDER in {', '.join(PROVIDERS)}; "
-                         f"got {spec!r}")
-    return provider, model.strip()
-
-
-class PinnedRouter(LLMRouter):
-    """A router of exactly one client (``--llm-model``): no fallback model or
-    provider, whatever LLM_PROVIDER / *_FALLBACK_* say, and no key needed for
-    any provider but the pinned one."""
-
-    def __init__(self, client: LLMClient, pacer: TokenPacer):
-        self.mock = False
-        self.pacer = pacer
-        self.clients = [client]
-
-
-def build_pinned_router(spec: str) -> LLMRouter:
-    """``PinnedRouter`` for "PROVIDER:MODEL" (fails fast on a missing key);
-    no per-minute pacing, as in ``build_llm_router``."""
-    provider, model = parse_llm_model(spec)
-    return PinnedRouter(LLMClient(provider, model=model), TokenPacer({}))
-
-
-def set_router_temperature(router, temperature: float) -> None:
-    """Every client of ``router`` sends ``temperature`` (the eval's choice,
-    not settings.LLM_TEMPERATURE)."""
-    for client in getattr(router, "clients", None) or []:
-        client.temperature = float(temperature)
-
-
-def openrouter_routing(args, router) -> dict | None:
-    """OpenRouter ``provider`` routing sent with a primary-only run whose
-    client is on OpenRouter: no fallback to another upstream, and
-    ``--llm-upstream`` pins which one (without it OpenRouter still
-    load-balances across upstreams, which the per-item upstream log shows)."""
-    if not args.llm_primary_only or getattr(router, "mock", False):
-        return None
-    if not any(getattr(c, "provider", None) == "openrouter" for c in router.clients):
-        return None
-    routing: dict = {"allow_fallbacks": False}
-    if args.llm_upstream:
-        routing["order"] = [args.llm_upstream]
-    return routing
 
 
 def build_semgrep_scanner():

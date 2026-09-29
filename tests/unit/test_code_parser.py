@@ -61,3 +61,12 @@ def test_javascript_functions():
     assert any(f["name"] == "greet" for f in funcs)
     # Arrow function has no name field -> anonymous, but is still captured.
     assert any("=>" in f["code"] for f in funcs)
+
+
+def test_functions_on_one_line_keep_source_order():
+    # Minified JS: several functions share a line. Ties on (start_line,
+    # end_line) are broken by byte offset, so the order (and every prompt built
+    # from it) is the same in every process.
+    src = "function a(x){return x}function n(y){return y}function p(z){return z}\n"
+    funcs = CodeParser().extract_functions(src, ".js")
+    assert [f["name"] for f in funcs] == ["a", "n", "p"]

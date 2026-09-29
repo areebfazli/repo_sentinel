@@ -40,3 +40,7 @@ data/cve_corpus/rejected/
 # per-pair rows (2.3 MB; regenerate with python -m ml.evaluation.eval_guard_diff).
 ml/evaluation/results/llm_cache.jsonl
 ml/evaluation/results/guard_diff_eval.json
+
+# PR eval datasets (full file contents, ~180 MB; regenerate offline in ~30 s with
+# python scripts/build_pr_eval.py; the committed pr_eval_v1_manifest.json pins their sha256)
+ml/evaluation/datasets/pr_eval/*.jsonl

@@ -15,7 +15,8 @@ Decided 2026-09-22. Ordered by expected impact.
 9. **PR-level review** (2026-09-30, design below): files mode now audits the change as a whole
    and verifies each candidate separately (`REVIEW_MODE=pr`, default; `units` kept). Next:
    measure it against the per-unit review on the PR eval set (`ml/evaluation/datasets/pr_eval/`)
-   before tuning any threshold.
+   before tuning any threshold. Harness built (`ml/evaluation/run_pr_eval.py`, "PR-level eval
+   harness" below; dry run done); the live runs are pending.
 
 ## Findings 2026-09-24 (precision research + adversarial review)
 
@@ -185,6 +186,49 @@ FP, Semgrep >= high fires rarely.
 - Whether the sink leads help or just add noise (off switch: `PR_REVIEW_SINK_LEADS`).
 - Whether a stronger verifier model (`VERIFIER_MODEL`) is worth its rate budget.
 - Free-tier throughput: a 6-call review is a few minutes on Groq's 8K TPM.
+
+## PR-level eval harness (2026-09-30)
+
+`ml/evaluation/run_pr_eval.py` (README "PR-level eval"): arms `pr` (scored as `verified` and
+`audit_only` from one run), `units` (the per-unit review in-process, same PRs) and
+`pr_misleading` (the introducing PRs with a "harmless refactor" title / body). Retrieval off,
+deterministic nonces, per-call JSONL cache (resume), pacing / call / token budgets,
+localised scoring, pair stats, precision at 1/2/5 %, exact McNemar `--compare`, offline
+`--rescore` and `--dry-run`. Shared LLM-eval plumbing moved to `ml/evaluation/llm_eval_common.py`
+(`run_eval` re-exports it; importing it doesn't load torch). `CodeParser.extract_functions` now
+breaks same-line ties by byte offset: the order of functions on one line (minified JS) differed
+between processes, which changed prompts and would have broken the cache.
+
+**Dry run on `pr_eval_v1_sample_dev.jsonl`** (200 PRs: 60 introducing / 60 fix / 80 benign;
+offline, 4 worker processes, ~1 min and < 0.5 GB per arm). Prompt tokens are estimates
+(chars / 4 x 1.25); totals add `LLM_OUTPUT_TOKENS_ESTIMATE` = 1500 completion tokens per call.
+`floor` = audit calls only (no candidate, no context round); `scenario` = the stub reports one
+candidate per file, each verified; `ceiling` = every context round the audit budget allows
+(+1500 tokens each) and all 8 verifier calls at 6000 tokens.
+
+| arm | requests floor / scenario / ceiling | calls per PR (mean, p90) floor / scenario | tokens incl. completion floor / scenario / ceiling |
+|---|---|---|---|
+| `pr` (200) | 320 / 689 / 2,274 | 1.6, 3 / 3.4, 7 | 1.75M / 4.13M / 16.2M |
+| `units` (200) | 392 (exact: no follow-up calls) | 1.96, 4 | 2.29M |
+| `pr_misleading` (60) | 98 / 200 / 683 | 1.6, 3 / 3.3, 6 | 0.54M / 1.21M / 4.89M |
+
+- Prompt size per call: `pr` mean 4.5K, p90 6.0K; `units` mean 4.3K, p90 6.0K.
+- Wall time on OpenRouter's free tier (20 requests/min, 1,000/day with credits), 3 s spacing
+  plus an assumed 20 s per call: `pr` ~2.0 h (floor) / 4.4 h (scenario) / 14.5 h (ceiling, 3
+  days of requests); `units` ~2.5 h; `pr_misleading` ~0.6-1.3 h. On Groq's free tier (8K
+  tokens/min, ~200K tokens/day per model) even the `pr` floor is ~5.4 h and ~9 days of tokens:
+  use OpenRouter.
+- Partial by the pipeline's own budget (independent of the model's answers): `pr` 29/200 PRs
+  (25 with a file's diff clipped to fit one 6,000-token audit prompt, 4 with files left
+  unaudited by the 4-call audit budget); `units` 1/200.
+- `pr_misleading`: prompts byte-identical to the `pr` arm's for 60/60 PRs; the PR title / body
+  reached no prompt. A live run of that arm therefore measures only provider nondeterminism.
+
+**Semgrep leads**: `--semgrep-precompute` runs the engine once over every file of the selection
+(`pr_eval_v1_sample_dev`: 388 files, 282 Python / 106 JS/TS, 7.6 MB; the `pr_misleading` items
+reuse their base items' entries). 2-item smoke test: 12 s engine time (mostly fixed start-up),
+~0.9 GB peak for the engine processes; the cached hits served per PR matched a direct engine
+run on the same units. Not yet run on the dataset.
 
 ## 1. Detection quality
 

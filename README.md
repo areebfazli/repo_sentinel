@@ -474,6 +474,62 @@ regexes come from [anthropics/claude-code-security-review](https://github.com/an
 [openai/codex-security](https://github.com/openai/codex-security) (Apache-2.0). Both are
 modified; notices and licence texts: `backend/app/core/prompts/THIRD_PARTY_NOTICES.md`.
 
+### PR-level eval (`ml/evaluation/run_pr_eval.py`)
+
+Measures the PR review against the per-unit review on PR-shaped items
+(`ml/evaluation/datasets/pr_eval/`, built by `scripts/build_pr_eval.py`; the default dataset
+is the 200-item dev sample: 60 vulnerability-introducing PRs (reversed fixes), their 60 real
+fixes and 80 bystander benign PRs). Retrieval is off in every arm; no embedder or Qdrant.
+
+- `--arm pr`: `review_pr` on the item's files. One run gives two headlines: `verified`
+  (the report: confirmed findings + deterministic guard alerts) and `audit_only` (every
+  candidate that reached the verifier, i.e. before verification).
+- `--arm units`: the per-unit review (`REVIEW_MODE=units`), run in-process exactly as
+  `scan_runner` runs files mode, on the same PRs.
+- `--arm pr_misleading`: the `pr` arm on the `_misleading` variants of the selected
+  introducing PRs (a "harmless refactor" title / body, passed to `review_pr`, which must ignore
+  it). Nonces come from the base id, so the prompts are byte-identical to the `pr` arm's when
+  the text is ignored (the dry run checks this offline).
+
+Scoring (tolerance `--localise-tolerance`, 2): an introducing PR is a **localised TP** when a
+kept finding is in `target.path` within 2 lines of a `vuln_lines_new` line (also reported:
+any finding, right file, any vulnerable path); a fix PR is an FP when anything is reported
+(also: on the fix's own changed lines); a benign PR is an FP (alert) when anything is
+reported. The output adds pair outcomes (introducing vs its fix), precision at 1 / 2 / 5 %
+base rates from the benign FPR, Wilson CIs, calls / tokens / latency per PR (mean, p90), the
+candidate funnel, context rounds (symbols requested vs resolved), verifier outcomes (a
+heuristic bucketing of the verifier's reasons), `review_status` and per category / language.
+
+Calls go through a gate: a JSONL cache (`ml/evaluation/results/pr_llm_cache.jsonl`) keyed by
+(item id, call prompt sha256, model, temperature, repeat) so a re-run resumes; pacing
+(`--llm-sleep`, `--llm-tpm`); `--llm-max-calls` / `--llm-token-budget`; a clean stop on a
+daily limit or repeated rate limits. Items with an unfinished or failed call are `not_run` /
+`error` and excluded (re-run to resume). The wall-clock budget is disabled in the eval.
+`--llm-model` / `--llm-upstream` / `--verifier-model` pin models; `--llm-temperature`
+defaults to 0; `--split dev|test` (test needs `--i-know-this-is-the-test-set`);
+`--sample-kinds vulnerable=N,fix=N,benign=N --seed S` keeps pairs together.
+
+Semgrep leads are precomputed once (one engine run over every file of the selection, all
+severities) and served from the cache by a stub scanner; without `--semgrep-cache` there are
+no Semgrep leads.
+
+```bash
+# offline: every prompt with a stub model, calls / tokens / time estimates (~1 min, 4 workers)
+python -m ml.evaluation.run_pr_eval --dry-run --arm pr      # also: --arm units / pr_misleading
+# Semgrep leads for the selection (one engine run; see ROADMAP for time / RAM)
+python -m ml.evaluation.run_pr_eval --semgrep-precompute \
+    --semgrep-cache ml/evaluation/results/pr_semgrep_dev200.json
+# live runs (real provider calls), then offline comparison
+python -m ml.evaluation.run_pr_eval --arm pr --llm-model openrouter:qwen/qwen3.8-27b:free \
+    --llm-tpm 0 --llm-sleep 3 --llm-max-calls 950 \
+    --semgrep-cache ml/evaluation/results/pr_semgrep_dev200.json \
+    --out ml/evaluation/results/pr_eval_pr_dev200.json
+python -m ml.evaluation.run_pr_eval --compare ml/evaluation/results/pr_eval_units_dev200.json \
+    ml/evaluation/results/pr_eval_pr_dev200.json                # exact McNemar, paired by id
+python -m ml.evaluation.run_pr_eval --compare A.json A.json --view-a audit_only --view-b verified
+python -m ml.evaluation.run_pr_eval --rescore A.json --localise-tolerance 5 --out A5.json
+```
+
 ---
 
 ## Project layout
@@ -488,7 +544,7 @@ backend/app/
 data/cve_corpus/  CVE snippet corpus (JSON)
 frontend/         static vanilla-JS dashboard
 github_action/    PR scanner script
-ml/evaluation/    detection eval harness + baseline
+ml/evaluation/    detection eval harness + baseline; PR-level eval (run_pr_eval.py)
 scripts/          ingestion scripts for both collections
 tests/            pytest suite (unit + integration; slow eval regression)
 ```

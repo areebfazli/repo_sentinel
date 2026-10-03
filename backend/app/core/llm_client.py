@@ -327,11 +327,23 @@ class LLMClient:
         # try the fallback rather than crashing the whole scan, but no point retrying
         # the same provider for the same bad shape.
         try:
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise _Retriable(f"{self.label} malformed response: {exc}", transient=False) from exc
         if content is None:
-            raise _Retriable(f"{self.label} returned null content", transient=False)
+            # Say why: a reasoning model that hit its output cap mid-thought
+            # (finish_reason "length", reasoning but no content) looks different
+            # from a provider that returned nothing.
+            message = choice.get("message") or {}
+            reasoning = message.get("reasoning") or message.get("reasoning_content") or ""
+            usage = data.get("usage") or {}
+            raise _Retriable(
+                f"{self.label} returned null content (finish_reason="
+                f"{choice.get('finish_reason')!r}, completion_tokens="
+                f"{usage.get('completion_tokens')}, reasoning_chars={len(reasoning)})",
+                transient=False,
+            )
         return content
 
 

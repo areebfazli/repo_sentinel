@@ -38,6 +38,14 @@ per-function in isolation. Stages:
    calls; a candidate that could not be verified is not reported and makes
    the review partial. ``VERIFIER_MODEL`` puts a different model first
    (``llm_client.verifier_router_for``); each finding records who verified it.
+6. **Worth a look** (non-blocking): a candidate the verifier left "uncertain"
+   (or confirmed below the cutoff) with confidence >=
+   ``PR_REVIEW_SUGGEST_MIN_CONFIDENCE`` becomes a ``review_suggestions`` item
+   (status ``review_suggested``) only with deterministic evidence that the
+   change removed a security control there: a guard_diff ``guard_removed``
+   change in its unit, or the verifier's ``removed_control_quote`` found in
+   the OLD file on deleted lines near it and in no new file. At most
+   ``PR_REVIEW_MAX_SUGGESTIONS``; never a finding, never gating.
 
 ``review_pr`` runs all of it on a PR given as plain file dicts, without the
 API or DB (the eval's entry point); ``scan_runner`` calls ``run_pr_review`` /
@@ -89,9 +97,11 @@ from backend.app.core.pr_context import (
     SectionPlan,
     build_pr_bundle,
     definition_block,
+    deleted_old_lines,
     diff_lines,
     fit_file_section,
     numbered,
+    old_line_for,
     render_diff,
     render_file_section,
 )
@@ -135,6 +145,8 @@ class PRReviewConfig:
     wall_s: float = 480.0
     guard_alert_severity: str = "medium"
     max_units: int = 50
+    max_review_suggestions: int = 5
+    suggest_min_confidence: int = 4
 
     @classmethod
     def from_settings(cls, **overrides) -> PRReviewConfig:
@@ -156,6 +168,8 @@ class PRReviewConfig:
             wall_s=s.LLM_SCAN_MAX_WALL_S,
             guard_alert_severity=s.GUARD_ALERT_SEVERITY,
             max_units=s.MAX_UNITS_PER_SCAN,
+            max_review_suggestions=s.PR_REVIEW_MAX_SUGGESTIONS,
+            suggest_min_confidence=s.PR_REVIEW_SUGGEST_MIN_CONFIDENCE,
         )
         known = {f.name for f in fields(cls)}
         base.update({k: v for k, v in overrides.items() if k in known})
@@ -803,6 +817,148 @@ def parse_verdict(data) -> dict:
         "counterevidence": clean_llm_text(data.get("counterevidence"), MAX_TEXT_CHARS),
         "reason": clean_llm_text(data.get("reason") or data.get("justification"),
                                  MAX_TEXT_CHARS),
+        # Only claimed under the prompt's removed-control rule; checked
+        # deterministically (``validate_removed_control``) before any use.
+        "removed_control_quote": clean_llm_text(data.get("removed_control_quote"),
+                                                MAX_QUOTE_CHARS, code=True),
+    }
+
+
+# ---------------------------------------------------------------------------
+# "Worth a look": a removed security control the verifier could not confirm
+# ---------------------------------------------------------------------------
+#
+# The verifier prompt answers "uncertain" when the change removes an existing
+# security control but the external attack path isn't visible (THREAT MODEL
+# rule 2). Only confirmed >= min_confidence is a finding; such a candidate is
+# instead a non-blocking "review suggestion" when deterministic evidence shows
+# the change really removed a control at that spot. Never counted as a finding,
+# never in is_vulnerable or any gate.
+
+REMOVED_CONTROL_WINDOW = QUOTE_WINDOW  # old-file lines around the candidate
+MAX_REMOVED_CONTROL_LINES = 6
+REMOVED_CONTROL_MAX_CHARS = 300
+
+
+def _strip_removed_markers(quote: str) -> str:
+    """A quote copied from the verifier's diff: line-number columns and the
+    leading ``-`` of removed lines dropped."""
+    out = []
+    for ln in quote.splitlines():
+        ln = _NUMBER_PREFIX.sub("", ln)
+        out.append(ln[1:] if ln.startswith("-") else ln)
+    return "\n".join(out)
+
+
+def guard_removal_evidence(bundle: PRBundle, guard: dict, cand: dict) -> dict | None:
+    """guard_diff evidence that the change removed or weakened a security
+    check in the candidate's unit: the planner unit containing the candidate's
+    line has risk ``guard_removed`` (the alert tier included) with a removed /
+    weakened change. The control shown is that change's old code."""
+    for u in bundle.units_of(cand["file_path"]):
+        if not (int(u.get("start_line") or 0) <= int(cand["line"])
+                <= int(u.get("end_line") or 0)):
+            continue
+        g = guard.get(unit_key(u))
+        if not g or g.get("risk") != "guard_removed":
+            continue
+        changes = [c for c in g.get("changes") or []
+                   if c.get("direction") in ("removed", "weakened")
+                   and (c.get("old_text") or "").strip()]
+        if changes:
+            best = max(changes, key=lambda c: float(c.get("confidence") or 0))
+            return {"evidence": "guard_diff",
+                    "removed_control": best["old_text"].strip()[:REMOVED_CONTROL_MAX_CHARS],
+                    "removed_control_line": None, "kind": best.get("kind")}
+    return None
+
+
+def validate_removed_control(bundle: PRBundle, cand: dict, quote: str | None) -> dict | None:
+    """The verifier's ``removed_control_quote`` as evidence, or None. It must
+    be (at most MAX_REMOVED_CONTROL_LINES lines) found in the file's OLD
+    content (``locate_quote``: whitespace-insensitive; diff markers tolerated),
+    within REMOVED_CONTROL_WINDOW old lines of the candidate, on lines the
+    patch deletes, and in NO file's new content (a control that moved or
+    still applies elsewhere in the PR is not removed). The control shown is
+    the old file's own lines, not the model's text."""
+    f = bundle.by_path.get(cand["file_path"])
+    if not quote or f is None or not f.old_content or not f.patch:
+        return None
+    if len(quote.splitlines()) > MAX_REMOVED_CONTROL_LINES:
+        return None
+    lines = f.old_content.splitlines()
+    deleted = deleted_old_lines(f.patch)
+    target = old_line_for(f.patch, int(cand["line"]))
+    lo = max(target - 1 - REMOVED_CONTROL_WINDOW, 0)
+    hi = min(target + REMOVED_CONTROL_WINDOW, len(lines))
+    variants = [quote]
+    stripped = _strip_removed_markers(quote)
+    if stripped != quote:
+        variants.append(stripped)
+    news = [p.new_content for p in bundle.files if p.new_content]
+    for q in variants:
+        span = locate_quote(q, "\n".join(lines[lo:hi])) if lo < hi else None
+        if span is None:
+            continue
+        first, last = lo + span[0] + 1, lo + span[1] + 1
+        if not any(first <= n <= last for n in deleted):
+            continue
+        if any(locate_quote(q, content) is not None for content in news):
+            return None  # still in the PR's code: moved or kept, not removed
+        return {"evidence": "verifier_quote",
+                "removed_control": "\n".join(lines[first - 1:last])[:REMOVED_CONTROL_MAX_CHARS],
+                "removed_control_line": first}
+    return None
+
+
+def removed_control_evidence(bundle: PRBundle, guard: dict, cand: dict,
+                             verdict: dict) -> list[dict]:
+    """Deterministic evidence that the change removed a security control at
+    the candidate's spot: the verifier's validated quote, then guard_diff."""
+    out = []
+    quoted = validate_removed_control(bundle, cand, verdict.get("removed_control_quote"))
+    if quoted:
+        out.append(quoted)
+    by_guard = guard_removal_evidence(bundle, guard, cand)
+    if by_guard:
+        out.append(by_guard)
+    return out
+
+
+def review_suggestion_eligible(verdict: str | None, confidence: int | None, evidence, *,
+                               min_confidence: int, floor: int) -> bool:
+    """A verified candidate that is not reported (verdict "uncertain", or
+    "confirmed" below ``min_confidence``), rated at least ``floor`` by the
+    verifier, with removed-control evidence. Rejected / unverified: never."""
+    conf = confidence or 0
+    if not evidence or conf < floor:
+        return False
+    return verdict == "uncertain" or (verdict == "confirmed" and conf < min_confidence)
+
+
+def review_suggestion(bundle: PRBundle, c: dict, verdict: dict, verifier: str | None,
+                      evidence: list[dict]) -> dict:
+    """A non-blocking "worth a look" item (``schemas.ReviewSuggestion``)."""
+    fn = bundle.function_at(c["file_path"], c["line"])
+    shown = evidence[0]
+    return {
+        "file_path": c["file_path"],
+        "line": c["line"],
+        "end_line": c["end_line"],
+        "function_name": fn["name"] if fn else None,
+        "start_line": fn["start_line"] if fn else None,
+        "title": c["title"],
+        "cwe": c.get("cwe"),
+        "severity": c.get("severity"),
+        "quoted_code": c.get("quoted_code") or "",
+        "removed_control": shown["removed_control"],
+        "removed_control_line": shown.get("removed_control_line"),
+        "evidence": [e["evidence"] for e in evidence],
+        "verdict": verdict["verdict"],
+        "confidence": verdict["confidence"],
+        "audit_confidence": c.get("audit_confidence"),
+        "verifier": verifier,
+        "verifier_reason": verdict.get("reason") or None,
     }
 
 
@@ -874,7 +1030,8 @@ def _empty_stats(config: PRReviewConfig) -> dict:
         "context_rounds_used": 0, "context_requested": 0, "context_resolved": 0,
         "candidates": 0, "quote_not_found": 0, "hard_excluded": 0,
         "below_audit_confidence": 0, "verified": 0, "confirmed": 0, "rejected": 0,
-        "uncertain": 0, "below_min_confidence": 0, "unverified": 0, "bad_output": 0,
+        "uncertain": 0, "below_min_confidence": 0, "review_suggested": 0, "unverified": 0,
+        "bad_output": 0,
         "prompt_tokens_est": 0, "files_total": 0, "files_reviewed": 0,
         "leads": {"guard": 0, "semgrep": 0, "sinks": 0},
         "verifier_models": [], "min_confidence": config.min_confidence,
@@ -895,13 +1052,15 @@ async def run_pr_review(
     """Audit (with context rounds) + verification of one PR bundle.
 
     Never raises for LLM failures. Returns {findings (confirmed report
-    findings), candidates (every validated candidate with its ``status``),
-    reviewed_units, not_reviewed (units + ``not_reviewed_reason``),
-    partial_paths, windowed_paths, providers, verifier_models, stats, notes}.
+    findings), review_suggestions (non-blocking "worth a look" items, see
+    ``review_suggestion_eligible``), candidates (every validated candidate
+    with its ``status``), reviewed_units, not_reviewed (units +
+    ``not_reviewed_reason``), providers, verifier_models, stats, config}.
     """
     config = config or PRReviewConfig.from_settings()
     verifier_router = verifier_router or router
-    leads = collect_leads(bundle, semgrep_leads or {}, guard or {}, config)
+    guard = guard or {}
+    leads = collect_leads(bundle, semgrep_leads or {}, guard, config)
     stats = _empty_stats(config)
     for fl in leads.values():
         for k, v in fl.count().items():
@@ -1011,6 +1170,7 @@ async def run_pr_review(
     to_verify.sort(key=lambda c: (SEVERITY_ORDER.get(c.get("severity"), 4),
                                   -(c.get("audit_confidence") or 0)))
     findings: list[dict] = []
+    suggestions: list[dict] = []
     verifier_models: list[str] = []
     vclock = getattr(verifier_router, "clock", clock)
     for n, c in enumerate(to_verify):
@@ -1051,12 +1211,25 @@ async def run_pr_review(
         verdict = parse_verdict(data)
         stats["verified"] += 1
         c.update(verdict=verdict, verifier=label)
+        # Removed-control evidence for every confirmed / uncertain verdict (the
+        # eval replays other cutoffs from it); "rejected" never qualifies.
+        evidence = (removed_control_evidence(bundle, guard, c, verdict)
+                    if verdict["verdict"] in ("confirmed", "uncertain") else [])
+        c["review_evidence"] = [e["evidence"] for e in evidence]
         # The stats partition the candidates: "confirmed" counts reported
-        # findings only; a confirmation under the cutoff is below_min_confidence.
+        # findings only; a confirmation under the cutoff is below_min_confidence,
+        # unless it (or an uncertain one) is a review suggestion.
         if verdict["verdict"] == "confirmed" and verdict["confidence"] >= config.min_confidence:
             c["status"] = "confirmed"
             stats["confirmed"] += 1
             findings.append(report_finding(bundle, c, verdict, label))
+        elif review_suggestion_eligible(
+                verdict["verdict"], verdict["confidence"], evidence,
+                min_confidence=config.min_confidence, floor=config.suggest_min_confidence
+        ) and len(suggestions) < config.max_review_suggestions:
+            c["status"] = "review_suggested"
+            stats["review_suggested"] += 1
+            suggestions.append(review_suggestion(bundle, c, verdict, label, evidence))
         elif verdict["verdict"] == "confirmed":
             c["status"] = "below_min_confidence"
             stats["below_min_confidence"] += 1
@@ -1066,6 +1239,7 @@ async def run_pr_review(
     stats["verifier_models"] = verifier_models
     return {
         "findings": findings,
+        "review_suggestions": suggestions,
         "candidates": candidates,
         "reviewed_units": reviewed_units,
         "not_reviewed": not_reviewed,
@@ -1117,7 +1291,9 @@ def pr_notes(outcome: dict) -> list[str]:
         f"finding(s): {s['confirmed']} reported (confirmed by an independent verifier with "
         f"confidence >= {cfg.min_confidence}), {s['rejected']} rejected by the verifier, "
         f"{s['uncertain'] + s['below_min_confidence']} uncertain or confirmed below the "
-        f"confidence cutoff, {s['hard_excluded']} excluded by rule, "
+        f"confidence cutoff, {s.get('review_suggested', 0)} worth a look (not blocking: a "
+        f"removed security control the verifier could not confirm), "
+        f"{s['hard_excluded']} excluded by rule, "
         f"{s['below_audit_confidence']} below the audit's own confidence floor, "
         f"{s['unverified']} not verified._"
     ]
@@ -1174,17 +1350,22 @@ def assemble_pr_result(outcome: dict, guard: dict, semgrep_evidence_hits: dict, 
         notes.append("_LLM_PROVIDER=mock: no real review was performed._")
     notes.extend(pr_notes(outcome))
     statics = static_out(semgrep_evidence_hits)
+    suggestions = list(outcome.get("review_suggestions") or [])
     markdown = render_markdown(
         report, cve_count, team_count, units_reviewed=coverage["units_reviewed"],
         static_hits=len(statics), notes=notes, review_status=coverage["review_status"],
         units_total=coverage["units_total"], units_not_reviewed=len(outcome["not_reviewed"]),
         units_partial=coverage["units_partially_reviewed"],
         show_reference_counts=bool(outcome["config"].fix_examples),
+        suggestions=suggestions,
     )
+    # Review suggestions are never findings: not in is_vulnerable, the report
+    # findings or any gate.
     return {
         "is_vulnerable": bool(report),
         "report_markdown": markdown,
         "report_findings": report,
+        "review_suggestions": suggestions,
         "llm_provider_used": ",".join(providers) or None,
         "static_analysis": statics,
         "guard_diff": list(guard.values()),
@@ -1244,7 +1425,8 @@ async def review_pr(
     description framing a change as safe can collapse detection); they are
     accepted so callers can pass a PR item as is, and ignored.
 
-    Returns the scan result's review fields (``assemble_pr_result``) plus
+    Returns the scan result's review fields (``assemble_pr_result``, incl.
+    ``review_suggestions``) plus
     ``candidates`` (every validated audit candidate with its status /
     verdict) and ``bundle_units`` (the planned units).
     """

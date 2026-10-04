@@ -217,3 +217,14 @@ def test_after_code_is_windowed_around_changes(parser):
     assert plan.include_after and plan.after_radius is not None and plan.after_radius >= 2
     text = render_file_section(b, f, "N", plan)
     assert "x30 = eval(a)" in text and "line(s) omitted" in text
+
+
+def test_deleted_old_lines_and_old_line_mapping():
+    from backend.app.core.pr_context import deleted_old_lines, old_line_for
+
+    old = "a\nb\nc\nd\ne\n"
+    new = "a\nc\nD\ne\n"  # b removed, d modified
+    patch = synthesize_patch(old, new)
+    assert deleted_old_lines(patch) == {2, 4}
+    assert old_line_for(patch, 2) == 3 and old_line_for(patch, 4) == 5
+    assert deleted_old_lines(None) == set() and old_line_for(None, 7) == 7

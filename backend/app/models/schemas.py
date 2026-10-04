@@ -126,6 +126,36 @@ class ReportFinding(BaseModel):
     counterevidence: str | None = None
 
 
+class ReviewSuggestion(BaseModel):
+    """A non-blocking "worth a look" item of the PR-level review: a candidate
+    the verifier did not confirm (verdict "uncertain", or "confirmed" below
+    PR_REVIEW_MIN_CONFIDENCE) at a spot where the change removed an existing
+    security control, shown by deterministic evidence: ``evidence`` lists
+    "verifier_quote" (the verifier's quote of the control, found in the old
+    file on deleted lines and in no new file) and / or "guard_diff" (a
+    guard_removed change in the unit). Never a finding: not in
+    ``report_findings``, ``is_vulnerable`` or any gate. Text fields are plain
+    text (LLM-written or PR code): escape them when rendering."""
+
+    file_path: str
+    line: int
+    end_line: int | None = None
+    function_name: str | None = None
+    start_line: int | None = None
+    title: str
+    cwe: str | None = None
+    severity: str | None = None  # the audit's, for context only
+    quoted_code: str = ""
+    removed_control: str = ""  # old-file code of the removed / weakened control
+    removed_control_line: int | None = None  # old-file line, when known
+    evidence: list[str] = []
+    verdict: str
+    confidence: int | None = None  # the verifier's (1-10)
+    audit_confidence: int | None = None
+    verifier: str | None = None
+    verifier_reason: str | None = None
+
+
 class StaticAnalysisHit(BaseModel):
     """A Semgrep hit given to the LLM as evidence (at/above SEMGREP_MIN_SEVERITY)."""
 
@@ -196,12 +226,16 @@ class PRReviewStats(BaseModel):
     hard_excluded: int = 0
     below_audit_confidence: int = 0
     # hard_excluded + below_audit_confidence + confirmed + rejected + uncertain
-    # + below_min_confidence + unverified == candidates.
+    # + below_min_confidence + review_suggested + unverified == candidates.
     verified: int = 0  # verdicts received: confirmed + rejected + uncertain + below_min
+    #                    + review_suggested
     confirmed: int = 0  # confirmed at/above PR_REVIEW_MIN_CONFIDENCE = reported
     rejected: int = 0
-    uncertain: int = 0
+    uncertain: int = 0  # not counting review_suggested ones
     below_min_confidence: int = 0  # confirmed, but under PR_REVIEW_MIN_CONFIDENCE
+    # Uncertain / below the cutoff, with removed-control evidence: the result's
+    # review_suggestions (non-blocking), not findings.
+    review_suggested: int = 0
     unverified: int = 0  # verifier budget / time / errors / unusable answer: not reported
     bad_output: int = 0  # audit or verifier answers not in the requested JSON shape
     prompt_tokens_est: int = 0
@@ -219,6 +253,8 @@ class AnalyzeResult(BaseModel):
     report_markdown: str
     findings: list[FindingOut]
     report_findings: list[ReportFinding] = []
+    # PR-level review only: non-blocking "worth a look" items (never findings).
+    review_suggestions: list[ReviewSuggestion] = []
     ghost_hunter_matches: int
     team_memory_matches: int
     # "<provider>:<model>" of the LLM client that answered (e.g. "groq:qwen/qwen3.8-27b"),

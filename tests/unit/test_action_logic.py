@@ -347,3 +347,29 @@ def test_legacy_marker_is_adopted_at_most_once():
     ops = plan_comment_ops([{"id": 1, "body": f"x\n<!-- {old_marker} -->"}], [d1, d2])
     assert [u["id"] for u in ops["update"]] == [1]
     assert [c["marker"] for c in ops["create"]] == ["m2"] and ops["delete"] == []
+
+
+def test_review_suggestions_are_summary_only_and_never_gate(monkeypatch, tmp_path, capsys):
+    import json
+
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps({"pull_request": {"number": 7, "head": {"sha": "a" * 40}}}))
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_EVENT_PATH", str(event))
+    monkeypatch.setenv("INPUT_FAIL_ON_SEVERITY", "low")
+    monkeypatch.setattr(scan_pr.sys, "argv", ["scan_pr.py", "--dry-run"])
+    patch = "@@ -1,2 +1,1 @@\n def f(p):\n-    p = clean(p)\n"
+    monkeypatch.setattr(scan_pr, "collect_changed_files",
+                        lambda *a: [{"path": "a.py", "content": "def f(p):\n", "patch": patch}])
+    suggestion = {"file_path": "a.py", "line": 1, "title": "Path traversal", "severity": "high",
+                  "verdict": "uncertain", "confidence": 5, "removed_control": "p = clean(p)"}
+    result = {"report_findings": [], "review_status": "complete", "units_not_reviewed": [],
+              "report_markdown": "## ✅ RepoSentinel Security Report\n\n### 👀 Worth a look "
+                                 "(not blocking)", "review_suggestions": [suggestion]}
+    monkeypatch.setattr(scan_pr, "run_analysis", lambda *a: result)
+    assert scan_pr.main() == 0  # a high-severity suggestion never fails the gate
+    out = capsys.readouterr().out
+    assert "a.py:1" not in out.split("planned inline comments:")[1].split("unanchored")[0]
+    assert "👀 1 non-blocking review suggestion(s)" in out
+    assert scan_pr.suggestions_line({"review_suggestions": []}) is None
+    assert "non-blocking" not in build_summary("## r", "high", {"review_status": "complete"})

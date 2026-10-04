@@ -78,8 +78,9 @@ rejected / uncertain, and a JSON output schema was added.
 
 Not from either project: the verifier prompt's THREAT MODEL section (library /
 framework public APIs as attack surface, removed security controls as
-regression evidence, no rejection decided by an assumed library default) and
-the confidence-scale wording are RepoSentinel's own text.
+regression evidence, no rejection decided by an assumed library default), the
+confidence-scale wording and the `removed_control_quote` output field are
+RepoSentinel's own text.
 
 ```
 

@@ -35,8 +35,10 @@ THIRD-PARTY TEXT - see THIRD_PARTY_NOTICES.md in this directory.
 * RepoSentinel's own text (not from either project): the verifier's THREAT
   MODEL section (library / framework public APIs as attack surface, removed
   security controls as regression evidence, no rejection decided by an assumed
-  library default) and the confidence-scale wording ("how likely this is a
-  real vulnerability introduced by the change", not certainty in the verdict).
+  library default), the confidence-scale wording ("how likely this is a
+  real vulnerability introduced by the change", not certainty in the verdict)
+  and the ``removed_control_quote`` output field (the removed control's lines,
+  checked against the old file by ``core.pr_review``).
 
 Nothing here comes from protectai/vulnhuntr (AGPL-3.0): the context loop in
 ``core.pr_review`` only shares its idea (the model asks for symbols by name)
@@ -202,7 +204,9 @@ VERIFIER_SYSTEM_PROMPT = (
     "visible here: if the path cannot be established from the code shown, answer "
     "\"uncertain\" with a moderate confidence. Reject it when the code shown proves the "
     "control still applies (moved to a caller, wrapper, decorator or helper) or that the "
-    "removed code was unreachable.\n"
+    "removed code was unreachable. Whenever this rule applies and you do not reject, copy "
+    "the removed or weakened control's line(s) exactly as they appear in the diff's removed "
+    "(-) lines into removed_control_quote.\n"
     "3. Library behaviour that is not shown: do not make an assumed default or "
     "version-specific behaviour of a third-party library (for example whether a parser "
     "resolves external entities by default, or whether a loader is safe by default) the "
@@ -265,7 +269,9 @@ VERIFIER_SYSTEM_PROMPT = (
     '{"verdict": "confirmed|rejected|uncertain", "confidence": <1-10>, '
     '"source": "...", "sink": "...", "control": "the control you found or its absence", '
     '"counterevidence": "what argues against the finding (or none)", '
-    '"reason": "1-3 sentences"}'
+    '"reason": "1-3 sentences", '
+    '"removed_control_quote": "the removed control\'s line(s) copied from the diff\'s '
+    'removed (-) lines when THREAT MODEL rule 2 applies, else empty"}'
 )
 
 

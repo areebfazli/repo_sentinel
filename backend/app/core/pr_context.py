@@ -198,6 +198,39 @@ def diff_lines(patch: str | None) -> list[tuple[int | None, str]]:
     return out
 
 
+def deleted_old_lines(patch: str | None) -> set[int]:
+    """Old-file (1-based) line numbers the patch removes (a modified line is
+    removed and re-added)."""
+    out: set[int] = set()
+    if not patch:
+        return out
+    try:
+        hunks = _parse_hunks(patch)
+    except Exception:
+        return out
+    for a, b, _c, _d, lines in hunks:
+        old = a if b > 0 else a + 1
+        for line in lines:
+            tag = line[0]
+            if tag == "-":
+                out.add(old)
+                old += 1
+            elif tag != "+":
+                old += 1
+    return out
+
+
+def old_line_for(patch: str | None, new_line: int) -> int:
+    """Approximate old-file line of new-file ``new_line`` (``new_line`` itself
+    without a patch)."""
+    if not patch:
+        return new_line
+    try:
+        return _old_line_for(patch, new_line)
+    except Exception:
+        return new_line
+
+
 def render_diff(rows: list[tuple[int | None, str]], max_rows: int | None = None) -> str:
     """Numbered diff text: ``"   12| +code"`` (new-file line numbers; blank
     for removed lines and hunk headers). ``max_rows`` clips, with a marker."""

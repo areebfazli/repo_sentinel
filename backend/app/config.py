@@ -142,6 +142,15 @@ class Settings(BaseSettings):
     PR_REVIEW_MIN_CONFIDENCE: int = 7
     # Candidates the audit itself rates below this (1-10) are not verified.
     PR_REVIEW_MIN_AUDIT_CONFIDENCE: int = 5
+    # "Worth a look" (non-blocking, never a finding or a gate): a candidate the
+    # verifier left "uncertain" (or confirmed below PR_REVIEW_MIN_CONFIDENCE)
+    # with at least PR_REVIEW_SUGGEST_MIN_CONFIDENCE, AND deterministic evidence
+    # that the change removed a security control at that spot (guard_diff
+    # guard_removed in its unit, or the verifier's removed_control_quote found
+    # in the old file on deleted lines and in no new file). At most
+    # PR_REVIEW_MAX_SUGGESTIONS per scan; 0 turns the tier off.
+    PR_REVIEW_MAX_SUGGESTIONS: int = 5
+    PR_REVIEW_SUGGEST_MIN_CONFIDENCE: int = 4
     # Semgrep hits at/above this severity are shown to the audit as LEADS
     # (marked with their severity; leads focus attention, they are not findings).
     # Evidence-grade hits (static_analysis, corroboration) still use

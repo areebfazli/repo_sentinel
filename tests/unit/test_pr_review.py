@@ -257,6 +257,128 @@ def test_funnel_stats_partition_the_candidates():
     assert "1 not verified" in md
 
 
+# --- "worth a look": removed controls the verifier could not confirm ----------------
+
+UNCERTAIN_REMOVED = {"verdict": "uncertain", "confidence": 5,
+                     "reason": "clean() was removed, the caller is not shown",
+                     "removed_control_quote": "    p = clean(p)"}
+SQL_FINDING = {"file": "app/db.py", "line": 2, "severity": "high", "cwe": "CWE-89",
+               "title": "SQL injection in find()", "quoted_code": "return db.execute(f\"SELECT",
+               "confidence": 8}
+
+
+def _schema_ok(result):
+    AnalyzeResult(**{**result, "findings": [], "ghost_hunter_matches": 0,
+                     "team_memory_matches": 0})
+
+
+def test_uncertain_removed_control_is_a_non_blocking_review_suggestion():
+    router = PRRouter(audits=[{"findings": [TRAVERSAL]}], verdict=UNCERTAIN_REMOVED)
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router)
+    _schema_ok(result)
+    assert result["report_findings"] == [] and result["is_vulnerable"] is False
+    [sug] = result["review_suggestions"]
+    assert (sug["file_path"], sug["line"], sug["function_name"]) == ("app/files.py", 7, "read")
+    assert sug["removed_control"] == "    p = clean(p)" and sug["removed_control_line"] == 7
+    assert sug["evidence"] == ["verifier_quote"] and sug["verdict"] == "uncertain"
+    assert sug["confidence"] == 5 and sug["verifier"] == "stub:verifier"
+    [c] = result["candidates"]
+    assert c["status"] == "review_suggested" and c["review_evidence"] == ["verifier_quote"]
+    s = result["pr_review"]
+    assert (s["review_suggested"], s["uncertain"], s["confirmed"], s["verified"]) == (1, 0, 0, 1)
+    md = result["report_markdown"]
+    assert md.startswith("## ✅") and result["review_status"] == "complete"
+    assert "### 👀 Worth a look (not blocking)" in md and "`    p = clean(p)`" not in md
+    assert "Removed control (line 7 before the change): `p = clean(p)`" in md
+    assert "1 worth a look (not blocking" in md
+
+
+@pytest.mark.parametrize("quote", [
+    "     | -    p = clean(p)",       # copied from the verifier's numbered diff
+    "-    p = clean(p)",
+    "p=clean(p)",                     # whitespace-insensitive
+])
+def test_removed_control_quote_tolerates_diff_markers_and_whitespace(quote):
+    verdict = {**UNCERTAIN_REMOVED, "removed_control_quote": quote}
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), PRRouter(
+        audits=[{"findings": [TRAVERSAL]}], verdict=verdict))
+    assert [c["status"] for c in result["candidates"]] == ["review_suggested"]
+
+
+@pytest.mark.parametrize("verdict", [
+    {**UNCERTAIN_REMOVED, "removed_control_quote": "p = sanitize_path(p)"},  # not in old file
+    {**UNCERTAIN_REMOVED, "removed_control_quote": "return os.path.basename(p)"},  # kept
+    {**UNCERTAIN_REMOVED, "removed_control_quote": ""},
+    {**UNCERTAIN_REMOVED, "confidence": 3},  # verifier: likely a false positive
+])
+def test_unvalidated_or_weak_claims_are_not_suggestions(verdict):
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), PRRouter(
+        audits=[{"findings": [TRAVERSAL]}], verdict=verdict))
+    assert result["review_suggestions"] == []
+    assert [c["status"] for c in result["candidates"]] == ["uncertain"]
+    assert "Worth a look" not in result["report_markdown"]
+
+
+def test_a_moved_control_is_not_removed():
+    moved = PY_NEW.replace("    return read(req.args['f'])\n",
+                           "    p = req.args['f']\n    p = clean(p)\n    return read(p)\n")
+    result = _review(_files(("app/files.py", PY_OLD, moved)), PRRouter(
+        audits=[{"findings": [TRAVERSAL]}], verdict=UNCERTAIN_REMOVED))
+    assert result["review_suggestions"] == []
+    assert result["candidates"][0]["status"] == "uncertain"
+
+
+def test_rejected_never_qualifies_and_confirmed_below_cutoff_does():
+    rejected = {**UNCERTAIN_REMOVED, "verdict": "rejected", "confidence": 6}
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), PRRouter(
+        audits=[{"findings": [TRAVERSAL]}], verdict=rejected))
+    assert result["review_suggestions"] == [] and result["candidates"][0]["status"] == "rejected"
+    low = {**UNCERTAIN_REMOVED, "verdict": "confirmed", "confidence": 6}
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), PRRouter(
+        audits=[{"findings": [TRAVERSAL]}], verdict=low))
+    assert result["report_findings"] == []
+    [sug] = result["review_suggestions"]
+    assert sug["verdict"] == "confirmed" and "confirmed below the cutoff" in \
+        result["report_markdown"]
+    # At/above the cutoff it is a finding, not a suggestion.
+    high = {**UNCERTAIN_REMOVED, "verdict": "confirmed", "confidence": 7}
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), PRRouter(
+        audits=[{"findings": [TRAVERSAL]}], verdict=high))
+    assert len(result["report_findings"]) == 1 and result["review_suggestions"] == []
+
+
+def test_guard_diff_removal_in_the_unit_is_evidence_without_a_quote():
+    router = PRRouter(audits=[{"findings": [SQL_FINDING]}],
+                      verdict={"verdict": "uncertain", "confidence": 5, "reason": "caller?"})
+    result = _review(_files(("app/db.py", SQL_OLD, SQL_NEW)), router)
+    _schema_ok(result)
+    [sug] = result["review_suggestions"]
+    assert sug["evidence"] == ["guard_diff"]
+    assert sug["removed_control"] == "'SELECT * FROM users WHERE name = ?'"
+    assert sug["removed_control_line"] is None
+    # The guard alert itself is still the deterministic finding; the suggestion
+    # is not added to the findings.
+    assert [f["source"] for f in result["report_findings"]] == ["guard_diff"]
+
+
+def test_suggestions_can_be_turned_off_and_are_capped():
+    router = PRRouter(audits=[{"findings": [TRAVERSAL]}], verdict=UNCERTAIN_REMOVED)
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router, max_review_suggestions=0)
+    assert result["review_suggestions"] == []
+    assert result["candidates"][0]["status"] == "uncertain"
+    assert result["candidates"][0]["review_evidence"] == ["verifier_quote"]
+
+
+def test_suggestion_text_is_escaped_in_the_report():
+    finding = {**TRAVERSAL, "title": "XSS <script>alert(1)</script> @admin [x](http://evil)"}
+    verdict = {**UNCERTAIN_REMOVED, "reason": "see <img src=x onerror=1> @team"}
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), PRRouter(
+        audits=[{"findings": [finding]}], verdict=verdict))
+    md = result["report_markdown"].split("Worth a look")[1]
+    assert "<script>" not in md and "<img" not in md
+    assert "@admin" not in md and "@team" not in md and "](http" not in md
+
+
 def test_low_audit_confidence_is_not_verified():
     router = PRRouter(audits=[{"findings": [{**TRAVERSAL, "confidence": 3}]}])
     result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router)

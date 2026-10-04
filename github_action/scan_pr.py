@@ -5,7 +5,10 @@ RepoSentinel API (files mode), then posts findings as inline review comments —
 deduped across pushes via hidden markers — plus a summary comment, and sets the
 check status via a configurable severity gate and a review-coverage gate
 (INPUT_FAIL_ON_PARTIAL, default true: a scan whose LLM review was partial or
-failed fails the check rather than passing as clean).
+failed fails the check rather than passing as clean). The PR review's
+non-blocking "worth a look" items (``review_suggestions``) appear only in the
+summary comment (the server's report plus a count line): no inline comments,
+never part of the gate.
 
 Standalone (only `requests` required); backend modules are NOT importable here, so
 the diff parser is duplicated. The decision-making logic (comment planning,
@@ -140,6 +143,18 @@ def coverage_line(result: dict) -> str:
         detail = f" ({', '.join(parts)})" if parts else ""
     icon = {"complete": "✅", "partial": "⚠️", "failed": "❌"}[status]
     return f"{icon} Review coverage: `{status}`{detail}"
+
+
+def suggestions_line(result: dict) -> str | None:
+    """One Markdown line on the PR review's non-blocking "worth a look" items
+    (``review_suggestions``: removed security controls the verifier could not
+    confirm), or None. Trusted numbers only: the items themselves are in the
+    server-rendered report. They are never inline comments and never gate."""
+    n = len(result.get("review_suggestions") or [])
+    if not n:
+        return None
+    return (f"👀 {n} non-blocking review suggestion(s) (\"Worth a look\" above): not "
+            "findings; they never fail this check.")
 
 
 def anchor_line(
@@ -346,7 +361,9 @@ def build_summary(report_markdown: str, gate_threshold: str, result: dict | None
     if not gate_on_deterministic:
         gates += " (deterministic-only findings need LLM / Semgrep corroboration)"
     gates += "; fails on partial review" if fail_on_partial else "; partial review allowed"
-    footer = f"\n\n{coverage_line(result)}\n\n<sub>{gates}</sub>"
+    extra = suggestions_line(result)
+    footer = f"\n\n{coverage_line(result)}" + (f"\n\n{extra}" if extra else "")
+    footer += f"\n\n<sub>{gates}</sub>"
     return f"{body}{footer}\n<!-- reposentinel:summary -->"
 
 
@@ -575,8 +592,11 @@ def main() -> int:
     result = run_analysis(api_base, api_key, files, repo, pr_number)
     # Gate + inline comments use the REVIEWED findings (LLM findings that quote
     # the code, plus deterministic guard checks) — not the raw retrieval matches.
+    # review_suggestions ("worth a look", PR-level review) are deliberately left
+    # out of both: they are only listed in the summary comment, never gate.
     findings = result.get("report_findings", [])
     print(f"{len(findings)} confirmed finding(s); is_vulnerable={result.get('is_vulnerable')}; "
+          f"{len(result.get('review_suggestions') or [])} non-blocking review suggestion(s); "
           f"review {review_status(result)}")
 
     changed_by_file = {file["path"]: parse_changed_lines(file.get("patch") or "") for file in files}

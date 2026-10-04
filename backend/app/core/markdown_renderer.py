@@ -541,6 +541,41 @@ def _render_finding(f: dict[str, Any]) -> list[str]:
     return block
 
 
+def _render_suggestions(suggestions: list[dict]) -> list[str]:
+    """The non-blocking "worth a look" section (PR-level review), or []."""
+    if not suggestions:
+        return []
+    out = ["### 👀 Worth a look (not blocking)",
+           "_Not confirmed by the verifier, but the change removed an existing security "
+           "control at this spot (checked deterministically against the code before the "
+           "change). Not counted as findings; never fails a check._"]
+    for s in suggestions:
+        refs = []
+        loc = _location(s)
+        if loc:
+            refs.append(md_code_span(loc))
+        if s.get("cwe"):
+            refs.append(md_inline(s["cwe"]))
+        heading = f"- **{md_inline(s.get('title') or 'Possible regression')}**"
+        if refs:
+            heading += f" ({', '.join(refs)})"
+        out.append(heading)
+        if s.get("removed_control"):
+            where = (f" (line {int(s['removed_control_line'])} before the change)"
+                     if isinstance(s.get("removed_control_line"), int) else "")
+            out.append(f"  - Removed control{where}: "
+                       f"{md_code_span(s['removed_control'].strip())}")
+        conf = s.get("confidence")
+        conf_text = f", confidence {int(conf)}/10" if isinstance(conf, (int, float)) else ""
+        verdict = "uncertain" if s.get("verdict") == "uncertain" else "confirmed below the cutoff"
+        who = f" by {md_code_span(str(s['verifier']))}" if s.get("verifier") else ""
+        line = f"  - Verifier{who}: {verdict}{conf_text}"
+        if s.get("verifier_reason"):
+            line += f". {md_inline(s['verifier_reason'])}"
+        out.append(line)
+    return out
+
+
 def coverage_banner(
     review_status: str | None, units_total: int, units_not_reviewed: int, units_partial: int
 ) -> str | None:
@@ -573,6 +608,7 @@ def render_markdown(
     units_not_reviewed: int = 0,
     units_partial: int = 0,
     show_reference_counts: bool = True,
+    suggestions: list[dict] | None = None,
 ) -> str:
     """Render the PR comment from validated structured findings (deterministic;
     every LLM-written field escaped). ``findings`` from the LLM carry
@@ -582,7 +618,9 @@ def render_markdown(
     decides whether an empty report may say "no findings": only a complete
     review gets the clean ✅. ``show_reference_counts`` False leaves the
     retrieval counts out of the footer (the PR-level review doesn't show
-    retrieved matches to the model)."""
+    retrieved matches to the model). ``suggestions``: the PR-level review's
+    non-blocking "worth a look" items, in their own section; they never
+    change the heading (an otherwise clean report stays ✅)."""
     footer_bits = []
     if units_reviewed is not None:
         footer_bits.append(
@@ -596,7 +634,10 @@ def render_markdown(
     if static_hits:
         footer_bits.append(f"{static_hits} static-analysis hit(s) as evidence")
     footer = f"_{'; '.join(footer_bits)}._"
-    tail = [footer, *(notes or [])]
+    worth = _render_suggestions(suggestions or [])
+    # Blank line after the list, so the footer isn't read as part of its last item.
+    tail = ["\n".join(worth) + "\n"] if worth else []
+    tail += [footer, *(notes or [])]
     banner = coverage_banner(review_status, units_total, units_not_reviewed, units_partial)
 
     if not findings:

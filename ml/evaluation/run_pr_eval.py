@@ -142,7 +142,7 @@ if str(_ROOT) not in sys.path:
     sys.path.append(str(_ROOT))
 
 from backend.app.config import BASE_DIR, settings  # noqa: E402
-from backend.app.core.llm_client import LLMError  # noqa: E402
+from backend.app.core.llm_client import MIN_OUTPUT_TOKENS, LLMError  # noqa: E402
 from backend.app.core.markdown_renderer import SEVERITY_ORDER  # noqa: E402
 from backend.app.core.markdown_renderer import SYSTEM_PROMPT as UNITS_SYSTEM_PROMPT  # noqa: E402
 from backend.app.core.pr_context import diff_lines  # noqa: E402
@@ -234,7 +234,10 @@ SEMGREP_CACHE_VERSION = 1
 FINDING_KEYS = ("file_path", "line", "end_line", "cwe", "severity", "title", "source")
 # Pacing profiles for the dry-run's wall-time estimate: OpenRouter free models
 # allow 20 requests/min (1,000/day with credits); Groq's free tier ~30 req/min and
-# 8K tokens/min per model.
+# 8K tokens/min per model. With a tokens/min limit, a call whose estimated prompt
+# leaves under llm_client.MIN_OUTPUT_TOKENS of it is NOT servable (the router
+# skips that client: Groq counts max_tokens against the limit), so the profile's
+# wall time covers the servable calls only and the rest are counted apart.
 PACING_PROFILES = {
     "openrouter_free": {"sleep_s": 3.0, "tpm": 0, "requests_per_day": 1000},
     "groq_free_8k_tpm": {"sleep_s": 2.0, "tpm": 8000, "requests_per_day": 1000},
@@ -1888,23 +1891,36 @@ def dry_run_item_estimate(rec: dict, arm: str, config: PRReviewConfig) -> dict:
            "verifier_calls_scenario": len(verifier), "verifier_prompt_tokens": verifier}
     floor_tokens = sum(audit)
     if arm not in PR_ARMS:
-        out.update(floor={"calls": len(audit), "tokens": floor_tokens},
-                   scenario={"calls": len(audit), "tokens": floor_tokens},
-                   ceiling={"calls": len(audit), "tokens": floor_tokens})
+        out.update(floor={"calls": len(audit), "tokens": floor_tokens,
+                          "call_tokens": list(audit)},
+                   scenario={"calls": len(audit), "tokens": floor_tokens,
+                             "call_tokens": list(audit)},
+                   ceiling={"calls": len(audit), "tokens": floor_tokens,
+                            "call_tokens": list(audit)})
         return out
     extras = context_call_bound(len(audit), config.max_audit_calls, config.context_rounds)
-    ctx_tokens = sum(x * (t + config.context_max_tokens) for x, t in zip(extras, audit,
-                                                                        strict=False))
+    ctx_calls = [t + config.context_max_tokens
+                 for x, t in zip(extras, audit, strict=False) for _ in range(x)]
     vmax = config.max_verifier_calls
+    ceiling_calls = list(audit) + ctx_calls + [config.max_prompt_tokens] * vmax
     out.update(
         context_calls_upper=sum(extras),
         verifier_calls_upper=vmax,
-        floor={"calls": len(audit), "tokens": floor_tokens},
-        scenario={"calls": len(audit) + len(verifier), "tokens": floor_tokens + sum(verifier)},
-        ceiling={"calls": len(audit) + sum(extras) + vmax,
-                 "tokens": floor_tokens + ctx_tokens + vmax * config.max_prompt_tokens},
+        floor={"calls": len(audit), "tokens": floor_tokens, "call_tokens": list(audit)},
+        scenario={"calls": len(audit) + len(verifier), "tokens": floor_tokens + sum(verifier),
+                  "call_tokens": list(audit) + list(verifier)},
+        ceiling={"calls": len(ceiling_calls), "tokens": sum(ceiling_calls),
+                 "call_tokens": ceiling_calls},
     )
     return out
+
+
+def servable(prompt_tokens: int, tpm: int | None) -> bool:
+    """Whether a client with ``tpm`` tokens/min (0 / None = no limit) can take
+    a call of ``prompt_tokens`` estimated prompt tokens:
+    ``LLMRouter.max_output_tokens`` skips it when the prompt leaves under
+    MIN_OUTPUT_TOKENS of the limit."""
+    return not tpm or tpm - prompt_tokens >= MIN_OUTPUT_TOKENS
 
 
 def pacing_seconds(call_tokens: list[int], sleep_s: float, tpm: int | None,
@@ -1938,6 +1954,7 @@ def summarize_dry_run(records: list[dict], arm: str, config: PRReviewConfig, *,
         for e, c in zip(ests, calls, strict=True):
             avg = (e[scen]["tokens"] / c if c else 0) + completion_tokens
             flat.extend([avg] * c)
+        call_lists = [e[scen].get("call_tokens") for e in ests]
         cut = None
         if max_calls is not None or token_budget is not None:
             run_calls = run_tokens = 0
@@ -1956,15 +1973,9 @@ def summarize_dry_run(records: list[dict], arm: str, config: PRReviewConfig, *,
             "total_prompt_tokens": sum(prompt),
             "total_tokens_incl_completion": total_tokens,
             "budget_cutoff": cut,
-            "wall_time_h": {
-                name: {
-                    "pacing_only": round(pacing_seconds(flat, p["sleep_s"], p["tpm"], 0) / 3600,
-                                         2),
-                    "with_latency": round(pacing_seconds(flat, p["sleep_s"], p["tpm"],
-                                                         latency_s) / 3600, 2),
-                    "days_at_requests_per_day": math.ceil(total_calls / p["requests_per_day"])
-                    if total_calls else 0,
-                } for name, p in PACING_PROFILES.items()},
+            "wall_time_h": {name: _profile_wall_time(p, flat, call_lists, completion_tokens,
+                                                     latency_s)
+                            for name, p in PACING_PROFILES.items()},
         }
     partial = [r["id"] for r in records if r.get("review_status") != "complete"
                and (r.get("not_reviewed_reasons") or r.get("units_partially_reviewed"))]
@@ -1980,6 +1991,35 @@ def summarize_dry_run(records: list[dict], arm: str, config: PRReviewConfig, *,
         out["context_calls_upper_total"] = sum(e.get("context_calls_upper", 0) for e in ests)
         out["verifier_unverified_in_scenario"] = sum(
             (r.get("pr_review") or {}).get("unverified") or 0 for r in records)
+    return out
+
+
+def _profile_wall_time(p: dict, flat: list[float], call_lists: list, completion_tokens: int,
+                       latency_s: float) -> dict:
+    """One pacing profile's wall-time estimate. With a tokens/min limit, only
+    the calls it can serve (``servable``) are paced; the others are counted
+    (``not_servable_calls``, ``items_with_unservable_calls``: PRs a setup with
+    only this provider would leave partial or failed)."""
+    calls = flat
+    out: dict = {}
+    if p["tpm"] and all(c is not None for c in call_lists):
+        ok = [t + completion_tokens for cs in call_lists for t in cs if servable(t, p["tpm"])]
+        bad = sum(1 for cs in call_lists for t in cs if not servable(t, p["tpm"]))
+        calls = ok
+        out.update(
+            max_servable_prompt_tokens=p["tpm"] - MIN_OUTPUT_TOKENS,
+            not_servable_calls=bad,
+            items_with_unservable_calls=sum(
+                1 for cs in call_lists if any(not servable(t, p["tpm"]) for t in cs)),
+            note=("pacing covers the servable calls only: a prompt over "
+                  f"{p['tpm'] - MIN_OUTPUT_TOKENS} est. tokens can't run on this provider "
+                  "(the router skips it)") if bad else None)
+    n = len(calls)
+    out.update(
+        pacing_only=round(pacing_seconds(calls, p["sleep_s"], p["tpm"], 0) / 3600, 2),
+        with_latency=round(pacing_seconds(calls, p["sleep_s"], p["tpm"], latency_s) / 3600, 2),
+        days_at_requests_per_day=math.ceil(n / p["requests_per_day"]) if n else 0,
+    )
     return out
 
 

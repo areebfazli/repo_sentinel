@@ -466,12 +466,14 @@ def test_dry_run_builds_real_prompts_and_estimates(tmp_path):
     for r in recs:
         d = r["dry_run"]
         assert d["audit_calls"] == 1 and d["verifier_calls_scenario"] == 1
-        assert d["floor"] == {"calls": 1, "tokens": d["audit_prompt_tokens"][0]}
+        assert d["floor"] == {"calls": 1, "tokens": d["audit_prompt_tokens"][0],
+                              "call_tokens": d["audit_prompt_tokens"]}
         assert d["scenario"]["calls"] == 2
         assert d["ceiling"]["calls"] == 1 + cfg.context_rounds + cfg.max_verifier_calls
         assert d["ceiling"]["tokens"] == (d["audit_prompt_tokens"][0] * 3
                                           + 2 * cfg.context_max_tokens
                                           + cfg.max_verifier_calls * cfg.max_prompt_tokens)
+        assert sum(d["ceiling"]["call_tokens"]) == d["ceiling"]["tokens"]
     summary = R.summarize_dry_run(recs, "pr", cfg, completion_tokens=100, latency_s=10.0,
                                   max_calls=3, token_budget=None)
     assert summary["floor"]["total_requests"] == 2
@@ -481,6 +483,25 @@ def test_dry_run_builds_real_prompts_and_estimates(tmp_path):
                                                     "items_covered": 1}
     units = asyncio.run(R.dry_run_records(items, "units", parser=R._parser()))
     assert all(u["dry_run"]["ceiling"]["calls"] == 1 for u in units)
+
+
+def test_dry_run_groq_estimate_counts_unservable_prompts():
+    est = {"floor": {"calls": 2, "tokens": 9000, "call_tokens": [3000, 6000]},
+           "scenario": {"calls": 3, "tokens": 21000, "call_tokens": [3000, 6000, 12000]},
+           "ceiling": {"calls": 3, "tokens": 21000, "call_tokens": [3000, 6000, 12000]},
+           "audit_prompt_tokens": [3000, 6000], "verifier_prompt_tokens": [12000]}
+    recs = [{"id": "x", "dry_run": est, "review_status": "complete"}]
+    s = R.summarize_dry_run(recs, "pr", R.pr_review_config(), completion_tokens=0,
+                            latency_s=0.0, max_calls=None, token_budget=None)
+    groq = s["scenario"]["wall_time_h"]["groq_free_8k_tpm"]
+    assert groq["max_servable_prompt_tokens"] == 8000 - R.MIN_OUTPUT_TOKENS
+    assert (groq["not_servable_calls"], groq["items_with_unservable_calls"]) == (1, 1)
+    assert "servable calls only" in groq["note"]
+    # Only the 3K and 6K calls are paced: max(2 s, 60 x 3000 / 8000) before the second.
+    assert groq["pacing_only"] == round(22.5 / 3600, 2)
+    assert s["floor"]["wall_time_h"]["groq_free_8k_tpm"]["not_servable_calls"] == 0
+    assert "not_servable_calls" not in s["scenario"]["wall_time_h"]["openrouter_free"]
+    assert R.servable(7488, 8000) and not R.servable(7489, 8000) and R.servable(10**6, 0)
 
 
 def test_pacing_seconds():

@@ -54,9 +54,33 @@ class Settings(BaseSettings):
     OPENROUTER_FALLBACK_MODEL: str | None = "google/gemma-4-31b-it:free"
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     LLM_TIMEOUT_SECONDS: int = 60
-    # Sampling temperature of every review call. 0.2 is what production has always
-    # used; the eval (ml/evaluation/run_eval --llm-temperature) defaults to 0.0.
+    # Sampling temperature of review calls to a model WITHOUT an LLM_SAMPLING
+    # entry. 0.2 is what production has always used; the eval
+    # (ml/evaluation/run_eval --llm-temperature) overrides it per client (0.0).
     LLM_TEMPERATURE: float = 0.2
+    # Per-model sampling (code default, not .env), keyed by model id; a key
+    # matches the model with or without OpenRouter's ":free" suffix (a
+    # "<provider>:<model>" key matches only that provider). Used whenever the
+    # client has no explicit temperature override (``LLMClient.temperature`` is
+    # None); an override sends only that temperature, as before.
+    # qwen/qwen3.8-27b: the model card's thinking-mode recommendation (also
+    # OpenRouter's defaults for it); greedy / low temperature is discouraged for
+    # thinking mode (repetition loops). OpenRouter's ":free" endpoint for this
+    # model serves an fp4-quantised build. top_k is only sent to providers that
+    # accept it (llm_client.PROVIDERS "supports_top_k": OpenRouter).
+    LLM_SAMPLING: dict[str, dict[str, float | int]] = {
+        "qwen/qwen3.8-27b": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+    }
+    # Cap on completion tokens per call, sent as max_tokens (None = not sent).
+    # Reasoning models count their thinking against it: the JSON answer is a few
+    # hundred to ~2K tokens, but thinking-mode models spend several thousand
+    # tokens reasoning first, so 16K leaves room for a long reasoning pass while
+    # bounding a runaway generation (one call ran to 131,072 completion tokens
+    # with no cap). A client with a tokens-per-minute limit (LLM_TPM_LIMITS, i.e.
+    # Groq) gets at most what is left of that limit after the prompt, since Groq
+    # counts max_tokens against it. Output cut at the cap (finish_reason
+    # "length") is a failed call that falls through, never an empty review.
+    LLM_MAX_OUTPUT_TOKENS: int | None = 16000
     LLM_RETRIES: int = 1                 # same-client retries on 429/5xx/timeout
     # Per-scan LLM budget. Units are ordered by evidence (guard_diff alert, Semgrep
     # hit, guard_removed, retrieval similarity) and packed into as few prompts as

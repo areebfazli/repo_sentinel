@@ -284,7 +284,7 @@ def test_router_falls_back_on_primary_failure(monkeypatch):
     monkeypatch.setattr(settings, "LLM_RETRIES", 0)
     router = LLMRouter()
 
-    async def groq_fails(self, system, user):
+    async def groq_fails(self, system, user, max_tokens=None):
         if self.provider == "groq":  # both Groq models
             raise llm_client._Retriable("boom")
         return '{"findings": [{"title": "from gemini"}]}'
@@ -304,7 +304,7 @@ def test_router_reports_groq_fallback_model_when_primary_model_fails(monkeypatch
     monkeypatch.setattr(settings, "LLM_RETRIES", 0)
     router = LLMRouter()
 
-    async def primary_model_fails(self, system, user):
+    async def primary_model_fails(self, system, user, max_tokens=None):
         if self.model == "openai/gpt-oss-120b":
             raise llm_client.LLMError("groq:openai/gpt-oss-120b HTTP 404: model_not_found")
         return '{"findings": [{"title": "from qwen"}]}'

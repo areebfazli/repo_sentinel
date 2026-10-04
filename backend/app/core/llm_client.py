@@ -27,7 +27,16 @@ OpenRouter quirks handled here: an error object inside an HTTP 200 body
 (`{"error": {...}}`), and free models that reject `response_format` (HTTP 400 ->
 one retry without it, remembered for the client's lifetime). All providers'
 content goes through a tolerant JSON extractor (```json fences, <think> blocks
-or reasoning text before the object); plain JSON parses exactly as before.
+or reasoning text before the object; the LAST complete top-level object wins);
+plain JSON parses exactly as before. A reply that isn't a JSON object, or that
+was cut at max_tokens (finish_reason "length") without a complete JSON document,
+is a bad-output failure: the next client is tried.
+
+Every request carries max_tokens (settings.LLM_MAX_OUTPUT_TOKENS, lowered for a
+client with a tokens-per-minute limit to what the prompt leaves of it; a prompt
+that leaves too little skips that client) and the model's sampling parameters
+(settings.LLM_SAMPLING, else LLM_TEMPERATURE; ``LLMClient.temperature`` set by a
+caller overrides the temperature, see ``LLMClient.sampling_params``).
 
 `provider_used` is "<provider>:<model>" (e.g. "groq:openai/gpt-oss-120b"), or "mock".
 
@@ -49,7 +58,9 @@ from backend.app.config import settings
 # Per provider: a fixed "url", or a "base_url_setting" (+ "/chat/completions")
 # resolved when the client is built; "fallback_model_setting" names the
 # same-provider fallback model; "extra_headers" are sent on every request;
-# "response_format_fallback" enables the retry-without-response_format path.
+# "response_format_fallback" enables the retry-without-response_format path;
+# "supports_top_k" allows sending top_k (not an OpenAI parameter: Groq and
+# Gemini's OpenAI-compatible endpoints don't document it, so it isn't sent there).
 PROVIDERS = {
     "groq": {
         "url": "https://api.groq.com/openai/v1/chat/completions",
@@ -74,8 +85,13 @@ PROVIDERS = {
         },
         # Some free models reject response_format with HTTP 400.
         "response_format_fallback": True,
+        "supports_top_k": True,
     },
 }
+
+# Least completion room (max_tokens) worth sending to a client with a
+# tokens-per-minute limit; a prompt leaving less than this skips the client.
+MIN_OUTPUT_TOKENS = 512
 
 # Model ids (on providers with "response_format_fallback") known to reject
 # response_format json_object: it is never sent to them, saving the 400
@@ -175,13 +191,65 @@ _FENCE_RE = re.compile(r"```[A-Za-z0-9_-]*\s*\n?(.*?)```", re.DOTALL)
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
+def _object_end(text: str, start: int) -> int | None:
+    """Index just past the ``}`` closing the ``{`` at ``start`` (JSON string
+    aware), or None if it is never closed (e.g. output cut off mid-object)."""
+    depth, in_string, escaped = 0, False, False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return None
+
+
+# Where a JSON object can start: "{" then a key or "}" (prose braces like
+# "{set}" are not candidates).
+_OBJECT_START_RE = re.compile(r'\{\s*["}]')
+
+
+def _top_level_objects(text: str) -> list[dict]:
+    """The complete top-level JSON objects in ``text``, in order. Objects
+    nested inside another are not top-level; an object that is never closed
+    (truncated output) ends the scan, so nothing nested in it is returned."""
+    out: list[dict] = []
+    pos = 0
+    while (m := _OBJECT_START_RE.search(text, pos)) is not None:
+        end = _object_end(text, m.start())
+        if end is None:
+            break
+        try:
+            obj = json.loads(text[m.start():end])
+        except json.JSONDecodeError:
+            obj = None
+        if isinstance(obj, dict):
+            out.append(obj)
+        pos = end
+    return out
+
+
 def extract_json(content: str):
     """Parse the model's JSON, tolerating reasoning-model wrappers.
 
     Plain JSON (Groq/Gemini with response_format) is parsed by the first
-    json.loads, unchanged. Otherwise: drop <think>...</think> blocks, try the
-    contents of each Markdown code fence (```json ... ```), then the first
-    top-level JSON object in the text (e.g. after leading reasoning prose).
+    json.loads, unchanged. Otherwise: drop <think>...</think> blocks, then take
+    the LAST complete top-level JSON object in the text (inside a ``` fence or
+    not): a model that drafts an answer and then gives its final one means the
+    final one, and an inner object of a truncated answer (e.g. one finding of a
+    cut-off findings list) is never mistaken for the answer. Failing that, the
+    last Markdown code fence whose contents parse (e.g. a fenced list).
     Raises json.JSONDecodeError (from the plain parse) if nothing parses.
     """
     try:
@@ -189,20 +257,39 @@ def extract_json(content: str):
     except json.JSONDecodeError as exc:
         original = exc
     text = _THINK_RE.sub("", content)
-    for candidate in [text, *_FENCE_RE.findall(text)]:
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError:
+        pass
+    objects = _top_level_objects(text)
+    if objects:
+        return objects[-1]
+    for candidate in reversed(_FENCE_RE.findall(text)):
         try:
             return json.loads(candidate.strip())
         except json.JSONDecodeError:
             pass
-    decoder = json.JSONDecoder()
-    for match in re.finditer(r"\{", text):
-        try:
-            obj, _ = decoder.raw_decode(text, match.start())
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict):
-            return obj
     raise original
+
+
+def _is_json_object(content: str) -> bool:
+    """The whole content (whitespace aside) is one JSON object."""
+    try:
+        return isinstance(json.loads(content.strip()), dict)
+    except (json.JSONDecodeError, AttributeError):
+        return False
+
+
+def model_sampling(provider: str, model: str) -> dict:
+    """settings.LLM_SAMPLING's entry for this model ({} if none): a
+    "<provider>:<model>" key first, then the model id, then the id without
+    OpenRouter's ":free" suffix."""
+    table = settings.LLM_SAMPLING or {}
+    base = model.removesuffix(":free")
+    for key in (f"{provider}:{model}", f"{provider}:{base}", model, base):
+        if key in table:
+            return dict(table[key])
+    return {}
 
 
 def _provider_key(provider: str) -> str | None:
@@ -212,7 +299,8 @@ def _provider_key(provider: str) -> str | None:
 
 
 class LLMClient:
-    def __init__(self, provider: str, model: str | None = None):
+    def __init__(self, provider: str, model: str | None = None,
+                 temperature: float | None = None):
         if provider not in PROVIDERS:
             raise ValueError(f"Unknown LLM provider: {provider}")
         cfg = PROVIDERS[provider]
@@ -232,9 +320,11 @@ class LLMClient:
         self.use_response_format = not (
             self._response_format_fallback and self.model in _NO_RESPONSE_FORMAT_MODELS
         )
-        # Sampling temperature sent with every request (settings.LLM_TEMPERATURE;
-        # the eval overrides it per client, e.g. 0.0 for reproducible runs).
-        self.temperature = settings.LLM_TEMPERATURE
+        # Explicit temperature override (the eval sets it per client, e.g. 0.0
+        # for reproducible runs). None = the model's LLM_SAMPLING entry, else
+        # settings.LLM_TEMPERATURE (see sampling_params).
+        self.temperature = temperature
+        self._supports_top_k = bool(cfg.get("supports_top_k"))
         # Reported as provider_used and used in logs: says exactly which model answered.
         self.label = f"{provider}:{self.model}"
         if not _key_configured(self.api_key):
@@ -251,15 +341,42 @@ class LLMClient:
             and "response_format" in _error_message(resp)
         )
 
-    async def _post(self, system: str, user: str) -> httpx.Response:
+    def sampling_params(self) -> dict:
+        """The sampling fields sent with each request.
+
+        With ``self.temperature`` set (an explicit override): only that
+        temperature, exactly as before per-model sampling existed. With None:
+        the model's settings.LLM_SAMPLING entry (temperature, top_p, and top_k
+        on providers that accept it), its temperature defaulting to
+        settings.LLM_TEMPERATURE; a model without an entry sends just
+        LLM_TEMPERATURE. Read at request time, so settings changes apply."""
+        if self.temperature is not None:
+            return {"temperature": float(self.temperature)}
+        entry = model_sampling(self.provider, self.model)
+        params = {"temperature": float(entry.get("temperature", settings.LLM_TEMPERATURE))}
+        if entry.get("top_p") is not None:
+            params["top_p"] = float(entry["top_p"])
+        if entry.get("top_k") is not None and self._supports_top_k:
+            params["top_k"] = int(entry["top_k"])
+        return params
+
+    @property
+    def effective_temperature(self) -> float:
+        """The temperature this client actually sends."""
+        return self.sampling_params()["temperature"]
+
+    async def _post(self, system: str, user: str, max_tokens: int | None = None
+                    ) -> httpx.Response:
         body = {
             "model": self.model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "temperature": self.temperature,
+            **self.sampling_params(),
         }
+        if max_tokens:
+            body["max_tokens"] = int(max_tokens)
         if self.use_response_format:
             body["response_format"] = {"type": "json_object"}
         async with httpx.AsyncClient(timeout=settings.LLM_TIMEOUT_SECONDS) as http:
@@ -269,9 +386,12 @@ class LLMClient:
                 json=body,
             )
 
-    async def complete(self, system: str, user: str) -> str:
-        """Return the raw assistant message content (expected to be JSON)."""
-        resp = await self._post(system, user)
+    async def complete(self, system: str, user: str, max_tokens: int | None = None) -> str:
+        """Return the raw assistant message content (expected to be JSON).
+        ``max_tokens`` defaults to settings.LLM_MAX_OUTPUT_TOKENS."""
+        if max_tokens is None:
+            max_tokens = settings.LLM_MAX_OUTPUT_TOKENS
+        resp = await self._post(system, user, max_tokens)
         if self._rejects_response_format(resp):
             # The system prompt already asks for JSON and the router still
             # validates it, so dropping response_format loses no safety.
@@ -281,7 +401,7 @@ class LLMClient:
                 self.model, self.provider,
             )
             self.use_response_format = False
-            resp = await self._post(system, user)
+            resp = await self._post(system, user, max_tokens)
         if resp.status_code != 200:
             if resp.status_code == 402:
                 # Account-level (insufficient credits): retrying, or trying another
@@ -342,6 +462,16 @@ class LLMClient:
                 f"{self.label} returned null content (finish_reason="
                 f"{choice.get('finish_reason')!r}, completion_tokens="
                 f"{usage.get('completion_tokens')}, reasoning_chars={len(reasoning)})",
+                transient=False,
+            )
+        if choice.get("finish_reason") == "length" and not _is_json_object(content):
+            # Cut off at max_tokens: whatever JSON could be salvaged from it (a
+            # draft, one finding of a cut-off list) is not the answer.
+            usage = data.get("usage") or {}
+            raise _Retriable(
+                f"{self.label} output truncated (finish_reason='length', completion_tokens="
+                f"{usage.get('completion_tokens')}, max_tokens={max_tokens}) without a "
+                "complete JSON answer",
                 transient=False,
             )
         return content
@@ -463,6 +593,21 @@ class LLMRouter:
             clients.append(LLMClient(provider, model=fb_model))
         return clients
 
+    def max_output_tokens(self, client: LLMClient, prompt_tokens: int) -> int | None:
+        """max_tokens for one call: settings.LLM_MAX_OUTPUT_TOKENS, capped for a
+        client with a tokens-per-minute limit (Groq counts max_tokens against
+        it, so prompt + max_tokens over the limit is rejected outright) to what
+        the estimated prompt leaves of the limit. 0 = the prompt leaves under
+        MIN_OUTPUT_TOKENS: skip the client. None = no cap sent."""
+        cap = settings.LLM_MAX_OUTPUT_TOKENS
+        limit = self.pacer.limit_for(client.label, client.provider)
+        if not limit:
+            return cap
+        room = limit - prompt_tokens
+        if room < MIN_OUTPUT_TOKENS:
+            return 0
+        return min(cap, room) if cap else room
+
     @property
     def clock(self):
         """The pacer's monotonic clock (scan deadlines are measured on it)."""
@@ -488,9 +633,8 @@ class LLMRouter:
         if self.mock:
             return MOCK_RESPONSE, "mock"
 
-        tokens = estimate_tokens(system) + estimate_tokens(user) + (
-            settings.LLM_OUTPUT_TOKENS_ESTIMATE
-        )
+        prompt_tokens = estimate_tokens(system) + estimate_tokens(user)
+        tokens = prompt_tokens + settings.LLM_OUTPUT_TOKENS_ESTIMATE
         last_error: Exception | None = None
         deadline_hit = False
         dead_providers: set[str] = set()  # account-level failure (HTTP 402)
@@ -500,6 +644,17 @@ class LLMRouter:
                     "Skipping LLM client {}: provider '{}' failed account-wide.",
                     client.label, client.provider,
                 )
+                continue
+            max_tokens = self.max_output_tokens(client, prompt_tokens)
+            if max_tokens == 0:
+                limit = self.pacer.limit_for(client.label, client.provider)
+                logger.warning(
+                    "Skipping LLM client {}: the prompt (~{} est. tokens) leaves under {} "
+                    "output tokens of its {} tokens/min limit.",
+                    client.label, prompt_tokens, MIN_OUTPUT_TOKENS, limit,
+                )
+                last_error = last_error or LLMError(
+                    f"{client.label}: prompt too large for its tokens/min limit")
                 continue
             # attempt 0 is the first try; attempts 1..LLM_RETRIES are same-client
             # retries of a transient failure. LLM_RETRIES=0 -> exactly today's
@@ -518,8 +673,12 @@ class LLMRouter:
                     last_error = last_error or LLMError(f"{client.label}: rate budget {why}")
                     break
                 try:
-                    content = await client.complete(system, user)
-                    return extract_json(content), client.label
+                    content = await client.complete(system, user, max_tokens=max_tokens)
+                    data = extract_json(content)
+                    if not isinstance(data, dict):
+                        raise _Retriable(f"{client.label} returned JSON that is not an object",
+                                         transient=False)
+                    return data, client.label
                 except (_Retriable, httpx.TimeoutException, httpx.TransportError) as exc:
                     last_error = exc
                     transient = getattr(exc, "transient", True)

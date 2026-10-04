@@ -105,8 +105,9 @@ GET /api/v1/analyze/{job_id}  ◀── clients poll for the result
   to file + line for inline PR comments.
 - **PR-level review in files mode.** The model is asked what the *change* newly introduces,
   over the unified diff and each changed function before and after, with leads (guard_diff,
-  permissive Semgrep, sensitive sinks on added lines) to focus attention; it can ask for code
-  defined elsewhere in the PR, and every candidate is re-judged by a separate verifier call
+  permissive Semgrep, sensitive sinks on added lines) to focus attention; it may ask for code
+  defined elsewhere in the PR (the option exists, but the model made no such request in the
+  160 scored PRs of the dev run), and every candidate is re-judged by a separate verifier call
   before it is reported. See [PR-level review](#pr-level-review-files-mode).
 
 ---
@@ -402,7 +403,8 @@ reviewer reads one, not function by function:
 4. **Context loop**: instead of answering, the model may send `{"need_context": [{"symbol",
    "file", "want": "definition|callers"}]}`; symbols are resolved from the PR's own files,
    appended and the audit re-asked (≤ `PR_REVIEW_CONTEXT_ROUNDS`, ≤
-   `PR_REVIEW_CONTEXT_MAX_TOKENS`, stops early when nothing new resolves).
+   `PR_REVIEW_CONTEXT_MAX_TOKENS`, stops early when nothing new resolves). In the 160 scored
+   PRs of the dev run the model never used it (0 context requests).
 5. **Validation + filters**: the quote must be in the NEW file (searched near the claimed line
    first; diff markers tolerated), then regex hard exclusions (DoS, rate limiting, resource
    leaks, memory safety outside C/C++, docs, tests) and the audit-confidence floor.

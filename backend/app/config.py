@@ -136,9 +136,11 @@ class Settings(BaseSettings):
     # One verifier call per candidate finding, at most this many per scan.
     PR_REVIEW_MAX_VERIFIER_CALLS: int = 8
     # A finding is reported only when the verifier confirms it with at least
-    # this confidence (1-10). 7 is where the verifier prompt's own scale starts
-    # "likely a real vulnerability" (7-10), so the cutoff matches what the model
-    # is told the numbers mean; it is not tuned on the eval set.
+    # this confidence (1-10). 7 was chosen to match the verifier prompt's own
+    # scale (7-10 = "likely a real vulnerability"), so the cutoff means what the
+    # model is told the numbers mean. The dev-set policy curve (confirmed >= k,
+    # run_pr_eval) already existed when it was chosen, so the dev numbers are
+    # not an independent check of it: the held-out test split is.
     PR_REVIEW_MIN_CONFIDENCE: int = 7
     # Candidates the audit itself rates below this (1-10) are not verified.
     PR_REVIEW_MIN_AUDIT_CONFIDENCE: int = 5

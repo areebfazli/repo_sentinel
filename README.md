@@ -23,9 +23,12 @@ How a review works:
      code): known vulnerable code from public CVEs (published security bugs) and the team's
      own past review comments.
 3. **Audit the whole PR with an LLM** (a large language model). It asks "what does this change
-   newly make exploitable?" and can request more code from the PR before it answers.
+   newly make exploitable?" It may ask for more code from the PR before it answers (the
+   option exists, but the model never used it in the 160-PR eval run).
 4. **Double-check every finding.** Each candidate goes to a separate verifier call. Only
-   findings confirmed with high confidence are reported.
+   findings confirmed with high confidence are reported. A candidate the verifier can't
+   confirm, at a spot where the change provably removed a security check, is listed
+   separately as "worth a look"; it never fails the check.
 5. **Report.** It posts inline comments on the PR and can fail the check when a finding is
    severe enough.
 
@@ -44,10 +47,10 @@ job API, and a small **web dashboard** for pasting code by hand.
 | What was measured | Result | Sample |
 |---|---|---|
 | Similarity search alone | Can't tell a bug from its fix: precision 0.5 (a coin flip) at every threshold. A function and its fixed version embed at cosine 0.96-0.998. | 1,054 eval functions |
-| Old design: LLM reviews each changed function on its own | Caught about **1 in 8** real bugs on the right lines | 8 bug/fix pairs + 13 ordinary functions |
+| Old design: LLM reviews each changed function on its own | Caught **1 of 8** real bugs on the right lines (95% CI 2-47%) | 8 bug/fix pairs + 13 ordinary functions; a different, much smaller test than the PR-level row, so not directly comparable |
 | Static checks only (Semgrep + guard-removal check), best case | Reach **23%** of bugs at a **4%** false-alarm rate on benign changes | 502 held-out bug/fix pairs |
 | Guard-removal "alert" tier alone | Fires on **3%** of bugs, **0** false alarms measured | 506 pairs + 994 benign edits |
-| **Current design: PR-level review** (preliminary) | Reported findings (after the verifier): catches **22%** (12/55) of bug-introducing PRs on the right lines; wrongly flags **3.5%** (2/57) of fix PRs and **0 of 48** benign PRs. Audit candidates before the verifier: **53%** (29/55) caught, 7% of fix PRs and 4.2% (2/48) of benign PRs flagged. | 160 of 200 dev PRs scored |
+| **Current design: PR-level review** (preliminary; measured with the previous configuration, see below) | Reported findings (after the verifier): catches **12/55** bug-introducing PRs on the exact lines and **16/55** within the changed function; **16/41** within the function when denial-of-service and timing bugs (which the prompt doesn't target) are left out. Wrongly flags **2/57** fix PRs and **0/48** benign PRs. Audit candidates before the verifier: **35/55** caught within the function, 4/57 fix and 2/48 benign PRs flagged. | 160 of 200 dev PRs scored: 55 of 60 bug-introducing, 57 of 60 fix, only 48 of 80 benign |
 
 What this means:
 
@@ -57,11 +60,18 @@ What this means:
   the LLM, not as the verdict.
 - The PR-level numbers come from a partial run on a dev sample built from real CVE fix commits
   (each fix reversed gives a bug-introducing PR), using the free Qwen 3.8 27B model through
-  OpenRouter. Treat them as preliminary until the run, the benign false-alarm rate and the
-  held-out test split are done.
-- The verifier trades recall for quiet: it removes every benign false alarm seen so far but
-  also drops more than half of the real catches (53% -> 22%). Tuning that trade-off is the
-  next step.
+  OpenRouter, with temperature 0, the old verifier prompt and a confidence cutoff of 8. The
+  current defaults differ (Qwen's recommended sampling 1.0 / 0.95 / top_k 20, a rewritten
+  verifier prompt, cutoff 7, 12K-token prompts). **A rerun with the current defaults is
+  pending**, and so is the held-out test split.
+- The benign PRs are files that changed alongside security fixes in the same commits, not
+  ordinary PRs. Only 48 of the 80 were scored: if all 32 unknown ones were flagged, the
+  false-alarm rate would be 32/80. The 0/48 also rests on the cutoff of 8: one benign PR
+  (pypiserver) was confirmed at confidence 7, so the same verdicts at today's cutoff of 7
+  would give 1/48.
+- The verifier trades recall for quiet: within the changed function it keeps 16 of the 35
+  catches the audit made, and removes both benign false alarms and 2 of the 4 fix-PR alarms.
+  Tuning that trade-off is the next step.
 
 Other facts worth knowing: the CVE corpus holds 2,890 vulnerable/fixed code pairs (25
 handwritten, the rest mined from real fix commits of PyPI and npm advisories). Code is
@@ -99,7 +109,7 @@ cp .env.example .env                 # fill in keys; defaults to ENVIRONMENT=dev
 | Key | Needed? | Used for |
 |---|---|---|
 | `OPENROUTER_API_KEY` | Yes (primary provider; startup fails without it) | The LLM review. Free models need "allow free endpoints that may train on inputs" in OpenRouter's privacy settings. |
-| `GROQ_API_KEY` | Recommended | Fallback when OpenRouter's free pool rate-limits (it often does). Skipped with a warning if missing. |
+| `GROQ_API_KEY` | Recommended | Fallback when OpenRouter's free pool rate-limits (it often does). Groq's free tier only fits prompts up to ~7.5K tokens, so it backs up the smaller calls; for a Groq-only setup set `PR_REVIEW_MAX_PROMPT_TOKENS=6000`. Skipped with a warning if missing. |
 | `GITHUB_TOKEN` | Optional | Crawling a real repo's past review comments into Team Memory. |
 | `REPOSENTINEL_API_KEY` | Optional in development, required in production | Shared secret clients send as `X-RepoSentinel-Key`. |
 

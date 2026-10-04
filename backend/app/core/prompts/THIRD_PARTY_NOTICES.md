@@ -25,7 +25,9 @@ Modifications: rewritten for RepoSentinel's JSON schema and nonce-tagged
 untrusted-data blocks; tool-based repository exploration replaced by a bounded
 context-request protocol; precedents narrowed to Python / JavaScript web code;
 the DoS rule no longer covers regex DoS, open redirects are not excluded, test
-and documentation files are excluded by path.
+and documentation files are excluded by path; the timing-attack exclusion is
+narrowed to theoretical side channels (removing an existing constant-time
+comparison of a secret is reportable).
 
 ```
 MIT License
@@ -70,8 +72,14 @@ The repository ships no NOTICE file.
 Modifications (RepoSentinel, 2026): the guidance was condensed and reworded
 into system-prompt text for single LLM calls without tools (the audit prompt's
 METHOD section and the verifier prompt's ESTABLISH FROM THE CODE SHOWN
-section), the verdict categories were renamed to confirmed / rejected /
-uncertain, and a JSON output schema was added.
+section, and the rule to reject only when the evidence shown positively
+defeats the claim), the verdict categories were renamed to confirmed /
+rejected / uncertain, and a JSON output schema was added.
+
+Not from either project: the verifier prompt's THREAT MODEL section (library /
+framework public APIs as attack surface, removed security controls as
+regression evidence, no rejection decided by an assumed library default) and
+the confidence-scale wording are RepoSentinel's own text.
 
 ```
 

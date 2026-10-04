@@ -161,7 +161,7 @@ def test_dedupe_key_matches_the_units_review_for_the_same_line():
 ])
 def test_verifier_keeps_only_confident_confirmations(verdict, kept, status):
     router = PRRouter(audits=[{"findings": [TRAVERSAL]}], verdict=verdict)
-    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router, min_confidence=7)
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router)
     assert bool(result["report_findings"]) is kept
     assert [c["status"] for c in result["candidates"]] == [status]
     assert result["review_status"] == "complete"
@@ -173,6 +173,12 @@ def test_min_confidence_is_configurable():
     result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router, min_confidence=8)
     assert result["report_findings"] == []
     assert result["candidates"][0]["status"] == "below_min_confidence"
+
+
+def test_default_min_confidence_matches_the_verifier_scale():
+    # The verifier prompt says 7-10 = likely a real vulnerability.
+    assert settings.PR_REVIEW_MIN_CONFIDENCE == 7 == PRReviewConfig().min_confidence
+    assert "7-10 likely a real vulnerability" in VERIFIER_SYSTEM_PROMPT
 
 
 @pytest.mark.parametrize("value,expected", [
@@ -650,6 +656,27 @@ def test_third_party_notices_are_present():
     assert "END OF TERMS AND CONDITIONS" in notices and "Modifications" in notices
     header = (root / "pr_audit.py").read_text()[:3000]
     assert "THIRD_PARTY_NOTICES.md" in header and "vulnhuntr" in header
+
+
+def test_verifier_prompt_framing_is_evidence_based():
+    v = VERIFIER_SYSTEM_PROMPT
+    assert "Most candidates are false positives" not in v
+    assert "reject only when the code shown positively defeats the claim" in v
+    # Library threat model, regression evidence, no rejection on assumed defaults.
+    assert "public API" in v and "attacker-controlled from the library's point of view" in v
+    assert "Removed security controls" in v and "moved to a caller" in v
+    assert "assumed default" in v
+    # Confidence = likelihood of a real vulnerability, not certainty in the verdict.
+    assert "NOT how sure you are of the verdict" in v
+
+
+def test_timing_exclusion_is_only_for_theoretical_side_channels():
+    for prompt in (AUDIT_SYSTEM_PROMPT, VERIFIER_SYSTEM_PROMPT):
+        assert "race conditions or timing attacks" not in prompt
+        assert "constant-time comparison" in prompt
+    finding = {"file_path": "app/auth.py", "title": "Timing attack on token comparison",
+               "explanation": "hmac.compare_digest was replaced by == on the API token"}
+    assert hard_exclusion_reason(finding) is None
 
 
 # --- through run_scan ---------------------------------------------------------------

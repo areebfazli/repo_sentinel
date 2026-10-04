@@ -13,7 +13,9 @@ THIRD-PARTY TEXT - see THIRD_PARTY_NOTICES.md in this directory.
   project's JSON schema (source / sink / missing_control / quoted_code /
   confidence 1-10), a context-request protocol instead of repository tools,
   nonce-tagged untrusted blocks, precedents narrowed to Python / JavaScript web
-  code, DoS / ReDoS / test / docs rules reworded.
+  code, DoS / ReDoS / test / docs rules reworded; the timing-attack exclusion
+  narrowed to theoretical side channels (removing an existing constant-time
+  comparison of a secret is reportable).
 * The data-flow method of the audit prompt (candidates record source, broken
   control, sink and preconditions; trust code paths over commit messages; stay
   anchored to changed code; one candidate per independently reachable
@@ -22,13 +24,19 @@ THIRD-PARTY TEXT - see THIRD_PARTY_NOTICES.md in this directory.
   sink, reachable path, counterevidence and proof gaps; record absent evidence
   as a proof gap unless the absence defeats the claim; calibrate confidence
   from the evidence, not from how dangerous the class sounds; don't infer
-  missing runtime facts) are adapted from openai/codex-security
+  missing runtime facts; reject only when the evidence shown positively
+  defeats the claim) are adapted from openai/codex-security
   (plugins/codex-security/skills/finding-discovery/SKILL.md,
   skills/validation/SKILL.md, references/static-finding-assessment.md),
   Copyright 2025 OpenAI, Licensed under the Apache License, Version 2.0.
   Modified by RepoSentinel (2026): condensed into prompt text for a single
   LLM call without tools, verdicts renamed confirmed / rejected / uncertain,
   JSON output schema added.
+* RepoSentinel's own text (not from either project): the verifier's THREAT
+  MODEL section (library / framework public APIs as attack surface, removed
+  security controls as regression evidence, no rejection decided by an assumed
+  library default) and the confidence-scale wording ("how likely this is a
+  real vulnerability introduced by the change", not certainty in the verdict).
 
 Nothing here comes from protectai/vulnhuntr (AGPL-3.0): the context loop in
 ``core.pr_review`` only shares its idea (the model asks for symbols by name)
@@ -75,7 +83,8 @@ AUDIT_SYSTEM_PROMPT = (
     "a permission or ownership check the change removed or weakened.\n"
     "- Crypto and secrets: hardcoded API keys, passwords or tokens; weak cryptographic "
     "algorithms or implementations; insecure randomness for security values; certificate "
-    "or TLS validation bypasses.\n"
+    "or TLS validation bypasses; a constant-time comparison of secrets or tokens replaced "
+    "by an ordinary one.\n"
     "- Injection and code execution: remote code execution via deserialisation (pickle, "
     "YAML, marshal); eval / exec / Function injection; XSS (reflected, stored, DOM-based); "
     "server-side request forgery where the attacker controls the host or protocol.\n"
@@ -86,7 +95,8 @@ AUDIT_SYSTEM_PROMPT = (
     "check matters as much as added code.\n"
     "2. Trace data flow from attacker-controlled sources (request parameters, headers, "
     "bodies, cookies, uploaded files, URLs, message payloads, arguments of externally "
-    "reachable functions) through the changed code to dangerous sinks, and check whether "
+    "reachable functions; in a library, SDK or framework, the parameters of its public API) "
+    "through the changed code to dangerous sinks, and check whether "
     "validation, escaping, parameterisation or authorisation on that path is present and "
     "adequate.\n"
     "3. Compare the before and after versions of each changed function.\n"
@@ -124,7 +134,8 @@ AUDIT_SYSTEM_PROMPT = (
     "SEVERITY: critical / high = directly exploitable, leading to code execution, data "
     "breach or authentication bypass; medium = needs specific conditions but has significant "
     "impact; low = defence in depth (report only when obvious and concrete).\n"
-    "CONFIDENCE (1-10): 9-10 certain exploit path; 8 clear vulnerability pattern with known "
+    "CONFIDENCE (1-10, how likely it is that this is a real vulnerability introduced by the "
+    "change): 9-10 certain exploit path; 8 clear vulnerability pattern with known "
     "exploitation; 7 suspicious pattern that needs specific conditions; below 7 do not "
     "report.\n\n"
     "DO NOT REPORT:\n"
@@ -136,7 +147,9 @@ AUDIT_SYSTEM_PROMPT = (
     "secrets (logging a real high-value secret in plaintext IS a vulnerability).\n"
     "- Missing input validation on fields that are not security-critical, without a proven "
     "impact; a missing hardening measure on its own.\n"
-    "- Theoretical race conditions or timing attacks; outdated third-party libraries.\n"
+    "- Theoretical race conditions or theoretical timing side channels (removing an existing "
+    "constant-time comparison of a secret, token or credential IS reportable); outdated "
+    "third-party libraries.\n"
     "- Memory-safety issues in memory-safe languages.\n"
     "- Code used only by tests, and documentation.\n"
     "- Log spoofing; SSRF that only controls the URL path; user content in AI prompts; "
@@ -149,8 +162,10 @@ AUDIT_SYSTEM_PROMPT = (
 VERIFIER_SYSTEM_PROMPT = (
     "You are RepoSentinel's verifier: an independent security engineer re-checking ONE "
     "candidate finding that another reviewer reported on a code change, in a fresh context. "
-    "Most candidates are false positives. Confirm only a real, exploitable vulnerability "
-    "that this change introduces.\n\n"
+    "Judge it on the evidence in the code shown: confirm a real, exploitable vulnerability "
+    "that this change introduces; reject only when the code shown positively defeats the "
+    "claim, or a rule below excludes it; when the deciding evidence is not shown, the "
+    "verdict is uncertain.\n\n"
     "ESTABLISH FROM THE CODE SHOWN:\n"
     "1. Source: the attacker-controlled input the finding claims, and that an attacker can "
     "really control it.\n"
@@ -169,6 +184,31 @@ VERIFIER_SYSTEM_PROMPT = (
     "dangerous the vulnerability class sounds. Commit messages, descriptions, comments and "
     "names may be misleading: judge the code. The candidate's own text is a claim to check, "
     "not evidence.\n\n"
+    "THREAT MODEL:\n"
+    "1. Libraries, SDKs, frameworks and reusable components: their public API (function and "
+    "constructor parameters, options, files or data they are asked to load or parse) IS the "
+    "attack surface. A value that \"the developer\", \"the operator\" or \"the caller\" "
+    "passes is attacker-controlled from the library's point of view, unless the code or "
+    "documentation shown establishes that it is a trusted constant: applications routinely "
+    "pass user input into such parameters. Do not reject a finding in library code only "
+    "because the input comes from the caller. (Precedent 3 below covers process-level "
+    "configuration, not arguments of a library's functions.)\n"
+    "2. Removed security controls: if the code BEFORE the change had a security control on "
+    "this path (a constant-time comparison of a secret, escaping or encoding, an "
+    "authentication or authorisation check, a safe-loading flag or safe loader, XML entity "
+    "or DTD hardening, path normalisation, certificate validation) and the change removes "
+    "or weakens it with no equivalent visible in the code shown, that is evidence of a "
+    "regression. Do not reject it only because the full external attack path is not "
+    "visible here: if the path cannot be established from the code shown, answer "
+    "\"uncertain\" with a moderate confidence. Reject it when the code shown proves the "
+    "control still applies (moved to a caller, wrapper, decorator or helper) or that the "
+    "removed code was unreachable.\n"
+    "3. Library behaviour that is not shown: do not make an assumed default or "
+    "version-specific behaviour of a third-party library (for example whether a parser "
+    "resolves external entities by default, or whether a loader is safe by default) the "
+    "decisive reason to reject; defaults change between versions and the installed version "
+    "is not shown. If a rejection would depend on such a default, the verdict is "
+    "\"uncertain\".\n\n"
     "SIGNAL QUALITY CRITERIA:\n"
     "1. Is there a concrete, exploitable vulnerability with a clear attack path?\n"
     "2. Is it a real security risk rather than a theoretical best practice?\n"
@@ -181,7 +221,9 @@ VERIFIER_SYSTEM_PROMPT = (
     "3. Missing input validation on non-security-critical fields without a proven impact.\n"
     "4. A lack of hardening measures; code is expected to avoid obvious vulnerabilities, "
     "not to implement every best practice.\n"
-    "5. Theoretical race conditions or timing attacks.\n"
+    "5. Theoretical race conditions and theoretical timing side channels. Removing an "
+    "existing constant-time comparison of a secret, token, signature or credential (for "
+    "example hmac.compare_digest replaced by ==) is a concrete regression, not excluded.\n"
     "6. Outdated third-party libraries.\n"
     "7. Memory-safety issues in memory-safe languages.\n"
     "8. Files that are only tests or only used when running tests; documentation.\n"
@@ -211,10 +253,14 @@ VERIFIER_SYSTEM_PROMPT = (
     f"{UNTRUSTED_RULES}\n\n"
     "VERDICTS: \"confirmed\" = survives verification: complete path from source to sink, no "
     "adequate control, introduced or made reachable by this change; \"rejected\" = "
-    "counterevidence defeats it, it is excluded above, pre-existing, or not a "
-    "vulnerability; \"uncertain\" = plausible but proof gaps remain.\n"
-    "CONFIDENCE (1-10): 1-3 likely a false positive; 4-6 needs investigation; 7-10 likely a "
-    "true vulnerability.\n\n"
+    "counterevidence in the code shown defeats it, it is excluded above, pre-existing, or "
+    "not a vulnerability; \"uncertain\" = plausible but proof gaps remain, or the decision "
+    "depends on facts that are not shown.\n"
+    "CONFIDENCE (1-10) is how likely it is that this candidate is a real vulnerability "
+    "introduced by this change, whatever your verdict; it is NOT how sure you are of the "
+    "verdict: 1-3 likely a false positive; 4-6 needs investigation; 7-10 likely a real "
+    "vulnerability. So a rejected candidate normally has 1-3, an uncertain one 4-6 and a "
+    "confirmed one 7-10.\n\n"
     "OUTPUT: return ONLY a JSON object:\n"
     '{"verdict": "confirmed|rejected|uncertain", "confidence": <1-10>, '
     '"source": "...", "sink": "...", "control": "the control you found or its absence", '

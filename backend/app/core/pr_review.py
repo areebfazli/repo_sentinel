@@ -119,12 +119,12 @@ class PRReviewConfig:
     """Knobs of one PR review; ``from_settings`` reads them from Settings
     (the eval can override any of them)."""
 
-    max_prompt_tokens: int = 6000
+    max_prompt_tokens: int = 12000
     max_audit_calls: int = 4
     context_rounds: int = 2
     context_max_tokens: int = 1500
     max_verifier_calls: int = 8
-    min_confidence: int = 8
+    min_confidence: int = 7
     min_audit_confidence: int = 5
     semgrep_lead_min_severity: str = "low"
     semgrep_min_severity: str = "high"

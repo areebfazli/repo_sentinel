@@ -115,9 +115,15 @@ class Settings(BaseSettings):
     # candidate. "units": the older per-function review (review_plan), kept for
     # comparison. Snippet mode always uses the per-unit review.
     REVIEW_MODE: str = "pr"                   # pr | units
-    # Audit prompt budget (estimated tokens, like LLM_MAX_PROMPT_TOKENS); 6000
-    # keeps one call + its answer under Groq's free-tier 8K tokens/min.
-    PR_REVIEW_MAX_PROMPT_TOKENS: int = 6000
+    # Audit (and verifier) prompt budget, estimated tokens like
+    # LLM_MAX_PROMPT_TOKENS. 12000: the PR-level numbers were measured with it
+    # (6000 left 29 of 200 eval PRs partial). The primary, OpenRouter's free
+    # models, has no tokens-per-minute cap; Groq's free tier (~8K tokens/min per
+    # model, the fallback) can never take a prompt this size, so the router skips
+    # a Groq client for a prompt that leaves no output room under its
+    # LLM_TPM_LIMITS entry (falls through) instead of sending a doomed request.
+    # Smaller prompts still use Groq as before.
+    PR_REVIEW_MAX_PROMPT_TOKENS: int = 12000
     # All audit calls of a scan, context rounds included. A PR too big for one
     # prompt is split by file into several audit prompts; files beyond this
     # budget are listed as not reviewed ("budget").
@@ -130,8 +136,10 @@ class Settings(BaseSettings):
     # One verifier call per candidate finding, at most this many per scan.
     PR_REVIEW_MAX_VERIFIER_CALLS: int = 8
     # A finding is reported only when the verifier confirms it with at least
-    # this confidence (1-10).
-    PR_REVIEW_MIN_CONFIDENCE: int = 8
+    # this confidence (1-10). 7 is where the verifier prompt's own scale starts
+    # "likely a real vulnerability" (7-10), so the cutoff matches what the model
+    # is told the numbers mean; it is not tuned on the eval set.
+    PR_REVIEW_MIN_CONFIDENCE: int = 7
     # Candidates the audit itself rates below this (1-10) are not verified.
     PR_REVIEW_MIN_AUDIT_CONFIDENCE: int = 5
     # Semgrep hits at/above this severity are shown to the audit as LEADS

@@ -47,8 +47,7 @@ job API, and a small **web dashboard** for pasting code by hand.
 | Old design: LLM reviews each changed function on its own | Caught about **1 in 8** real bugs on the right lines | 8 bug/fix pairs + 13 ordinary functions |
 | Static checks only (Semgrep + guard-removal check), best case | Reach **23%** of bugs at a **4%** false-alarm rate on benign changes | 502 held-out bug/fix pairs |
 | Guard-removal "alert" tier alone | Fires on **3%** of bugs, **0** false alarms measured | 506 pairs + 994 benign edits |
-| **Current design: PR-level review** (preliminary) | Reported findings (after the verifier): catches **16%** (6/38) of bug-introducing PRs on the right lines. Audit candidates before the verifier: **50%** (19/38). Both wrongly flag **2.4%** (1/42) of PRs that fix the bug. | 80 of 200 dev PRs scored so far |
-| Benign-PR false-alarm rate | _pending — run in progress_ | ordinary PRs from the same repos |
+| **Current design: PR-level review** (preliminary) | Reported findings (after the verifier): catches **22%** (12/55) of bug-introducing PRs on the right lines; wrongly flags **3.5%** (2/57) of fix PRs and **0 of 48** benign PRs. Audit candidates before the verifier: **53%** (29/55) caught, 7% of fix PRs and 4.2% (2/48) of benign PRs flagged. | 160 of 200 dev PRs scored |
 
 What this means:
 
@@ -60,9 +59,9 @@ What this means:
   (each fix reversed gives a bug-introducing PR), using the free Qwen 3.8 27B model through
   OpenRouter. Treat them as preliminary until the run, the benign false-alarm rate and the
   held-out test split are done.
-- The verifier currently throws away two thirds of the real catches (50% -> 16%) without a
-  measured drop in false alarms on fix PRs. Tuning it is the next step once the benign
-  false-alarm rate is in.
+- The verifier trades recall for quiet: it removes every benign false alarm seen so far but
+  also drops more than half of the real catches (53% -> 22%). Tuning that trade-off is the
+  next step.
 
 Other facts worth knowing: the CVE corpus holds 2,890 vulnerable/fixed code pairs (25
 handwritten, the rest mined from real fix commits of PyPI and npm advisories). Code is

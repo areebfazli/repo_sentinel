@@ -281,6 +281,22 @@ def test_one_pr_run_scores_audit_only_and_verified():
     assert ops["verifier_rejection_reasons_heuristic"] == {"control_present": 1}
 
 
+def test_funnel_records_bad_output_and_counts_confirmed_as_reported():
+    # A verifier answer with no verdict: the candidate is unverified (bad_output).
+    rec, _ = _run(intro_item(), "pr", StubLLM(audit={"findings": [TRAVERSAL]},
+                                              verdict={"note": "no verdict here"}))
+    assert rec["pr_review"]["bad_output"] == 1
+    ops = R.operational_metrics([rec], "pr")
+    assert ops["funnel"]["bad_output"] == 1 and ops["funnel"]["unverified"] == 1
+    # A record from before the stats partitioned the candidates: its "confirmed"
+    # also counted the below-cutoff confirmation; the funnel counts reported only.
+    old, _ = _run(intro_item(), "pr", StubLLM(audit={"findings": [TRAVERSAL]}))
+    old["pr_review"].update(confirmed=2, below_min_confidence=1)
+    old["candidates"].append({**old["candidates"][0], "status": "below_min_confidence"})
+    funnel = R.operational_metrics([old], "pr")["funnel"]
+    assert (funnel["confirmed"], funnel["below_min_confidence"]) == (1, 1)
+
+
 def test_confirmed_finding_is_a_localised_tp_in_both_views():
     rec, _ = _run(intro_item(), "pr", StubLLM(audit={"findings": [TRAVERSAL]}))
     R.attach_outcomes([rec], 2)

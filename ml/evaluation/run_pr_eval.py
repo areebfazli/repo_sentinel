@@ -751,7 +751,7 @@ def view_findings(result: dict, arm: str) -> dict[str, list[dict]]:
 STAT_KEYS = ("audit_calls", "audit_prompts_planned", "verifier_calls", "context_rounds_used",
              "context_requested", "context_resolved", "candidates", "quote_not_found",
              "hard_excluded", "below_audit_confidence", "verified", "confirmed", "rejected",
-             "uncertain", "below_min_confidence", "unverified", "files_total",
+             "uncertain", "below_min_confidence", "unverified", "bad_output", "files_total",
              "files_reviewed", "leads")
 
 
@@ -1298,6 +1298,20 @@ def reason_bucket(text: str | None) -> str:
     return "other" if t else "no_reason"
 
 
+def funnel_stats(rec: dict) -> dict:
+    """The record's ``pr_review`` stats with ``confirmed`` = reported findings
+    (candidates with status "confirmed"), the meaning ``run_pr_review`` gives it
+    now. Runs recorded before the stats partitioned the candidates counted
+    every confirmed verdict there, below_min_confidence ones included; the
+    candidate statuses were partitioned all along, so counting them gives one
+    meaning for old and new results alike."""
+    stats = dict(rec.get("pr_review") or {})
+    cands = rec.get("candidates")
+    if cands is not None:
+        stats["confirmed"] = sum(1 for c in cands if c.get("status") == "confirmed")
+    return stats
+
+
 def operational_metrics(records: list[dict], arm: str) -> dict:
     """Cost, coverage and funnel over the scored records."""
     recs = [r for r in records if scored(r)]
@@ -1324,11 +1338,12 @@ def operational_metrics(records: list[dict], arm: str) -> dict:
         out["calls_by_role"] = dict(roles)
         funnel = Counter()
         for r in recs:
+            stats = funnel_stats(r)
             for k in ("candidates", "quote_not_found", "hard_excluded", "below_audit_confidence",
                       "confirmed", "rejected", "uncertain", "below_min_confidence",
-                      "unverified", "context_rounds_used", "context_requested",
+                      "unverified", "bad_output", "context_rounds_used", "context_requested",
                       "context_resolved", "audit_calls", "verifier_calls"):
-                funnel[k] += (r.get("pr_review") or {}).get(k) or 0
+                funnel[k] += stats.get(k) or 0
         out["funnel"] = dict(funnel)
         out["context"] = {
             "rounds_used": funnel["context_rounds_used"],

@@ -139,8 +139,9 @@ can still be overridden there. Highlights:
 | `LLM_MAX_CVES_PER_UNIT` | `2` | Retrieved CVE matches shown per unit (team matches likewise); `0` also skips retrieval (and its embedding cost) entirely |
 | `SEMGREP_ENABLED` / `SEMGREP_MIN_SEVERITY` | `True` / `high` | Static-analysis evidence for the review (see below); a missing engine only logs a warning |
 | `REVIEW_MODE` | `pr` | Files mode: `pr` = PR-level audit + verification (below); `units` = the per-function review (kept for comparison). Snippet mode always uses the per-unit review |
-| `PR_REVIEW_MAX_PROMPT_TOKENS` / `PR_REVIEW_MAX_AUDIT_CALLS` / `PR_REVIEW_CONTEXT_ROUNDS` / `PR_REVIEW_CONTEXT_MAX_TOKENS` | `12000` / `4` / `2` / `1500` | Audit budget: prompt size (estimated tokens, incl. the context reserve; also the verifier prompt's size; a prompt too big for Groq's 8K tokens/min skips the Groq clients), audit calls per scan (context rounds included; a PR too big for one prompt is split by file), extra rounds answering the model's context requests, tokens of requested context per prompt |
+| `PR_REVIEW_MAX_PROMPT_TOKENS` / `PR_REVIEW_MAX_AUDIT_CALLS` / `PR_REVIEW_CONTEXT_ROUNDS` / `PR_REVIEW_CONTEXT_MAX_TOKENS` | `12000` / `4` / `2` / `1500` | Audit budget: prompt size (estimated tokens, incl. the context reserve; also the verifier prompt's size; a prompt too big for Groq's 8K tokens/min skips the Groq clients, so with Groq as the only provider set `6000`, see [the Groq limitation](#notes--gotchas)), audit calls per scan (context rounds included; a PR too big for one prompt is split by file), extra rounds answering the model's context requests, tokens of requested context per prompt |
 | `PR_REVIEW_MAX_VERIFIER_CALLS` / `PR_REVIEW_MIN_CONFIDENCE` / `PR_REVIEW_MIN_AUDIT_CONFIDENCE` | `8` / `7` / `5` | One verifier call per candidate, at most this many; a finding is reported only when confirmed with confidence ≥ 7/10; candidates the audit itself rates below 5 are not verified. An unverified candidate is not reported and makes the review `partial` |
+| `PR_REVIEW_MAX_SUGGESTIONS` / `PR_REVIEW_SUGGEST_MIN_CONFIDENCE` | `5` / `4` | The non-blocking "worth a look" tier (below): at most this many per scan (`0` = off), verifier confidence needed. Never findings, never gating |
 | `PR_REVIEW_SEMGREP_LEAD_MIN_SEVERITY` / `PR_REVIEW_SINK_LEADS` / `PR_REVIEW_HARD_EXCLUSIONS` | `low` / `True` / `True` | Semgrep hits shown as leads (marked "lead only" below `SEMGREP_MIN_SEVERITY`), sensitive-sink leads on added lines, regex hard exclusions before verification |
 | `PR_REVIEW_FIX_EXAMPLES` / `VERIFIER_MODEL` | `0` / (none) | Retrieved "how a similar bug was fixed" examples in the audit prompt (off); `<provider>:<model>` tried first for verifier calls (the normal chain stays the fallback; each finding records `verifier`) |
 | `REPOSENTINEL_API_KEY` | (none) | `X-RepoSentinel-Key` header, optional in dev, required in production |
@@ -164,7 +165,9 @@ LLM wording, so CWE / title drift between runs updates the same comment. Finding
 posted under an old marker is adopted and updated in place instead of deleted and re-posted
 (one whose CWE / title had already drifted can't be matched and is replaced once). It also
 posts a summary comment and applies a configurable severity gate. Finding text is escaped
-before it is posted.
+before it is posted. The PR review's non-blocking "worth a look" items
+(`review_suggestions`) appear only in the summary comment (the server's report section plus
+a count line): no inline comments, never part of either gate.
 
 The job result also carries the review's inputs and coverage: `static_analysis` (Semgrep
 evidence), `guard_diff` (units whose diff removed or added a guard), `llm_calls`,
@@ -409,13 +412,43 @@ reviewer reads one, not function by function:
    Python / JS web code (React XSS only via `dangerouslySetInnerHTML`, no SSRF / path traversal
    in client-side JS, env vars trusted, ReDoS only with an attacker-controlled pattern, ...).
    Kept only if `confirmed` with confidence ≥ `PR_REVIEW_MIN_CONFIDENCE`.
+7. **Worth a look (not blocking)**: the verifier prompt answers `uncertain` when the change
+   removes an existing security control but the attack path isn't visible, so such
+   regressions were never reported. A candidate becomes a `review_suggestions` item (status
+   `review_suggested`) only when the verdict is `uncertain` or `confirmed` below the cutoff,
+   the verifier's confidence is ≥ `PR_REVIEW_SUGGEST_MIN_CONFIDENCE` (4), and deterministic
+   evidence shows the change removed a control at that spot: guard_diff reports
+   `guard_removed` with a removed / weakened change in the candidate's unit, or the verifier's
+   optional `removed_control_quote` is found (whitespace-insensitive, diff markers tolerated)
+   in the OLD file within 40 lines of the candidate, on lines the patch deletes, and in no
+   file's NEW content (a moved control fails). A claim that doesn't check out never
+   qualifies; `rejected` / unverified never do. At most `PR_REVIEW_MAX_SUGGESTIONS` (5).
+   They get their own "👀 Worth a look (not blocking)" report section (escaped like
+   findings; an otherwise clean report keeps its ✅ heading) and are never in
+   `report_findings`, `is_vulnerable` or any gate.
 
 Deterministic guard_diff alerts, Semgrep evidence, `review_status` and `units_not_reviewed`
 work as in the per-unit review. The result adds `review_mode`, a `pr_review` block (audit /
-verifier calls, context rounds and requests, candidates → excluded / rejected / confirmed,
-estimated prompt tokens) and per-finding `taint_source`, `sink`, `missing_control`,
+verifier calls, context rounds and requests, candidates → excluded / rejected / uncertain /
+below the cutoff / `review_suggested` / confirmed, which partition the candidates; estimated
+prompt tokens), `review_suggestions` (file / line, title, the removed control's old code,
+`evidence`: `verifier_quote` and / or `guard_diff`, verdict, confidence, the verifier's reason)
+and per-finding `taint_source`, `sink`, `missing_control`,
 `exploit_scenario`, `confidence`, `audit_confidence`, `verifier` (all optional; the Action and
-dashboard ignore fields they don't know). `review_pr(files, router, ...)` runs the whole stage
+dashboard ignore fields they don't know). Report findings are not rows of the `findings`
+table (that holds retrieval matches for feedback); they and the review suggestions live in
+the scan's `result_json`.
+
+**Answer format checks.** Every audit / verifier call passes its schema check
+(`audit_schema_problem`, `verifier_schema_problem`; the per-unit review
+`units_schema_problem`) to `LLMRouter.generate(..., validate=...)`. The answer is the LAST
+JSON object in the reply that passes it (`extract_json`: a trailing example / note object
+or an unclosed brace / quote in reasoning prose no longer hides the answer; nothing nested in
+a cut-off object is ever returned); a reply with none is a bad-output failure of that client
+and the next model / provider in the chain answers instead. If every client fails that way
+the `LLMError` has `bad_output` set and the units are `not_reviewed` (reason `bad_output`) or
+the candidate `unverified`, never "reviewed, no findings". The checks also run after the call
+(defence in depth). `review_pr(files, router, ...)` runs the whole stage
 on plain `{path, old_content, new_content, patch}` dicts without the API or DB (the eval's
 entry point).
 
@@ -425,7 +458,9 @@ per call): a typical PR (1–5 files, one audit prompt) makes 1 audit call, +0�
 `PR_REVIEW_MAX_AUDIT_CALLS` + `PR_REVIEW_MAX_VERIFIER_CALLS` = 12 calls (~90K tokens). On
 Groq's free tier (8K tokens/min per model) each call takes about a minute of one model's
 budget, so a 6-call review needs a few minutes; `LLM_SCAN_MAX_WALL_S` (480 s) bounds it and
-anything cut is reported (`time_budget`). The per-unit review makes at most
+anything cut is reported (`time_budget`). Groq only serves prompts up to ~7.5K estimated
+tokens (see the Groq limitation under [Notes & gotchas](#notes--gotchas)): with the 12K default
+the larger audit / verifier prompts run on OpenRouter only. The per-unit review makes at most
 `LLM_MAX_CALLS_PER_SCAN` = 6 calls.
 
 Adapted text: the audit prompt, the verifier's exclusions / precedents and the hard-exclusion
@@ -441,9 +476,18 @@ modified; notices and licence texts: `backend/app/core/prompts/THIRD_PARTY_NOTIC
 is the 200-item dev sample: 60 vulnerability-introducing PRs (reversed fixes), their 60 real
 fixes and 80 bystander benign PRs). Retrieval is off in every arm; no embedder or Qdrant.
 
-- `--arm pr`: `review_pr` on the item's files. One run gives two headlines: `verified`
-  (the report: confirmed findings + deterministic guard alerts) and `audit_only` (every
-  candidate that reached the verifier, i.e. before verification).
+- `--arm pr`: `review_pr` on the item's files. One run gives three headlines: `verified`
+  (the report: confirmed findings + deterministic guard alerts), `verified_plus_review` (the
+  report plus the non-blocking worth-a-look items) and `audit_only` (every candidate that
+  reached the verifier, i.e. before verification). The output also says what the tier adds
+  (catches gained, false alarms added) and has policy-curve rows "confirmed ≥ 8 / ≥ 7 + worth
+  a look". `--rescore` of a run recorded before the tier replays `verified_plus_review` from
+  the cached verdicts with **guard_diff evidence only** (recomputed from the dataset; the old
+  verifier prompt had no `removed_control_quote`) at the run's own cutoff, and labels it so;
+  without the dataset the view is reported n/a. Rescore of `pr_eval_pr_dev200.json` (old
+  prompt, cutoff 8, guard_diff evidence only): introducing strict 15/55 (verified 12/55),
+  function-level 20/55 (16/55); fix PRs flagged 3/57 (2/57); benign 0/48 (0/48; only 48 of
+  80 benign PRs scored).
 - `--arm units`: the per-unit review (`REVIEW_MODE=units`), run in-process exactly as
   `scan_runner` runs files mode, on the same PRs.
 - `--arm pr_misleading`: the `pr` arm on the `_misleading` variants of the selected
@@ -461,7 +505,9 @@ candidate funnel, context rounds (symbols requested vs resolved), verifier outco
 heuristic bucketing of the verifier's reasons), `review_status` and per category / language.
 
 Calls go through a gate: a JSONL cache (`ml/evaluation/results/pr_llm_cache.jsonl`) keyed by
-(item id, call prompt sha256, model, temperature, repeat) so a re-run resumes; pacing
+(item id, call prompt sha256, model, temperature, repeat) so a re-run resumes (the
+pipeline's per-call format check is not part of the key, so older entries replay; a cached
+answer it rejects is a miss, re-asked within the call budget, and replaced); pacing
 (`--llm-sleep`, `--llm-tpm`); `--llm-max-calls` / `--llm-token-budget`; a clean stop on a
 daily limit or repeated rate limits. Items with an unfinished or failed call are `not_run` /
 `error` and excluded (re-run to resume). The wall-clock budget is disabled in the eval.
@@ -473,6 +519,11 @@ key carries the sampling sent, so `--llm-temperature 0` replays temperature-0 en
 Semgrep leads are precomputed once (one engine run over every file of the selection, all
 severities) and served from the cache by a stub scanner; without `--semgrep-cache` there are
 no Semgrep leads.
+
+The dry run's wall-time estimate has two pacing profiles. `groq_free_8k_tpm` paces only the
+calls Groq can serve (estimated prompt ≤ 8000 − 512 tokens) and reports the rest as
+`not_servable_calls` / `items_with_unservable_calls`: with the 12K prompt default many PR
+prompts can't run on Groq at all (see the Groq limitation).
 
 ```bash
 # offline: every prompt with a stub model, calls / tokens / time estimates (~1 min, 4 workers)
@@ -521,7 +572,19 @@ tests/            pytest suite (unit + integration; slow eval regression)
   `GROQ_API_KEY` too; a retired model id (HTTP 404) is logged as a "not found or decommissioned"
   warning naming the model and falls through to the next one. For OpenRouter an error object
   inside an HTTP 200 is treated as a failed call (not a crash), and replies wrapped in
-  ```` ```json ```` fences or preceded by reasoning text are still parsed.
+  ```` ```json ```` fences or preceded by reasoning text are still parsed. An answer that
+  fails the call's format check (e.g. a bare finding instead of `{"findings": [...]}`) falls
+  through to the next model too.
+- **Groq's free tier only serves small prompts.** Groq allows ~8K tokens/min per model and
+  counts `max_tokens` against it, so the router caps a Groq call's output at what the prompt
+  leaves of the 8K and skips a Groq client whose prompt leaves under 512 tokens: prompts over
+  ~7.5K estimated tokens never run on Groq, and those that do may get little room to answer
+  (`openai/gpt-oss-120b` as little as ~1.7K output tokens for a 6K units prompt). With the
+  12K `PR_REVIEW_MAX_PROMPT_TOKENS` default, OpenRouter serves the big PR-review prompts and
+  Groq is the fallback for small ones. A **Groq-only** setup (`LLM_PROVIDER=groq`, no
+  OpenRouter key) fails every PR-review prompt over ~7.5K tokens, cleanly (`LLMError`: the
+  units are `not_reviewed`, the review `partial` / `failed`, never clean); set
+  `PR_REVIEW_MAX_PROMPT_TOKENS=6000` there. Recommended: OpenRouter primary, Groq fallback.
 - **Local Qdrant is single-process.** The API, ingest scripts, and eval can never run at the
   same time; scripts print "stop the API first" on a lock error.
 - **Any embedding-model change requires `--recreate` on both collections.** Payloads carry

@@ -212,7 +212,8 @@ def test_localised_scoring_file_tolerance_and_multi_file_prs():
     no_line = s(rec, [{"file_path": "a.py", "line": None}], 2)
     assert no_line["right_file"] and not no_line["localised"]
     assert s(rec, [], 2) == {"any": False, "n_findings": 0, "right_file": False,
-                             "localised": False, "localised_any_vuln_path": False}
+                             "localised": False, "localised_any_vuln_path": False,
+                             "localised_fix_anchor": None, "localised_function": None}
 
 
 def test_fix_and_benign_false_positives():
@@ -542,3 +543,296 @@ def test_semgrep_cache_leads_reach_the_audit_prompt(tmp_path):
     # The misleading variant finds the base item's hits.
     scanner = R._item_scanner(loaded, misleading(intro_item()))
     assert scanner.file_hits == {"app/files.py": HITS[:1]}
+
+
+# --- change-anchored localisation, scope, leaky diffs, provenance ----------------------------
+
+from ml.evaluation import pr_eval_facts as F  # noqa: E402
+from ml.evaluation.llm_eval_common import (  # noqa: E402
+    fisher_exact_2x2,
+    precision_at_observed_fpr,
+    sampling_key,
+)
+
+GUARDED = (
+    "def other():\n"           # 1
+    "    return 1\n"           # 2
+    "\n"                       # 3
+    "def handle(req):\n"       # 4
+    "    name = req.args['n']\n"  # 5
+    "    if not safe(name):\n"    # 6 (removed by the PR)
+    "        raise ValueError\n"  # 7 (removed by the PR)
+    "    a = 1\n"
+    "    b = 2\n"
+    "    c = 3\n"
+    "    d = 4\n"
+    "    return run(name)\n"
+)
+UNGUARDED = GUARDED.replace("    if not safe(name):\n        raise ValueError\n", "")
+NEW_MODULE = "import os\n\ndef dump(p):\n    return os.system(p)\n"
+
+
+def anchored_intro():
+    """The PR deletes handle()'s guard (new-file deletion point: lines 5-6;
+    the sink is line 10) and adds a whole module; the corpus target is other()."""
+    item = _item("pr_G_intro", "vuln_introducing",
+                 [_file("app/h.py", GUARDED, UNGUARDED),
+                  {"path": "app/new.py", "old_content": None, "new_content": NEW_MODULE,
+                   "patch": synthesize_patch("", NEW_MODULE)}],
+                 "app/h.py", vuln=[1], changed=[], pair_base="pr_G",
+                 category="cmd_injection", cwe="CWE-78")
+    rec = R.item_record(item, "pr")
+    rec["facts"] = F.selection_facts([item], R._parser())[item["id"]]
+    return rec
+
+
+def test_change_anchored_levels_cover_deleted_guard_sink_and_new_file():
+    rec = anchored_intro()
+    facts = rec["facts"]
+    assert facts["anchors_by_path"]["app/h.py"] == [5, 6]  # the deletion point
+    assert facts["touched_functions_by_path"]["app/h.py"] == [[4, 10, "handle"]]
+    assert facts["added_files"] == ["app/new.py"]
+
+    def levels(f):
+        o = R.score_findings(rec, [f], 2)
+        return o["localised"], o["localised_fix_anchor"], o["localised_function"]
+
+    assert levels(_f("app/h.py", 1)) == (True, True, True)      # strict target
+    assert levels(_f("app/h.py", 6)) == (False, True, True)     # next to the deleted guard
+    assert levels(_f("app/h.py", 10)) == (False, False, True)   # the sink, same function
+    assert levels(_f("app/new.py", 4)) == (False, True, True)   # a wholly added file
+    assert levels({"file_path": "app/h.py", "line": None}) == (False, False, False)
+    # Without facts the looser levels are not computable (None), never False.
+    bare = R.item_record(_item("x", "vuln_introducing", [], "a.py", vuln=[1]), "pr")
+    out = R.score_findings(bare, [_f("a.py", 1)], 2)
+    assert out["localised"] and out["localised_function"] is None
+
+
+def test_fix_items_use_the_same_anchored_definition():
+    item = _item("pr_G_fix", "vuln_fix", [_file("app/h.py", UNGUARDED, GUARDED)], "app/h.py",
+                 changed=[6, 7], pair_base="pr_G")
+    rec = R.item_record(item, "pr")
+    rec["facts"] = F.selection_facts([item], R._parser())[item["id"]]
+    on_guard = R.score_findings(rec, [_f("app/h.py", 7)], 2)
+    assert on_guard["on_fixed_lines"] and on_guard["on_fix_anchor"]
+    sink = R.score_findings(rec, [_f("app/h.py", 12)], 2)
+    assert sink["fp"] and not sink["on_fix_anchor"] and sink["in_fixed_function"]
+
+
+def test_scope_of_follows_the_audit_prompt_exclusions():
+    assert F.scope_of("redos", "CWE-120") == F.SCOPE_DOS        # 400 via the category
+    assert F.scope_of("other", "CWE-835") == F.SCOPE_DOS
+    assert F.scope_of("other", "CWE-789") == F.SCOPE_DOS
+    assert F.scope_of("other", "CWE-208") == F.SCOPE_TIMING_RACE
+    assert F.scope_of("other", "CWE-367") == F.SCOPE_TIMING_RACE
+    assert F.scope_of("other", "CWE-129") == F.SCOPE_IN         # vyper: not excluded
+    assert F.scope_of("prototype_pollution", "CWE-1321") == F.SCOPE_IN
+    assert F.scope_of(None, None) == F.SCOPE_IN
+
+
+def test_leaky_terms_come_from_deleted_lines_only():
+    old = "x = 1\n# SECURITY: prevent XML External Entity (XXE)\nparse(x)\n"
+    new = "x = 1\nparse(x)\n# sanitize later\n"
+    files = [_file("a.py", old, new)]
+    assert F.deleted_lines(files) == ["# SECURITY: prevent XML External Entity (XXE)"]
+    assert F.security_terms(F.deleted_lines(files)) == ["security", "xxe"]
+    assert F.security_terms(["validate(x)", "escape(y)"]) == []  # generic words left out
+
+
+def test_benign_provenance_flags_shared_commits_and_identical_files():
+    fix = fix_item("pr_A_fix", "pr_A")
+    fix["files"].append(_file("app/util.py", UTIL_OLD, UTIL_NEW))
+    fix["meta"]["commit"] = "c1"
+    same = benign_item("pr_bystander_same")
+    same["meta"] = {"commit": "c1", "bystander_of": "eval_fix_commit"}
+    other = benign_item("pr_bystander_other")
+    other["meta"] = {"commit": "c2", "bystander_of": "other_fix_commit"}
+    prov = F.benign_provenance([fix, same, other])
+    assert prov["pr_bystander_same"]["shares_commit_with"] == ["pr_A_fix"]
+    assert prov["pr_bystander_same"]["identical_subset_of_fix_files"] is True
+    assert prov["pr_bystander_other"]["shares_commit_with"] == []
+    recs = [_scored_rec(b, {"verified": hit}) for b, hit in
+            ((same, [_f("app/util.py", 2)]), (other, []))]
+    for r, b in zip(recs, (same, other), strict=True):
+        r["facts"] = {"provenance": prov[b["id"]]}
+    R.attach_outcomes(recs, 2)
+    bp = R.view_metrics(recs, "verified")["benign_provenance"]
+    assert (bp["fpr_all"]["k"], bp["fpr_all"]["n"]) == (1, 2)
+    assert (bp["fpr_no_shared_commit"]["k"], bp["fpr_no_shared_commit"]["n"]) == (0, 1)
+    assert bp["shares_commit_with_fix"] == 1 and bp["identical_subset_of_fix_files"] == 1
+
+
+def test_in_scope_and_leaky_views():
+    hit = [_f("app/files.py", 7)]
+    a = _scored_rec(intro_item("pr_A_intro", "pr_A"), {"verified": hit})
+    b = _scored_rec({**intro_item("pr_B_intro", "pr_B"), "category": "redos",
+                     "cwe": "CWE-400"}, {"verified": []})
+    c = _scored_rec({**intro_item("pr_C_intro", "pr_C"), "cwe": "CWE-208"}, {"verified": []})
+    for r, terms in ((a, ["security"]), (b, []), (c, [])):
+        r["facts"] = {"deleted_security_terms": terms}
+    R.attach_outcomes([a, b, c], 2)
+    m = R.view_metrics([a, b, c], "verified")
+    sc = m["in_scope"]
+    assert sc["by_scope"] == {"in": 1, "timing_race": 1, "dos": 1}
+    assert (sc["all"]["localised"]["k"], sc["all"]["localised"]["n"]) == (1, 3)
+    assert sc["excl_dos"]["localised"]["n"] == 2 and sc["in_scope_only"]["localised"]["n"] == 1
+    lk = m["leaky_split"]
+    assert (lk["n_leaky"], lk["n_not_leaky"]) == (1, 2)
+    assert lk["localised"]["leaky"]["k"] == 1
+    assert lk["localised"]["p_fisher_exact"] == pytest.approx(1 / 3, abs=1e-6)
+
+
+# --- coverage, partial results, bounds, verifier losses, policies -----------------------------
+
+
+def _cand(path, line, status, verdict=None, conf=None):
+    return {"file_path": path, "line": line, "end_line": line, "status": status,
+            "verdict": verdict, "verdict_confidence": conf, "source": "llm"}
+
+
+def _pr_rec(item, cands, status="ok", calls_total=2):
+    rec = R.item_record(item, "pr")
+    report = [c for c in cands if c["status"] == "confirmed"]
+    rec.update(status=status, candidates=cands,
+               findings={"verified": report,
+                         "audit_only": [c for c in cands if c["status"] in R.VERIFIER_BOUND],
+                         "audit_raw": list(cands)},
+               calls={**R._call_summary([]), "total": calls_total})
+    return rec
+
+
+def test_coverage_partial_results_and_bounds():
+    p = "app/files.py"
+    recs = [
+        _pr_rec(intro_item("pr_A_intro", "pr_A"), [_cand(p, 7, "confirmed", "confirmed", 9)]),
+        _pr_rec(intro_item("pr_B_intro", "pr_B"), [_cand(p, 7, "confirmed", "confirmed", 9)],
+                status="error", calls_total=1),                       # partial, a catch
+        _pr_rec(intro_item("pr_C_intro", "pr_C"), [], status="error", calls_total=0),
+        _pr_rec(intro_item("pr_D_intro", "pr_D"), []),                # scored miss
+        _pr_rec(benign_item("b1"), []),
+        _pr_rec(benign_item("b2"), [], status="not_run", calls_total=0),
+    ]
+    s = R.summarize(recs, "pr", 2)
+    assert s["coverage"]["vuln_introducing"] == {"n": 4, "scored": 2, "errored_partial": 1,
+                                                 "errored_no_result": 1, "not_run": 0}
+    assert s["coverage"]["benign"]["not_run"] == 1
+    assert s["views"]["verified"]["tpr_localised"]["k"] == 1  # strict: scored only
+    sens = s["sensitivity"]["verified"]
+    assert (sens["with_partial"]["tpr_localised"]["k"],
+            sens["with_partial"]["tpr_localised"]["n"]) == (2, 3)
+    b = sens["bounds"]["tpr_localised"]
+    assert (b["known_positive"], b["known_negative"], b["unknown"]) == (2, 1, 1)
+    assert (b["lower"], b["upper"], b["worst_case"]) == (0.5, 0.75, 0.5)
+    fb = sens["bounds"]["fpr_benign"]
+    assert (fb["lower"], fb["upper"], fb["worst_case"]) == (0.0, 0.5, 0.5)
+
+
+def test_verifier_losses_and_policy_curve_replay_cached_verdicts():
+    p = "app/files.py"
+    recs = [
+        _pr_rec(intro_item("pr_A_intro", "pr_A"), [_cand(p, 7, "confirmed", "confirmed", 9)]),
+        _pr_rec(intro_item("pr_B_intro", "pr_B"),
+                [_cand(p, 7, "below_min_confidence", "confirmed", 7)]),
+        _pr_rec(intro_item("pr_C_intro", "pr_C"), [_cand(p, 7, "uncertain", "uncertain", 5)]),
+        _pr_rec(intro_item("pr_D_intro", "pr_D"), [_cand(p, 7, "unverified")]),
+        _pr_rec(intro_item("pr_E_intro", "pr_E"), [_cand(p, 7, "hard_excluded")]),
+        _pr_rec(benign_item("b1"), [_cand("app/util.py", 2, "rejected", "rejected", 2)]),
+    ]
+    s = R.summarize(recs, "pr", 2)
+    vl = s["verifier_losses"]
+    assert vl["intro_catches_lost_strict"]["count"] == 3  # B, C, D (E never verifier-bound)
+    assert vl["benign_fps_removed"]["count"] == 1 and vl["fix_fps_removed"]["n"] == 0
+    curve = {row["policy"]: row for row in s["verifier_policy_curve"]}
+    k = {name: row["intro_localised"]["k"] for name, row in curve.items()}
+    assert k["confirmed>=8"] == 1 and k["confirmed>=7"] == 2
+    assert k["confirmed (any confidence)"] == 2 and k["confirmed or uncertain"] == 3
+    assert k["no verifier (every verifier-bound candidate)"] == 4
+    assert curve["no verifier (every verifier-bound candidate)"]["benign_flagged"]["k"] == 1
+    assert curve["confirmed>=8"]["benign_flagged"]["k"] == 0
+    # Two views of ONE run: losses, not a degenerate McNemar.
+    cmp = R.compare_runs(recs, recs, "verified", "audit_only", same=True)
+    assert cmp["nested_views"] and "p_mcnemar_exact" not in json.dumps(cmp)
+    assert cmp["losses"]["intro_catches_lost_strict"]["count"] == 3
+
+
+def test_precision_has_no_point_estimate_without_false_positives():
+    recs = [_scored_rec(intro_item("pr_A_intro", "pr_A"), {"verified": [_f("app/files.py", 7)]}),
+            *[_scored_rec(benign_item(f"b{k}"), {"verified": []}) for k in range(10)]]
+    R.attach_outcomes(recs, 2)
+    m = R.view_metrics(recs, "verified")
+    assert set(m["precision_at_base_rate"].values()) == {None}
+    assert m["precision_at_base_rate_note"].startswith("n/a: 0 of 10")
+    upper = m["fpr_benign_upper95_exact"]
+    assert upper == pytest.approx(1 - 0.025 ** 0.1, abs=1e-4)  # Clopper-Pearson, k = 0
+    assert m["precision_at_base_rate_fpr_upper95"]["0.01"] == round(
+        0.01 / (0.01 + upper * 0.99), 4)
+    assert precision_at_observed_fpr(0.5, 1, 10, 0.01) == round(0.005 / (0.005 + 0.099), 4)
+    assert fisher_exact_2x2(3, 1, 1, 3) == pytest.approx(0.4857, abs=1e-4)
+    assert fisher_exact_2x2(0, 0, 0, 0) == 1.0
+
+
+def test_rescore_recomputes_facts_and_refreshes_corrected_labels():
+    item = intro_item()
+    rec = _scored_rec({**item, "category": "redos", "cwe": "CWE-400"},
+                      {"verified": [_f("app/files.py", 7)]})
+    fixed = {**item, "category": "prototype_pollution", "cwe": "CWE-1321",
+             "meta": {**item["meta"], "label_override": {"reason": "advisory text",
+                                                         "from": {"cwe": "CWE-400",
+                                                                  "category": "redos"}}}}
+    data = {"config": {"arm": "units"}, "items": [rec]}
+    out = R.rescore(data, 2, [fixed], parser=R._parser())
+    [ch] = out["rescore"]["label_changes"]
+    assert ch["to"] == {"category": "prototype_pollution", "cwe": "CWE-1321"}
+    [r] = out["items"]
+    assert r["category"] == "prototype_pollution" and r["facts"]["anchors_by_path"]
+    assert out["summary"]["views"]["verified"]["in_scope"]["by_scope"]["in"] == 1
+    assert out["summary"]["views"]["verified"]["tpr_localised_function"]["k"] == 1
+
+
+# --- sampling / cache keys ------------------------------------------------------------------
+
+
+class SamplingClient:
+    def __init__(self, label="openrouter:qwen/qwen3.8-27b:free", temperature=None):
+        self.label, self.provider, self.temperature = label, label.split(":")[0], temperature
+
+    def sampling_params(self):
+        if self.temperature is not None:
+            return {"temperature": float(self.temperature)}
+        return {"temperature": 1.0, "top_p": 0.95, "top_k": 20}
+
+
+class SamplingLLM(StubLLM):
+    def __init__(self, temperature=None, **kw):
+        super().__init__(**kw)
+        self.clients = [SamplingClient(temperature=temperature)]
+
+
+def test_sampling_key_keeps_temperature_keys_and_separates_model_default():
+    assert sampling_key({"temperature": 0.0}) == 0.0
+    key = sampling_key({"top_k": 20, "temperature": 1.0, "top_p": 0.95})
+    assert key == 'sampling:{"temperature":1.0,"top_k":20,"top_p":0.95}'
+    assert R.parse_args(["--dry-run"]).llm_temperature is None  # model default
+    assert R.parse_args(["--dry-run", "--llm-temperature", "0"]).llm_temperature == 0.0
+
+
+def test_model_default_sampling_never_replays_temperature_zero_entries(tmp_path):
+    path = tmp_path / "cache.jsonl"
+    # A temperature-0 run (explicit override) fills the cache...
+    rec0, g0 = _run(intro_item(), "pr", SamplingLLM(temperature=0.0, audit={"findings": [
+        TRAVERSAL]}), _gate(LLMCache(path), temperature=None))
+    assert g0.calls == 2
+    assert {json.loads(x)["temperature"] for x in path.read_text().splitlines()} == {0.0}
+    # ...which the model-default run does not replay (and records its sampling key).
+    rec1, g1 = _run(intro_item(), "pr", SamplingLLM(), _gate(LLMCache(path), temperature=None))
+    assert g1.calls == 1 and rec1["status"] == "ok"
+    keys = [json.loads(x)["temperature"] for x in path.read_text().splitlines()]
+    assert keys[-1].startswith("sampling:")
+    # Each is replayed by its own setting; another repeat index is another call.
+    _, g2 = _run(intro_item(), "pr", SamplingLLM(), _gate(LLMCache(path), temperature=None))
+    _, g3 = _run(intro_item(), "pr", SamplingLLM(), _gate(LLMCache(path), temperature=0.0))
+    assert g2.calls == 0 and g3.calls == 0
+    _, g4 = _run(intro_item(), "pr", SamplingLLM(), _gate(LLMCache(path), temperature=None,
+                                                         repeat=1))
+    assert g4.calls == 1
+    assert json.loads(path.read_text().splitlines()[-1])["repeat"] == 1

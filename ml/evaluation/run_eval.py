@@ -145,10 +145,10 @@ from ml.evaluation.llm_eval_common import (  # noqa: E402, F401 (re-exported)
     BASE_RATES,
     DAILY_LIMIT_MARKERS,
     DAILY_LIMIT_RETRY_AFTER_S,
-    DEFAULT_EVAL_TEMPERATURE,
     DEFAULT_LLM_MAX_RATE_LIMIT_ERRORS,
     DEFAULT_LLM_SLEEP,
     DEFAULT_LLM_TPM,
+    GREEDY_EVAL_TEMPERATURE,
     LEGACY_CACHE_TEMPERATURE,
     TEST_SPLIT_FLAG,
     HttpUsageTap,
@@ -178,6 +178,9 @@ from ml.evaluation.llm_eval_common import (  # noqa: E402, F401 (re-exported)
     wilson_interval,
 )
 
+# The function-level eval keeps greedy decoding by default (the PR eval's
+# llm_eval_common.DEFAULT_EVAL_TEMPERATURE is the model's recommended sampling).
+DEFAULT_EVAL_TEMPERATURE = GREEDY_EVAL_TEMPERATURE
 DEFAULT_DATASET = BASE_DIR / "ml" / "evaluation" / "datasets" / "detection_eval.jsonl"
 BASELINE_PATH = BASE_DIR / "ml" / "evaluation" / "baseline.json"
 RESULTS_DIR = BASE_DIR / "ml" / "evaluation" / "results"

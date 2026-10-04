@@ -32,8 +32,14 @@ DEFAULT_LLM_MAX_RATE_LIMIT_ERRORS = 3
 DAILY_LIMIT_MARKERS = ("per day", "(TPD)", "(RPD)", "free-models-per-day")
 # A Retry-After this long only happens once a daily (not per-minute) window is spent.
 DAILY_LIMIT_RETRY_AFTER_S = 300.0
-# Eval calls default to greedy decoding; production keeps settings.LLM_TEMPERATURE.
-DEFAULT_EVAL_TEMPERATURE = 0.0
+# The PR eval's default: None = no temperature override, every call uses the
+# model's recommended sampling (settings.LLM_SAMPLING via
+# LLMClient.sampling_params, e.g. qwen/qwen3.8-27b: temperature 1.0, top_p 0.95,
+# top_k 20; LLM_TEMPERATURE for a model without an entry), what production
+# sends. A float (--llm-temperature T) forces that temperature.
+DEFAULT_EVAL_TEMPERATURE = None
+# The function-level eval (run_eval) keeps greedy decoding by default.
+GREEDY_EVAL_TEMPERATURE = 0.0
 # Every LLM cache entry written before the temperature was recorded used this.
 LEGACY_CACHE_TEMPERATURE = 0.2
 
@@ -65,6 +71,40 @@ def precision_at_base_rate(tpr: float | None, fpr: float | None, pi: float) -> f
         return None
     denom = tpr * pi + fpr * (1 - pi)
     return round(tpr * pi / denom, 4) if denom else None
+
+
+def precision_at_observed_fpr(tpr: float | None, fp_k: int, fp_n: int,
+                              pi: float) -> float | None:
+    """``precision_at_base_rate`` at the observed FPR ``fp_k / fp_n``, but None
+    when no false positive was observed (``fp_k == 0``): an FPR of exactly 0
+    gives a "precision" of 1.0 that only says the sample was too small to see
+    one; report the bound from ``fpr_upper95_exact`` instead."""
+    if not fp_n or not fp_k:
+        return None
+    return precision_at_base_rate(tpr, fp_k / fp_n, pi)
+
+
+def fpr_upper95_exact(k: int, n: int) -> float | None:
+    """Upper end of the exact (Clopper-Pearson) 95% interval of k / n."""
+    ci = clopper_pearson(k, n)
+    return ci[1] if ci else None
+
+
+def fisher_exact_2x2(a: int, b: int, c: int, d: int) -> float:
+    """Two-sided exact Fisher p-value of the table [[a, b], [c, d]]: the summed
+    probability (hypergeometric, fixed margins) of every table no more likely
+    than the observed one."""
+    r1, c1, n = a + b, a + c, a + b + c + d
+    if n == 0:
+        return 1.0
+
+    def prob(x: int) -> float:
+        return math.comb(c1, x) * math.comb(n - c1, r1 - x) / math.comb(n, r1)
+
+    observed = prob(a)
+    lo, hi = max(0, r1 + c1 - n), min(r1, c1)
+    return min(1.0, sum(p for x in range(lo, hi + 1)
+                        if (p := prob(x)) <= observed * (1 + 1e-9)))
 
 
 def _fmt_rate(r: dict) -> str:
@@ -144,12 +184,17 @@ def eval_nonce(item_id: str) -> str:
 
 
 def _cache_key(item_id: str, sha: str, model: str, temperature, repeat) -> tuple:
-    return (item_id, sha, model, round(float(temperature), 4), int(repeat))
+    """``temperature`` is a number (only a temperature was sent) or a
+    ``sampling_key`` string (temperature plus other sampling fields)."""
+    temp = temperature if isinstance(temperature, str) else round(float(temperature), 4)
+    return (item_id, sha, model, temp, int(repeat))
 
 
 class LLMCache:
     """Append-only JSONL of successful LLM results keyed by (item id, prompt
-    sha256, model, temperature, repeat index). Entries written before the
+    sha256, model, temperature, repeat index); the temperature part is the
+    ``sampling_key`` of what was sent (a plain number when only a temperature
+    was, so pre-existing entries keep their keys). Entries written before the
     temperature / repeat were recorded count as LEGACY_CACHE_TEMPERATURE /
     repeat 0 (what they were). Errors are never cached, so a re-run retries
     them."""
@@ -175,7 +220,7 @@ class LLMCache:
         return len(self._entries)
 
     def get(self, item_id: str, sha: str, model: str,
-            temperature: float = LEGACY_CACHE_TEMPERATURE, repeat: int = 0) -> dict | None:
+            temperature: float | str = LEGACY_CACHE_TEMPERATURE, repeat: int = 0) -> dict | None:
         return self._entries.get(_cache_key(item_id, sha, model, temperature, repeat))
 
     def put(self, rec: dict) -> None:
@@ -295,11 +340,37 @@ def llm_model_key(router) -> str:
     return "mock" if getattr(router, "mock", False) else router.clients[0].label
 
 
-def router_temperature(router) -> float:
-    """The temperature the router's primary client sends (settings default)."""
+def client_sampling(client) -> dict:
+    """The sampling fields ``client`` sends with each request: its
+    ``sampling_params()`` (an explicit temperature override, else the model's
+    settings.LLM_SAMPLING entry), or, for a client without that method, its
+    ``temperature`` (settings.LLM_TEMPERATURE when unset)."""
+    params = getattr(client, "sampling_params", None)
+    if callable(params):
+        return dict(params())
+    value = getattr(client, "temperature", None)
+    return {"temperature": float(settings.LLM_TEMPERATURE if value is None else value)}
+
+
+def sampling_key(sampling: dict) -> float | str:
+    """Cache-key form of the sampling sent: the temperature (rounded) when it is
+    the only field, so explicit-temperature runs keep their pre-existing keys
+    (e.g. 0.0); otherwise ``"sampling:" + canonical JSON`` (e.g. the model's
+    recommended temperature 1.0 + top_p + top_k), so a temperature-0 cache entry
+    is never replayed for model-default sampling, nor the reverse."""
+    if set(sampling) <= {"temperature"}:
+        return round(float(sampling.get("temperature", settings.LLM_TEMPERATURE)), 4)
+    return "sampling:" + json.dumps({k: sampling[k] for k in sorted(sampling)},
+                                    separators=(",", ":"))
+
+
+def router_temperature(router) -> float | str:
+    """``sampling_key`` of what the router's primary client sends
+    (settings.LLM_TEMPERATURE for a router without clients)."""
     clients = getattr(router, "clients", None) or []
-    value = getattr(clients[0], "temperature", None) if clients else None
-    return float(settings.LLM_TEMPERATURE if value is None else value)
+    if not clients:
+        return float(settings.LLM_TEMPERATURE)
+    return sampling_key(client_sampling(clients[0]))
 
 
 def build_llm_router(primary_only: bool = False) -> LLMRouter:
@@ -342,11 +413,12 @@ def build_pinned_router(spec: str) -> LLMRouter:
     return PinnedRouter(LLMClient(provider, model=model), TokenPacer({}))
 
 
-def set_router_temperature(router, temperature: float) -> None:
-    """Every client of ``router`` sends ``temperature`` (the eval's choice,
-    not settings.LLM_TEMPERATURE)."""
+def set_router_temperature(router, temperature: float | None) -> None:
+    """Every client of ``router`` sends ``temperature`` (the eval's choice);
+    None clears the override, so each client uses its model's recommended
+    sampling (``LLMClient.sampling_params``)."""
     for client in getattr(router, "clients", None) or []:
-        client.temperature = float(temperature)
+        client.temperature = None if temperature is None else float(temperature)
 
 
 def openrouter_routing(args, router) -> dict | None:

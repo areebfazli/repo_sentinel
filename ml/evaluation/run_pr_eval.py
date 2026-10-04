@@ -32,12 +32,21 @@ Arms (``--arm``):
 Every prompt uses deterministic nonces (``eval_nonce`` of the base id and the
 call's position), so prompts, and the cache, are reproducible. The LLM calls
 go through ``EvalGate``: a JSONL cache keyed by (item id, call prompt sha256,
-model, temperature, repeat 0) so a re-run replays finished calls and resumes;
+model, sampling, ``--llm-repeat-index``) so a re-run replays finished calls and
+resumes. Sampling defaults to each model's recommended parameters
+(settings.LLM_SAMPLING, what production sends; e.g. temperature 1.0, top_p
+0.95, top_k 20 for qwen/qwen3.8-27b) and is keyed as
+``llm_eval_common.sampling_key``: a plain number for a temperature-only run
+(``--llm-temperature 0`` replays the existing temperature-0 entries), a
+``"sampling:{...}"`` string otherwise, so the two never replay each other.
+Sampled runs are stochastic: repeat a selection with ``--llm-repeat-index 1,
+2, ...`` (separate ``--out`` files, ``--compare`` to pair them). Also:
 pacing (``--llm-sleep``, ``--llm-tpm``); a hard cap on real calls
 (``--llm-max-calls``) and on tokens (``--llm-token-budget``); a clean stop on
 a daily limit or repeated rate limits. An item whose calls could not all be
 made (stop) is ``not_run``; one whose call failed is ``error``; both are
-excluded from the metrics (re-run to resume / retry). The wall-clock budget
+excluded from the primary metrics (re-run to resume / retry) and reported in
+the coverage, sensitivity and bounds sections. The wall-clock budget
 (``LLM_SCAN_MAX_WALL_S``) is disabled in the eval (a frozen clock): pacing
 must not change results.
 
@@ -48,25 +57,49 @@ whole files, all severities, no exclusions) and served per item by
 the real scanner. Without ``--semgrep-cache`` there are no Semgrep leads (the
 config records it).
 
-Scoring (primary = localised; tolerance ``--localise-tolerance``, default 2):
+Scoring (primary = localised; tolerance ``--localise-tolerance``, default 2).
+The metrics are over fully completed items (status ok / cached); errored and
+not-run items are reported separately (below), never silently dropped.
 
 - ``vuln_introducing``: localised TP iff a kept finding is in ``target.path``
   and its line range overlaps a ``vuln_lines_new`` line within the tolerance.
-  Also: any-finding TP, right-file TP, and localised on any vulnerable path
-  (``meta.vuln_lines_by_path``; 15 of the 60 dev-sample items have several).
+  Also: any-finding TP, right-file TP, localised on any vulnerable path
+  (``meta.vuln_lines_by_path``; 15 of the 60 dev-sample items have several),
+  and two looser, pre-registered secondary levels from the item's change facts
+  (``pr_eval_facts``; ``change_anchored``): change-anchored (within the
+  tolerance of any line the fix changed or of a deletion point, in any file)
+  and function-level (also anywhere in a function the fix touched, or in a
+  file the PR adds whole). The strict level misses catches on a deleted
+  control, at the sink, or in a wholly new file, because ``vuln_lines_new``
+  only covers the corpus-paired functions.
 - ``vuln_fix``: FP iff any kept finding; also a finding on the fix's own
-  changed lines (``target.changed_lines_new``).
-- ``benign``: FP (alert) iff any kept finding; findings per PR.
+  added lines in ``target.path`` (``target.changed_lines_new``), and the same
+  two looser levels (on a fix anchor / in a fixed function).
+- ``benign``: FP (alert) iff any kept finding; findings per PR; FPR on all
+  benign PRs and on those sharing no commit with a vuln item of the selection
+  (provenance: every benign PR is a bystander of a security-fix commit).
+- Coverage per kind (scored / errored with a partial result / errored with no
+  result / not run); a sensitivity view adding the errored items' partial
+  results; bounds over all items with every unknown outcome either way.
+- In-scope recall (``pr_eval_facts.scope_of``: without the DoS family the
+  audit prompt excludes, and without timing / race too) and the leaky-diff
+  split (security vocabulary in the deleted lines; exact Fisher p).
 - Pairs (introducing vs its fix), precision at 1/2/5% base rates from the
-  localised TPR and the benign FPR (point, and with the FPR's Wilson upper
-  bound), Wilson CIs, calls / tokens / latency per PR, the candidate funnel,
-  context rounds, verifier outcomes, review_status and per category / language.
+  localised TPR and the benign FPR (no point estimate when 0 benign FPs were
+  observed; always at the FPR's exact 95% upper bound), Wilson CIs, calls /
+  tokens / latency per PR, the candidate funnel, context rounds, verifier
+  outcomes, review_status and per category / language.
+- What the verifier drops (audit_only vs verified, per kind) and the verifier
+  policy curve: confirmed >= k (k = 9..5), confirmed at any confidence,
+  confirmed or uncertain, no verifier, replayed from the cached verdicts.
 
 Offline modes: ``--rescore RESULT.json`` (recompute every metric from the
-stored findings, e.g. at another tolerance), ``--compare A.json B.json``
+stored findings, e.g. at another tolerance; the facts and labels are
+recomputed from the run's dataset), ``--compare A.json B.json``
 (exact McNemar on introducing localised TP and on fix FP, exact binomial CIs
 + paired table on benign FPR; items matched by base id; ``--view-a`` /
-``--view-b`` pick verified / audit_only), and ``--dry-run`` (every prompt
+``--view-b`` pick verified / audit_only; two views of ONE run get the
+verifier-loss counts instead of a degenerate McNemar), and ``--dry-run`` (every prompt
 built with a stub router, no network: calls and estimated tokens per PR, run
 totals, pacing time and budget cut-offs).
 
@@ -81,6 +114,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import random
@@ -126,14 +160,25 @@ from ml.evaluation.llm_eval_common import (  # noqa: E402
     build_pinned_router,
     call_sha256,
     classify_llm_error,
+    client_sampling,
     eval_nonce,
+    fisher_exact_2x2,
+    fpr_upper95_exact,
     llm_model_key,
     mcnemar_exact,
     openrouter_routing,
     parse_llm_model,
     precision_at_base_rate,
+    precision_at_observed_fpr,
     router_temperature,
     set_router_temperature,
+)
+from ml.evaluation.pr_eval_facts import (  # noqa: E402
+    SCOPE_DOS,
+    SCOPE_IN,
+    SCOPE_TIMING_RACE,
+    scope_of,
+    selection_facts,
 )
 
 DATASET_DIR = BASE_DIR / "ml" / "evaluation" / "datasets" / "pr_eval"
@@ -481,7 +526,8 @@ class EvalGate:
     def __init__(self, *, cache: LLMCache | None, max_calls: float, token_budget: int | None,
                  sleep_s: float, tpm: int | None, max_rate_limit_errors: int,
                  tap: HttpUsageTap | None = None, sleep=asyncio.sleep,
-                 temperature: float | None = None, keep_prompts: bool = False):
+                 temperature: float | None = None, keep_prompts: bool = False,
+                 repeat: int = 0):
         self.cache = cache
         self.max_calls = max_calls
         self.token_budget = token_budget
@@ -491,6 +537,7 @@ class EvalGate:
         self._sleep = sleep
         self.temperature = temperature
         self.keep_prompts = keep_prompts
+        self.repeat = int(repeat)
         self.calls = self.tokens_used = self.last_tokens = self.consecutive_rl = 0
         self.stopped: str | None = None
         self.item_id: str | None = None
@@ -505,7 +552,10 @@ class EvalGate:
         self.item_error = self.item_error_kind = None
         self.item_not_run = False
 
-    def _temperature(self, inner) -> float:
+    def _temperature(self, inner) -> float | str:
+        """Cache-key form of the sampling: ``--llm-temperature`` when forced,
+        else what the router's primary client sends (``router_temperature``:
+        the model's recommended sampling under the default)."""
         return router_temperature(inner) if self.temperature is None else float(self.temperature)
 
     async def call(self, inner, system: str, user: str) -> tuple:
@@ -518,7 +568,7 @@ class EvalGate:
         if self.keep_prompts:
             entry["user"] = user
         self.log.append(entry)
-        cached = (self.cache.get(self.item_id, sha, model, temp, 0)
+        cached = (self.cache.get(self.item_id, sha, model, temp, self.repeat)
                   if self.cache is not None else None)
         if cached is not None and "llm_json" in cached:
             entry.update(cached=True, provider=cached.get("provider_used"),
@@ -580,7 +630,8 @@ class EvalGate:
         if self.cache is not None:
             self.cache.put({
                 "id": self.item_id, "prompt_sha256": sha, "model": model, "temperature": temp,
-                "repeat": 0, "role": role, "provider_used": provider, "llm_json": llm_json,
+                "repeat": self.repeat, "role": role, "provider_used": provider,
+                "llm_json": llm_json,
                 "upstream_provider": entry.get("upstream_provider"), "latency_s": latency,
                 "usage": usage, "prompt_tokens_est": est,
             })
@@ -803,10 +854,55 @@ def overlaps(f: dict, lines, tol: int) -> bool:
     return any(lo - tol <= int(v) <= hi + tol for v in lines or ())
 
 
+def _in_spans(f: dict, spans) -> bool:
+    """The finding's [line, end_line] intersects one of ``spans``
+    (``[start, end, name]``); a finding without a line never does."""
+    if f.get("line") is None:
+        return False
+    lo = int(f["line"])
+    hi = int(f.get("end_line") or lo)
+    lo, hi = min(lo, hi), max(lo, hi)
+    return any(lo <= int(s[1]) and int(s[0]) <= hi for s in spans or ())
+
+
+def change_anchored(rec: dict, findings: list[dict], tol: int) -> tuple:
+    """``(anchor, function)`` localisation of ``findings`` against the item's
+    change facts (``pr_eval_facts``), or ``(None, None)`` without facts.
+
+    Pre-registered secondary definition (the strict ``localised`` stays the
+    primary), applied to every file of the PR, not only ``target.path``:
+
+    - anchor: a finding within ``tol`` lines of a change anchor of its file:
+      a line the diff added, or a deletion point (the new-file lines just
+      before / after a run of removed lines; ``patch_touched_lines``). In a
+      reversed fix that is every line the real fix modified, and where the fix
+      inserted a control (now deleted: e.g. the removed ``if hmac_key is not
+      None:`` guard).
+    - function: an anchor hit, OR a finding intersecting a function of the new
+      file that contains a change anchor (innermost named function: the sink
+      of a function whose guard the PR removed), OR any finding in a file the
+      PR adds whole (a module the real fix deleted).
+
+    Each level includes the stricter ones (the caller ORs in ``localised``)."""
+    facts = rec.get("facts") or {}
+    if "anchors_by_path" not in facts:
+        return None, None
+    anchors = facts.get("anchors_by_path") or {}
+    spans = facts.get("touched_functions_by_path") or {}
+    added = set(facts.get("added_files") or ())
+    anchor = any(overlaps(f, anchors.get(f.get("file_path")), tol) for f in findings)
+    function = anchor or any(
+        f.get("file_path") in added or _in_spans(f, spans.get(f.get("file_path")))
+        for f in findings)
+    return anchor, function
+
+
 def score_findings(rec: dict, findings: list[dict], tol: int) -> dict:
-    """Per-item outcome of one view."""
+    """Per-item outcome of one view (see the module docstring). ``None`` for a
+    change-anchored level means the record has no facts (not computable)."""
     t = rec.get("target") or {}
     out = {"any": bool(findings), "n_findings": len(findings)}
+    anchor, function = change_anchored(rec, findings, tol)
     if rec["kind"] == KIND_INTRO:
         path = t.get("path")
         out["right_file"] = any(f.get("file_path") == path for f in findings)
@@ -816,24 +912,40 @@ def score_findings(rec: dict, findings: list[dict], tol: int) -> dict:
         out["localised_any_vuln_path"] = any(
             f.get("file_path") in by_path and overlaps(f, by_path[f["file_path"]], tol)
             for f in findings)
+        out["localised_fix_anchor"] = None if anchor is None else bool(
+            out["localised"] or anchor)
+        out["localised_function"] = None if function is None else bool(
+            out["localised_fix_anchor"] or function)
     elif rec["kind"] == KIND_FIX:
         out["fp"] = bool(findings)
         out["on_fixed_lines"] = any(
             f.get("file_path") == t.get("path") and overlaps(f, t.get("changed_lines_new"), tol)
             for f in findings)
+        out["on_fix_anchor"] = None if anchor is None else bool(out["on_fixed_lines"] or anchor)
+        out["in_fixed_function"] = None if function is None else bool(
+            out["on_fix_anchor"] or function)
     else:
         out["fp"] = bool(findings)
     return out
 
 
 def scored(rec: dict) -> bool:
+    """Fully completed: every call made (the strict, primary population)."""
     return rec.get("status") in ("ok", "cached")
 
 
+def partial_result(rec: dict) -> bool:
+    """An errored item with a partial result: some calls failed but at least
+    one succeeded, so its findings are real but possibly incomplete."""
+    return rec.get("status") == "error" and bool((rec.get("calls") or {}).get("total"))
+
+
 def attach_outcomes(records: list[dict], tol: int) -> None:
+    """Outcomes for scored items and for errored items with a partial result
+    (the latter only enter the sensitivity view and the bounds)."""
     for r in records:
         r["outcomes"] = ({v: score_findings(r, fs, tol) for v, fs in r["findings"].items()}
-                         if scored(r) else None)
+                         if scored(r) or partial_result(r) else None)
 
 
 def _mean(xs):
@@ -848,16 +960,99 @@ def _p90(xs):
     return xs[min(len(xs) - 1, math.ceil(0.9 * len(xs)) - 1)]
 
 
+def _rate_of(recs: list[dict], view: str, kind: str, key: str) -> dict:
+    """``_rate`` of ``outcomes[view][key]`` over ``recs`` of ``kind``, records
+    whose value is None (not computable) left out."""
+    return _rate([bool(v) for r in recs if r["kind"] == kind
+                  for v in [r["outcomes"][view].get(key)] if v is not None])
+
+
+def item_scope(rec: dict) -> str:
+    """``pr_eval_facts.scope_of`` the record's (current) labels."""
+    return scope_of(rec.get("category"), rec.get("cwe"))
+
+
+INTRO_KEYS = (("localised", "strict"), ("localised_function", "function-level"),
+              ("any", "any finding"))
+
+
+def scope_metrics(recs: list[dict], view: str) -> dict:
+    """Introducing recall over all items and over the in-scope ones: without
+    the DoS family the audit prompt excludes (``excl_dos``), and also without
+    the timing / race group (``in_scope_only``)."""
+    intro = [r for r in recs if r["kind"] == KIND_INTRO]
+    groups = {"all": intro,
+              "excl_dos": [r for r in intro if item_scope(r) != SCOPE_DOS],
+              "in_scope_only": [r for r in intro if item_scope(r) == SCOPE_IN]}
+    out = {name: {key: _rate_of(g, view, KIND_INTRO, key) for key, _ in INTRO_KEYS}
+           for name, g in groups.items()}
+    out["by_scope"] = {s: sum(1 for r in intro if item_scope(r) == s)
+                       for s in (SCOPE_IN, SCOPE_TIMING_RACE, SCOPE_DOS)}
+    out["out_of_scope_ids"] = sorted(r["base_id"] for r in intro if item_scope(r) != SCOPE_IN)
+    return out
+
+
+def leaky_split(recs: list[dict], view: str) -> dict | None:
+    """Introducing recall split by whether the PR's deleted lines contain
+    ``SECURITY_VOCAB`` terms, with a two-sided exact Fisher p per key
+    (descriptive only). None without facts."""
+    intro = [r for r in recs if r["kind"] == KIND_INTRO
+             and "deleted_security_terms" in (r.get("facts") or {})]
+    if not intro:
+        return None
+    leaky = [r for r in intro if r["facts"]["deleted_security_terms"]]
+    clean = [r for r in intro if not r["facts"]["deleted_security_terms"]]
+    out: dict = {"n_leaky": len(leaky), "n_not_leaky": len(clean),
+                 "terms": dict(Counter(t for r in leaky
+                                       for t in r["facts"]["deleted_security_terms"])
+                               .most_common())}
+    for key, _ in INTRO_KEYS:
+        a, b = _rate_of(leaky, view, KIND_INTRO, key), _rate_of(clean, view, KIND_INTRO, key)
+        out[key] = {"leaky": a, "not_leaky": b, "p_fisher_exact": round(fisher_exact_2x2(
+            a["k"], a["n"] - a["k"], b["k"], b["n"] - b["k"]), 6)}
+    return out
+
+
+def _clean_benign(r: dict) -> bool:
+    """A benign item sharing no commit with a vuln item of the selection."""
+    prov = (r.get("facts") or {}).get("provenance")
+    return prov is not None and not prov["shares_commit_with"]
+
+
+def benign_provenance_metrics(recs: list[dict], view: str) -> dict | None:
+    """Benign FPR on all benign items and on the ``_clean_benign`` subset, with
+    the provenance counts. None without facts."""
+    benign = [r for r in recs if r["kind"] == KIND_BENIGN]
+    provs = [(r.get("facts") or {}).get("provenance") for r in benign]
+    if not benign or any(p is None for p in provs):
+        return None
+    clean = [r for r in benign if _clean_benign(r)]
+    fpr_clean = _rate_of(clean, view, KIND_BENIGN, "fp")
+    return {
+        "fpr_all": _rate_of(benign, view, KIND_BENIGN, "fp"),
+        "fpr_no_shared_commit": fpr_clean,
+        "fpr_no_shared_commit_upper95_exact": fpr_upper95_exact(fpr_clean["k"],
+                                                                fpr_clean["n"]),
+        "n": len(benign),
+        "by_bystander_of": dict(Counter(str(p["bystander_of"]) for p in provs)),
+        "shares_commit_with_intro": sum(p["shares_commit_with_intro"] for p in provs),
+        "shares_commit_with_fix": sum(p["shares_commit_with_fix"] for p in provs),
+        "shares_commit_with_any_vuln_item": sum(bool(p["shares_commit_with"]) for p in provs),
+        "identical_subset_of_fix_files": sum(p["identical_subset_of_fix_files"] for p in provs),
+        "no_shared_commit": len(clean),
+    }
+
+
 def view_metrics(records: list[dict], view: str, base_rates=BASE_RATES) -> dict:
-    """Detection metrics of one view over the scored records."""
+    """Detection metrics of one view over the scored (fully completed) records."""
     recs = [r for r in records if scored(r)]
 
     def rate(kind, key):
-        return _rate([bool(r["outcomes"][view][key]) for r in recs if r["kind"] == kind])
+        return _rate_of(recs, view, kind, key)
 
     tpr = rate(KIND_INTRO, "localised")
     fpr_benign = rate(KIND_BENIGN, "fp")
-    upper = (fpr_benign["ci95"] or [None, None])[1]
+    upper = fpr_upper95_exact(fpr_benign["k"], fpr_benign["n"])
     pairs = Counter()
     by_pair: dict[str, dict] = {}
     for r in recs:
@@ -877,36 +1072,206 @@ def view_metrics(records: list[dict], view: str, base_rates=BASE_RATES) -> dict:
             sub = [r for r in recs if str(r.get(field)) == value]
             row = {}
             for kind, key, name in ((KIND_INTRO, "localised", "tpr_localised"),
+                                    (KIND_INTRO, "localised_function", "tpr_localised_function"),
                                     (KIND_INTRO, "any", "tpr_any"),
                                     (KIND_FIX, "fp", "fpr_fix"),
                                     (KIND_BENIGN, "fp", "fpr_benign")):
-                vals = [bool(r["outcomes"][view][key]) for r in sub if r["kind"] == kind]
-                if vals:
-                    row[name] = _rate(vals)
+                if any(r["kind"] == kind for r in sub):
+                    row[name] = _rate_of(sub, view, kind, key)
             out[value] = row
         return out
 
+    no_fp = bool(fpr_benign["n"]) and not fpr_benign["k"]
     return {
         "n_scored": len(recs),
         "tpr_localised": tpr,
         "tpr_localised_any_vuln_path": rate(KIND_INTRO, "localised_any_vuln_path"),
+        "tpr_localised_fix_anchor": rate(KIND_INTRO, "localised_fix_anchor"),
+        "tpr_localised_function": rate(KIND_INTRO, "localised_function"),
         "tpr_right_file": rate(KIND_INTRO, "right_file"),
         "tpr_any_finding": rate(KIND_INTRO, "any"),
         "fpr_fix": rate(KIND_FIX, "fp"),
         "fpr_fix_on_fixed_lines": rate(KIND_FIX, "on_fixed_lines"),
+        "fpr_fix_on_fix_anchor": rate(KIND_FIX, "on_fix_anchor"),
+        "fpr_fix_in_fixed_function": rate(KIND_FIX, "in_fixed_function"),
         "fpr_benign": fpr_benign,
+        "fpr_benign_upper95_exact": upper,
         "benign_findings_per_pr": {"mean": _mean(benign_counts),
                                    "histogram": dict(sorted(Counter(benign_counts).items()))},
+        # Point estimate at the observed FPR; None when no benign FP was seen
+        # (an FPR of exactly 0 would print a meaningless precision of 1.0).
         "precision_at_base_rate": {
-            str(pi): precision_at_base_rate(tpr["rate"], fpr_benign["rate"], pi)
+            str(pi): precision_at_observed_fpr(tpr["rate"], fpr_benign["k"], fpr_benign["n"],
+                                               pi)
             for pi in base_rates},
+        "precision_at_base_rate_note": (f"n/a: 0 of {fpr_benign['n']} benign PRs flagged; "
+                                        "only the FPR-upper-bound precision is meaningful"
+                                        if no_fp else None),
+        # Conservative: at the exact (Clopper-Pearson) 95% upper bound of the FPR.
         "precision_at_base_rate_fpr_upper95": {
             str(pi): precision_at_base_rate(tpr["rate"], upper, pi) for pi in base_rates},
         "pairs_intro_localised_vs_fix_fp": {k: pairs[k] for k in
                                             ("intro_only", "both", "fix_only", "neither")},
+        "in_scope": scope_metrics(recs, view),
+        "leaky_split": leaky_split(recs, view),
+        "benign_provenance": benign_provenance_metrics(recs, view),
         "by_category": breakdown("category"),
         "by_language": breakdown("language"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Coverage, the errored-item sensitivity view, bounds
+# ---------------------------------------------------------------------------
+
+
+def coverage(records: list[dict]) -> dict:
+    """Per kind: items, fully scored, errored with a partial result, errored
+    with no result, not run (so "160 of 200" shows WHICH kinds are missing)."""
+    out = {}
+    for kind in PR_KINDS:
+        rs = [r for r in records if r["kind"] == kind]
+        if not rs:
+            continue
+        out[kind] = {
+            "n": len(rs),
+            "scored": sum(scored(r) for r in rs),
+            "errored_partial": sum(partial_result(r) for r in rs),
+            "errored_no_result": sum(r.get("status") == "error" and not partial_result(r)
+                                     for r in rs),
+            "not_run": sum(r.get("status") == "not_run" for r in rs),
+        }
+    return out
+
+
+SENSITIVITY_KEYS = ((KIND_INTRO, "localised", "tpr_localised"),
+                    (KIND_INTRO, "localised_function", "tpr_localised_function"),
+                    (KIND_INTRO, "any", "tpr_any_finding"),
+                    (KIND_FIX, "fp", "fpr_fix"),
+                    (KIND_BENIGN, "fp", "fpr_benign"))
+
+
+def sensitivity(records: list[dict], view: str) -> dict:
+    """Two robustness checks around the strict (fully completed) metrics.
+
+    ``with_partial``: the rates over scored items PLUS errored items with a
+    partial result, their findings taken as they are (a partial item without
+    a finding counts as negative, though a complete run might have found one).
+
+    ``bounds``: over ALL items of the kind, each rate's range when every item
+    without a known outcome went either way. A known positive is a positive
+    outcome of a scored or partial item (its finding exists whatever the
+    failed calls would have said); a known negative is a negative outcome of a
+    scored item; everything else (partial without a finding, errored without a
+    result, not run) is unknown. ``worst_case`` is the lower end for recall
+    (every unknown introducing PR a miss) and the upper end for FP rates
+    (every unknown fix / benign PR flagged)."""
+    recs = [r for r in records if scored(r) or partial_result(r)]
+    out: dict = {"n_items": len(recs), "with_partial": {}, "bounds": {}}
+    for kind, key, name in SENSITIVITY_KEYS:
+        out["with_partial"][name] = _rate_of(recs, view, kind, key)
+        rs = [r for r in records if r["kind"] == kind]
+        known_pos = known_neg = 0
+        for r in rs:
+            value = (r.get("outcomes") or {}).get(view, {}).get(key) if r.get(
+                "outcomes") else None
+            if value:
+                known_pos += 1
+            elif value is not None and scored(r):
+                known_neg += 1
+        n = len(rs)
+        if not n or not any(((r.get("outcomes") or {}).get(view) or {}).get(key) is not None
+                            for r in rs):
+            continue
+        lo, hi = known_pos / n, (n - known_neg) / n
+        out["bounds"][name] = {
+            "n": n, "known_positive": known_pos, "known_negative": known_neg,
+            "unknown": n - known_pos - known_neg,
+            "lower": round(lo, 4), "upper": round(hi, 4),
+            "worst_case": round(lo if kind == KIND_INTRO else hi, 4)}
+    return out
+
+
+# ---------------------------------------------------------------------------
+# What the verifier removes; offline verifier policies
+# ---------------------------------------------------------------------------
+
+LOSS_KEYS = ((KIND_INTRO, "localised", "intro_catches_lost_strict"),
+             (KIND_INTRO, "localised_function", "intro_catches_lost_function"),
+             (KIND_INTRO, "any", "intro_any_finding_lost"),
+             (KIND_FIX, "fp", "fix_fps_removed"),
+             (KIND_BENIGN, "fp", "benign_fps_removed"))
+
+
+def view_losses(records: list[dict], strict_view: str = "verified",
+                loose_view: str = "audit_only") -> dict:
+    """Per kind, items positive in ``loose_view`` but not in ``strict_view``
+    (and the reverse, which should be 0 when the strict view is a subset), over
+    the scored records. For verified vs audit_only this is what the verifier
+    drops: introducing catches lost, fix / benign false alarms removed. (A
+    McNemar test between two nested views of one run is degenerate: the strict
+    view is a subset by construction, so every discordant pair goes one way.)"""
+    recs = [r for r in records if scored(r)]
+    out: dict = {"strict_view": strict_view, "loose_view": loose_view}
+    for kind, key, name in LOSS_KEYS:
+        lost = gained = n = 0
+        ids = []
+        for r in recs:
+            if r["kind"] != kind:
+                continue
+            a = r["outcomes"][strict_view].get(key)
+            b = r["outcomes"][loose_view].get(key)
+            if a is None or b is None:
+                continue
+            n += 1
+            if b and not a:
+                lost += 1
+                ids.append(r["base_id"])
+            elif a and not b:
+                gained += 1
+        out[name] = {"n": n, "count": lost, "strict_only": gained, "ids": ids}
+    return out
+
+
+def _policy_confirmed_at_least(k: int):
+    return lambda c: c.get("verdict") == "confirmed" and (c.get("verdict_confidence") or 0) >= k
+
+
+VERIFIER_POLICIES = (
+    *((f"confirmed>={k}", _policy_confirmed_at_least(k)) for k in (9, 8, 7, 6, 5)),
+    ("confirmed (any confidence)", lambda c: c.get("verdict") == "confirmed"),
+    ("confirmed or uncertain", lambda c: c.get("verdict") in ("confirmed", "uncertain")),
+    ("no verifier (every verifier-bound candidate)", lambda c: True),
+)
+
+
+def policy_findings(rec: dict, keep) -> list[dict]:
+    """The findings a verifier decision policy ``keep(candidate)`` would report:
+    the deterministic guard_diff findings plus the verifier-bound candidates it
+    keeps (replayed from the cached verdicts: no LLM call)."""
+    guard = [f for f in rec["findings"].get("verified") or [] if f.get("source") == "guard_diff"]
+    return guard + [c for c in rec.get("candidates") or []
+                    if c.get("status") in VERIFIER_BOUND and keep(c)]
+
+
+def policy_curve(records: list[dict], tol: int) -> list[dict]:
+    """Every ``VERIFIER_POLICIES`` entry over the scored records: introducing
+    catches (strict / function-level), fix PRs flagged, benign PRs flagged."""
+    recs = [r for r in records if scored(r) and r.get("candidates") is not None]
+    rows = []
+    for name, keep in VERIFIER_POLICIES:
+        outs = [(r, score_findings(r, policy_findings(r, keep), tol)) for r in recs]
+
+        def rate(kind, key, outs=outs):
+            return _rate([bool(o[key]) for r, o in outs if r["kind"] == kind
+                          and o.get(key) is not None])
+
+        rows.append({"policy": name,
+                     "intro_localised": rate(KIND_INTRO, "localised"),
+                     "intro_localised_function": rate(KIND_INTRO, "localised_function"),
+                     "fix_flagged": rate(KIND_FIX, "fp"),
+                     "benign_flagged": rate(KIND_BENIGN, "fp")})
+    return rows
 
 
 # Heuristic buckets for the verifier's free-text reason on rejected / uncertain
@@ -987,34 +1352,108 @@ def operational_metrics(records: list[dict], arm: str) -> dict:
 
 def summarize(records: list[dict], arm: str, tol: int) -> dict:
     attach_outcomes(records, tol)
-    return {
+    views = VIEWS_BY_ARM[arm]
+    out = {
         "status_counts": dict(Counter(r["status"] for r in records)),
-        "views": {v: view_metrics(records, v) for v in VIEWS_BY_ARM[arm]},
+        "coverage": coverage(records),
+        "views": {v: view_metrics(records, v) for v in views},
+        "sensitivity": {v: sensitivity(records, v) for v in views},
         "operational": operational_metrics(records, arm),
     }
+    if arm in PR_ARMS:
+        out["verifier_losses"] = view_losses(records, "verified", "audit_only")
+        out["verifier_policy_curve"] = policy_curve(records, tol)
+    return out
+
+
+def _fmt_opt(r: dict) -> str:
+    return "n/a (no facts: rescore with the dataset)" if not r["n"] else _fmt_rate(r)
+
+
+def _frac(r: dict) -> str:
+    return f"{r['k']}/{r['n']}" if r["n"] else "n/a"
 
 
 def print_view(title: str, m: dict) -> None:
     print(f"\n{title} (n scored={m['n_scored']}):")
     print(f"  introducing, localised TP (primary)  {_fmt_rate(m['tpr_localised'])}")
     print(f"  introducing, localised any vuln path {_fmt_rate(m['tpr_localised_any_vuln_path'])}")
+    print(f"  introducing, change-anchored         {_fmt_opt(m['tpr_localised_fix_anchor'])}")
+    print(f"  introducing, function-level          {_fmt_opt(m['tpr_localised_function'])}")
     print(f"  introducing, right file              {_fmt_rate(m['tpr_right_file'])}")
     print(f"  introducing, any finding             {_fmt_rate(m['tpr_any_finding'])}")
     print(f"  fix PRs, any finding (FP)            {_fmt_rate(m['fpr_fix'])}")
     print(f"  fix PRs, finding on the fixed lines  {_fmt_rate(m['fpr_fix_on_fixed_lines'])}")
+    print(f"  fix PRs, finding on a fix anchor     {_fmt_opt(m['fpr_fix_on_fix_anchor'])}")
+    print(f"  fix PRs, finding in a fixed function {_fmt_opt(m['fpr_fix_in_fixed_function'])}")
     print(f"  benign PRs, alert rate (FP)          {_fmt_rate(m['fpr_benign'])}"
-          f"  (findings/PR {m['benign_findings_per_pr']['mean']})")
-    print(f"  precision @ base rate                {m['precision_at_base_rate']} "
-          f"(benign FPR upper 95%: {m['precision_at_base_rate_fpr_upper95']})")
+          f"  (findings/PR {m['benign_findings_per_pr']['mean']}; exact 95% upper "
+          f"{m['fpr_benign_upper95_exact']})")
+    point = m["precision_at_base_rate_note"] or m["precision_at_base_rate"]
+    print(f"  precision @ base rate (point)        {point}")
+    print(f"  precision @ base rate, FPR at upper  {m['precision_at_base_rate_fpr_upper95']}")
     print(f"  pairs (intro localised vs fix FP)    {m['pairs_intro_localised_vs_fix_fp']}")
+    sc = m["in_scope"]
+    print(f"  in-scope recall (by scope {sc['by_scope']}):")
+    for name, label in (("all", "all items"), ("excl_dos", "excluding DoS"),
+                        ("in_scope_only", "excluding DoS + timing/race")):
+        g = sc[name]
+        print(f"    {label:<29} strict {_frac(g['localised'])}, function-level "
+              f"{_frac(g['localised_function'])}, any {_frac(g['any'])}")
+    lk = m["leaky_split"]
+    if lk:
+        print(f"  leaky diff split (deleted lines with security vocabulary: {lk['n_leaky']} "
+              f"leaky / {lk['n_not_leaky']} not):")
+        for key, label in INTRO_KEYS:
+            row = lk[key]
+            print(f"    {label:<16} leaky {_frac(row['leaky'])}, not leaky "
+                  f"{_frac(row['not_leaky'])}; exact Fisher p = {row['p_fisher_exact']:.3g}")
+    bp = m["benign_provenance"]
+    if bp:
+        print(f"  benign provenance: {bp['n']} bystanders {bp['by_bystander_of']}; share a "
+              f"commit with an intro item {bp['shares_commit_with_intro']}, with a fix item "
+              f"{bp['shares_commit_with_fix']}; identical subset of the fix item's files "
+              f"{bp['identical_subset_of_fix_files']}; no shared commit {bp['no_shared_commit']}")
+        print(f"    benign FP, all {_fmt_rate(bp['fpr_all'])}; no shared commit "
+              f"{_fmt_rate(bp['fpr_no_shared_commit'])} (exact 95% upper "
+              f"{bp['fpr_no_shared_commit_upper95_exact']})")
 
 
 def print_summary(summary: dict, arm: str) -> None:
     print(f"\nStatuses: {summary['status_counts']}")
+    print("Coverage by kind (n / scored / errored with partial result / errored, no result / "
+          "not run):")
+    for kind, c in (summary.get("coverage") or {}).items():
+        print(f"  {kind:<17} {c['n']:>3} / {c['scored']:>3} / {c['errored_partial']:>3} / "
+              f"{c['errored_no_result']:>3} / {c['not_run']:>3}")
     labels = {"verified": f"{arm}: verified (the report)" if arm in PR_ARMS else "units",
               "audit_only": f"{arm}: audit only (candidates before verification)"}
     for view in HEADLINE_VIEWS[arm]:
         print_view(labels[view], summary["views"][view])
+        sens = (summary.get("sensitivity") or {}).get(view)
+        if sens:
+            wp = sens["with_partial"]
+            print(f"  sensitivity, + {sens['n_items'] - summary['views'][view]['n_scored']} "
+                  f"errored items' partial results: "
+                  + ", ".join(f"{name} {_frac(wp[name])}" for _, _, name in SENSITIVITY_KEYS))
+            print("  bounds over ALL items (unknown outcomes either way; worst case first):")
+            for name, b in sens["bounds"].items():
+                print(f"    {name:<24} worst {b['worst_case']:.3f}, range [{b['lower']:.3f}, "
+                      f"{b['upper']:.3f}] (known +{b['known_positive']} / "
+                      f"-{b['known_negative']}, unknown {b['unknown']} of {b['n']})")
+    if arm in PR_ARMS and summary.get("verifier_losses"):
+        vl = summary["verifier_losses"]
+        print("\nWhat the verifier drops (audit_only positive, verified negative; scored items):")
+        for _, _, name in LOSS_KEYS:
+            row = vl[name]
+            print(f"  {name:<28} {row['count']} of {row['n']}"
+                  + (f" (verified-only {row['strict_only']})" if row["strict_only"] else ""))
+        print("\nVerifier policy curve (cached verdicts replayed, no LLM call; scored items):")
+        print(f"  {'policy':<46} {'intro strict':>12} {'intro fn':>9} {'fix':>7} {'benign':>7}")
+        for row in summary.get("verifier_policy_curve") or []:
+            print(f"  {row['policy']:<46} {_frac(row['intro_localised']):>12} "
+                  f"{_frac(row['intro_localised_function']):>9} {_frac(row['fix_flagged']):>7} "
+                  f"{_frac(row['benign_flagged']):>7}")
     op = summary["operational"]
     print(f"\nCost per PR: calls {op['calls_per_pr']}, tokens {op['tokens_per_pr']['mean']} "
           f"(p90 {op['tokens_per_pr']['p90']}), latency {op['latency_s_per_pr']}")
@@ -1030,11 +1469,63 @@ def print_summary(summary: dict, arm: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def rescore(data: dict, tol: int) -> dict:
+def refresh_facts(records: list[dict], items: list[dict], parser=None) -> dict:
+    """Recompute every record's ``facts`` from the dataset ``items`` (matched by
+    base id; ``pr_eval_facts.selection_facts`` over the items) and refresh its
+    ``category`` / ``cwe`` from the dataset (labels may have been corrected
+    since the run: ``build_pr_eval.LABEL_OVERRIDES``). Returns what changed."""
+    facts = selection_facts(items, parser)
+    changes, missing = [], []
+    for r in records:
+        f = facts.get(r["base_id"])
+        if f is None:
+            missing.append(r["base_id"])
+            continue
+        r["facts"] = f
+        new = f["labels"]
+        if (r.get("category"), r.get("cwe")) != (new["category"], new["cwe"]):
+            changes.append({"id": r["base_id"],
+                            "from": {"category": r.get("category"), "cwe": r.get("cwe")},
+                            "to": {"category": new["category"], "cwe": new["cwe"]},
+                            "reason": (new.get("label_override") or {}).get("reason")})
+            r["category"], r["cwe"] = new["category"], new["cwe"]
+    return {"facts": "recomputed from the dataset", "label_changes": changes,
+            "records_without_dataset_item": missing}
+
+
+def rescore(data: dict, tol: int, items: list[dict] | None = None, parser=None) -> dict:
+    """Recompute every metric from the stored findings. With the run's dataset
+    ``items``, the facts (change anchors, scope labels, leaky-diff terms,
+    benign provenance) are recomputed first (``refresh_facts``); without, the
+    records' stored facts are used (none in runs older than the facts)."""
     records = [dict(r) for r in data["items"]]
+    meta = (refresh_facts(records, items, parser) if items is not None
+            else {"facts": "as stored in the records"})
     summary = summarize(records, data["config"]["arm"], tol)
     return {**data, "config": {**data["config"], "localise_tolerance": tol},
-            "summary": summary, "items": records}
+            "rescore": meta, "summary": summary, "items": records}
+
+
+def run_datasets(data: dict, fallback) -> list[Path]:
+    """The dataset file(s) a saved run selected from (``config.selection``),
+    else ``fallback``; only those that exist."""
+    sel = (data.get("config") or {}).get("selection") or {}
+    paths = [BASE_DIR / p if not Path(p).is_absolute() else Path(p)
+             for p in sel.get("datasets") or []] or _as_paths(fallback)
+    return [p for p in paths if p.exists()]
+
+
+def load_run_items(data: dict, fallback) -> tuple[list[dict] | None, dict]:
+    """The dataset items of a saved run's records (by base id), with the files'
+    sha256; (None, meta) when no dataset file is available."""
+    paths = run_datasets(data, fallback)
+    if not paths:
+        return None, {"datasets": [], "note": "dataset not found: facts not recomputed"}
+    ids = {r["base_id"] for r in data["items"]}
+    items = load_items(paths, ids=ids)
+    return items, {"datasets": [_rel(p) for p in paths],
+                   "sha256": {_rel(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                              for p in paths}}
 
 
 def _flat(records: list[dict], view: str, tol: int) -> dict[str, dict]:
@@ -1062,11 +1553,37 @@ def paired(a: dict[str, dict], b: dict[str, dict], kind: str, key: str) -> dict:
             "p_mcnemar_exact": round(mcnemar_exact(a_only, b_only), 6)}
 
 
+# The PR arm's views, narrowest first: each keeps a subset of the next one's
+# findings by construction (verified = confirmed candidates + guard alerts).
+NESTED_VIEWS = ("verified", "audit_only", "audit_raw")
+
+
+def same_run(a: dict, b: dict) -> bool:
+    """Two saved results of the same run: same config and the same records."""
+    return a.get("config") == b.get("config") and [r["id"] for r in a["items"]] == [
+        r["id"] for r in b["items"]]
+
+
 def compare_runs(a_recs: list[dict], b_recs: list[dict], view_a: str = "verified",
-                 view_b: str = "verified", tol: int = DEFAULT_LOCALISE_TOLERANCE) -> dict:
+                 view_b: str = "verified", tol: int = DEFAULT_LOCALISE_TOLERANCE,
+                 same: bool = False) -> dict:
     """Paired comparison by base id: exact McNemar on introducing localised TP
     (and any-finding TP) and on fix FP; exact binomial CIs (all scored) plus
-    the paired table on benign FPR."""
+    the paired table on benign FPR.
+
+    ``same`` (one run, two of its nested views, e.g. verified vs audit_only):
+    no McNemar, which would be degenerate (the narrower view is a subset by
+    construction, so every discordant pair points one way and the "test" only
+    measures how much the verifier removed); the result is ``view_losses``
+    instead: catches lost and false alarms removed per kind."""
+    if same and view_a != view_b and {view_a, view_b} <= set(NESTED_VIEWS):
+        strict, loose = sorted((view_a, view_b), key=NESTED_VIEWS.index)
+        recs = [dict(r) for r in a_recs]
+        attach_outcomes(recs, tol)
+        return {"view_a": view_a, "view_b": view_b, "localise_tolerance": tol,
+                "nested_views": True,
+                "note": f"{strict} is a subset of {loose} in one run: losses, not McNemar",
+                "losses": view_losses(recs, strict, loose)}
     a, b = _flat(a_recs, view_a, tol), _flat(b_recs, view_b, tol)
     return {
         "view_a": view_a, "view_b": view_b, "localise_tolerance": tol,
@@ -1086,6 +1603,12 @@ def compare_runs(a_recs: list[dict], b_recs: list[dict], view_a: str = "verified
 def print_comparison(label_a: str, label_b: str, cmp: dict) -> None:
     print(f"\nPaired comparison (by base id)  A = {label_a} [{cmp['view_a']}]\n"
           f"                                B = {label_b} [{cmp['view_b']}]")
+    if cmp.get("nested_views"):
+        print(f"  Nested views of one run ({cmp['note']}):")
+        for _, _, name in LOSS_KEYS:
+            row = cmp["losses"][name]
+            print(f"    {name:<28} {row['count']} of {row['n']}")
+        return
     print(f"  common {cmp['n_common']} (only in A {cmp['n_only_in_a']}, only in B "
           f"{cmp['n_only_in_b']})")
     for title, t in (("Introducing, localised TP (primary)", cmp["intro_localised_tp"]),
@@ -1391,7 +1914,15 @@ def build_parser() -> argparse.ArgumentParser:
     llm.add_argument("--verifier-model", default=None, metavar="PROVIDER:MODEL",
                      help="Pin the verifier to this model (default: the audit's router).")
     llm.add_argument("--llm-temperature", type=float, default=DEFAULT_EVAL_TEMPERATURE,
-                     metavar="T")
+                     metavar="T",
+                     help="Force this sampling temperature on every call. Default: no "
+                          "override, each model's recommended sampling (settings.LLM_SAMPLING, "
+                          "e.g. qwen/qwen3.8-27b: temperature 1.0, top_p 0.95, top_k 20), as "
+                          "production sends. Part of the cache key.")
+    llm.add_argument("--llm-repeat-index", type=int, default=0, metavar="R",
+                     help="Cache repeat index of this run's calls (default 0). With stochastic "
+                          "sampling, run the same selection with R = 0, 1, ... (one --out "
+                          "each) for independent samples of every call; --compare pairs them.")
     llm.add_argument("--llm-max-calls", type=int, default=None, metavar="N",
                      help=f"Hard cap on real calls this run (1..{LLM_MAX_CALLS_CAP}; cached "
                           "calls don't count). Required for a real run.")
@@ -1441,8 +1972,10 @@ def parse_args(argv=None) -> argparse.Namespace:
         parser.error("--llm-sleep and --llm-tpm must be >= 0.")
     if args.llm_max_rate_limit_errors < 1:
         parser.error("--llm-max-rate-limit-errors must be >= 1.")
-    if not 0.0 <= args.llm_temperature <= 2.0:
+    if args.llm_temperature is not None and not 0.0 <= args.llm_temperature <= 2.0:
         parser.error("--llm-temperature must be between 0 and 2.")
+    if args.llm_repeat_index < 0:
+        parser.error("--llm-repeat-index must be >= 0.")
     for flag, spec in (("--llm-model", args.llm_model), ("--verifier-model",
                                                           args.verifier_model)):
         if spec:
@@ -1461,7 +1994,8 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def build_routers(args):
-    """(audit router, verifier router or None), every client at --llm-temperature."""
+    """(audit router, verifier router or None), every client at --llm-temperature
+    (None: no override, each model's recommended sampling)."""
     router = (build_pinned_router(args.llm_model) if args.llm_model
               else build_llm_router(args.llm_primary_only))
     set_router_temperature(router, args.llm_temperature)
@@ -1490,6 +2024,10 @@ def run_config(args, router, verifier, semgrep_meta: dict | None) -> dict:
         "primary_only": bool(args.llm_model or args.llm_primary_only),
         "openrouter_provider_routing": _routing(args, router),
         "temperature": args.llm_temperature,
+        "sampling": None if getattr(router, "mock", False) else client_sampling(
+            router.clients[0]),
+        "sampling_key": router_temperature(router),
+        "repeat_index": args.llm_repeat_index,
         "max_calls": args.llm_max_calls,
         "token_budget": args.llm_token_budget,
         "sleep_s": args.llm_sleep,
@@ -1598,17 +2136,19 @@ async def run_live(args, items, router, verifier, semgrep_cache, tap
                     token_budget=args.llm_token_budget, sleep_s=args.llm_sleep,
                     tpm=args.llm_tpm or None,
                     max_rate_limit_errors=args.llm_max_rate_limit_errors, tap=tap,
-                    temperature=args.llm_temperature)
+                    temperature=args.llm_temperature, repeat=args.llm_repeat_index)
     audit = GatedRouter(router, gate)
     verify = GatedRouter(verifier, gate) if verifier is not None else audit
     parser = _parser()
     config = pr_review_config()
+    facts = selection_facts(items, parser)
     records = []
     announced = False
     for n, item in enumerate(items, start=1):
         rec = await run_item(item, args.arm, router=audit, verifier_router=verify, gate=gate,
                              parser=parser, semgrep_scanner=_item_scanner(semgrep_cache, item),
                              config=config)
+        rec["facts"] = facts[item["id"]]
         records.append(rec)
         views = rec["findings"]
         print(f"  [{n}/{len(items)}] {item['id']} ({item['kind']}): {rec['status']}, "
@@ -1630,9 +2170,12 @@ def run_real(args) -> dict:
     config = run_config(args, router, verifier, semgrep_meta)
     config["selection"] = meta
     routing = config["openrouter_provider_routing"]
+    temp = ("model default" if args.llm_temperature is None
+            else f"forced {args.llm_temperature:g}")
     print(f"PR eval ({args.arm}): {len(items)} items {meta['by_kind']}; model "
-          f"{config['model']}, verifier {config['verifier_model'] or 'same'}, temperature "
-          f"{args.llm_temperature:g}; max {args.llm_max_calls} real calls; cache "
+          f"{config['model']}, verifier {config['verifier_model'] or 'same'}, sampling "
+          f"{temp} {config['sampling']}, repeat {args.llm_repeat_index}; max "
+          f"{args.llm_max_calls} real calls; cache "
           f"{args.llm_cache}." + (f" OpenRouter routing: {routing}." if routing else ""),
           flush=True)
 
@@ -1660,7 +2203,15 @@ def run_real(args) -> dict:
 def main(argv=None):
     args = parse_args(argv)
     if args.rescore is not None:
-        data = rescore(json.loads(Path(args.rescore).read_text()), args.localise_tolerance)
+        data = json.loads(Path(args.rescore).read_text())
+        items, source = load_run_items(data, args.dataset)
+        data = rescore(data, args.localise_tolerance, items,
+                       parser=_parser() if items is not None else None)
+        data["rescore"].update(source)
+        print(f"Rescore: facts {data['rescore']['facts']} {source.get('datasets')}; "
+              f"label changes {len(data['rescore'].get('label_changes') or [])}")
+        for ch in data["rescore"].get("label_changes") or []:
+            print(f"  {ch['id']}: {ch['from']} -> {ch['to']} ({ch['reason']})")
         print_summary(data["summary"], data["config"]["arm"])
         if args.out:
             Path(args.out).write_text(json.dumps(data, indent=1))
@@ -1669,8 +2220,15 @@ def main(argv=None):
     if args.compare is not None:
         a_path, b_path = args.compare
         a, b = (json.loads(Path(p).read_text()) for p in (a_path, b_path))
+        same = Path(a_path).resolve() == Path(b_path).resolve() or same_run(a, b)
+        parser = None
+        for run in (a, b):  # current facts / labels for the change-anchored levels
+            items, _ = load_run_items(run, args.dataset)
+            if items is not None:
+                parser = parser or _parser()
+                refresh_facts(run["items"], items, parser)
         cmp = compare_runs(a["items"], b["items"], args.view_a, args.view_b,
-                           args.localise_tolerance)
+                           args.localise_tolerance, same=same)
         print_comparison(f"{_rel(a_path)} ({a['config']['arm']}, {a['config'].get('model')})",
                          f"{_rel(b_path)} ({b['config']['arm']}, {b['config'].get('model')})",
                          cmp)

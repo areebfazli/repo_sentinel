@@ -189,7 +189,7 @@ FP, Semgrep >= high fires rarely.
 
 ## PR-level eval harness (2026-09-30)
 
-`ml/evaluation/run_pr_eval.py` (README "PR-level eval"): arms `pr` (scored as `verified` and
+`ml/evaluation/run_pr_eval.py` ([docs/DETAILS.md, "PR-level eval"](docs/DETAILS.md#pr-level-eval)): arms `pr` (scored as `verified` and
 `audit_only` from one run), `units` (the per-unit review in-process, same PRs) and
 `pr_misleading` (the introducing PRs with a "harmless refactor" title / body). Retrieval off,
 deterministic nonces, per-call JSONL cache (resume), pacing / call / token budgets,

@@ -49,6 +49,11 @@ contents were never fetched). Patches are regenerated with difflib (standard
 ``@@`` headers, 3 context lines, ``a/<path>`` / ``b/<path>``, git's
 ``\\ No newline at end of file`` marker) so ``apply_patch(old, patch) == new``.
 
+Labels: ``cwe`` is the first CWE of the advisory's OSV record and ``category``
+the corpus category of its eval pair (``cwe_to_category``), except where
+``LABEL_OVERRIDES`` corrects a CWE tag that contradicts the advisory's own text
+(``meta.label_override`` records the original).
+
 ``pr_title`` / ``pr_body`` are synthetic and neutral ("Update <path>"): the
 commit message and advisory text are never used (they would leak the label). A
 variant file gives each vuln_introducing item a misleading benign description
@@ -82,6 +87,7 @@ if str(ROOT) not in sys.path:
 from scripts.build_corpus_from_osv import (  # noqa: E402
     SUPPORTED_EXTENSIONS,
     _is_skipped_path,
+    cwe_to_category,
     pair_code_hash,
 )
 
@@ -107,6 +113,50 @@ MISLEADING_BODY = (
 
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 NO_NEWLINE = "\\ No newline at end of file"
+
+# Label corrections. An item's ``cwe`` is the first CWE of its OSV record
+# (``database_specific.cwe_ids``, via the corpus builder's state) and its
+# ``category`` is ``cwe_to_category`` of that list. These advisories' CWE tags
+# contradict their own summary / details (checked offline against the OSV
+# export in data/osv_cache/{npm,PyPI}_all.zip), so the label comes from here
+# instead. Keyed by OSV id; an item matches if any of its ``meta.osv_ids`` does.
+# The original label is kept in ``meta.label_override.from``, and ``sample_dev``
+# stratifies on it so a correction never reshuffles the pre-registered sample.
+LABEL_OVERRIDES: dict[str, dict] = {
+    # CVE-2020-7771, "Prototype Pollution in asciitable.js": the advisory's PoC
+    # sets ``__proto__`` through the main function; OSV tags it CWE-400.
+    "GHSA-5pxj-mhwj-x5gv": {
+        "cwe": "CWE-1321",
+        "reason": "CVE-2020-7771 is prototype pollution (advisory title and __proto__ PoC); "
+                  "OSV tags CWE-400",
+    },
+    # CVE-2013-0270, "OpenStack Keystone Denial of Service vulnerability via a large
+    # HTTP request" ("CPU and memory consumption"); OSV tags CWE-119 / CWE-1284,
+    # memory-safety numbers that do not describe a Python request-size DoS.
+    "GHSA-4ppj-4p4v-jf4p": {
+        "cwe": "CWE-400",
+        "reason": "CVE-2013-0270 is a denial of service via a large HTTP request (CPU and "
+                  "memory consumption); OSV tags CWE-119 / CWE-1284",
+    },
+}
+
+
+def label_override(osv_ids) -> tuple[str, dict] | None:
+    """``(osv id, override)`` of the first of ``osv_ids`` (sorted) listed in
+    ``LABEL_OVERRIDES``, else None. The override's category is
+    ``cwe_to_category`` of its CWE, like every other label."""
+    for osv_id in sorted(osv_ids or ()):
+        if osv_id in LABEL_OVERRIDES:
+            o = LABEL_OVERRIDES[osv_id]
+            return osv_id, {**o, "category": cwe_to_category([o["cwe"]])}
+    return None
+
+
+def sample_category(item: dict) -> str | None:
+    """The category ``sample_dev`` stratifies on: the as-built (OSV-derived)
+    one, also for an item whose label ``LABEL_OVERRIDES`` corrected."""
+    o = (item.get("meta") or {}).get("label_override")
+    return o["from"]["category"] if o else item.get("category")
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +575,7 @@ def sample_dev(items: list[dict], seed: int, n_vuln: int = 60, n_benign: int = 8
                     and it["meta"]["pair_base"] in fix_of), key=lambda it: it["id"])
     strata: dict[tuple, list[dict]] = defaultdict(list)
     for it in intro:
-        strata[(it["language"], it["category"] or "none")].append(it)
+        strata[(it["language"], sample_category(it) or "none")].append(it)
     quotas = _quotas(n_vuln, {k: len(v) for k, v in strata.items()})
     picked: list[dict] = []
     for k in sorted(strata):
@@ -778,6 +828,10 @@ def build_vuln_items(commit: tuple[str, str], bases: list[str], pairs_by_base: d
     cve = next((d for d in display if d.startswith("CVE-")), None)
     cwe = next((sp["cwe_id"] for sp in srcs if sp.get("cwe_id")), None)
     category = next((pairs_by_base[b]["vuln"]["category"] for b in bases), first["category"])
+    osv_ids = sorted({sp["advisory_id"] for sp in srcs})
+    override = label_override(osv_ids)
+    if override is not None:
+        stats["label_override"] += 1
     base = pr_base_id(advisory_id, repo, sha)
     n_changed = sum(changed_count(e) for e in kept)
     notes = []
@@ -793,7 +847,7 @@ def build_vuln_items(commit: tuple[str, str], bases: list[str], pairs_by_base: d
                      f"pre-fix file.")
     title, body = neutral_pr_text([e["path"] for e in kept])
     meta = {
-        "commit": sha, "osv_ids": sorted({sp["advisory_id"] for sp in srcs}),
+        "commit": sha, "osv_ids": osv_ids,
         "advisory_ids": display, "pair_base": base,
         "eval_pair_ids": sorted(bases), "vuln_paths": priority,
         "vuln_functions": sorted({f"{sp['file_path']}::{sp['function_name']}"
@@ -804,6 +858,11 @@ def build_vuln_items(commit: tuple[str, str], bases: list[str], pairs_by_base: d
         "dropped_files": dropped, "omitted_files": sorted(omitted),
         "changed_lines": n_changed,
     }
+    if override is not None:
+        osv_id, o = override
+        meta["label_override"] = {"advisory": osv_id, "reason": o["reason"],
+                                  "from": {"cwe": cwe, "category": category}}
+        cwe, category = o["cwe"], o["category"]
     common = {
         "language": item_language(kept, target), "repo": repo, "advisory_id": advisory_id,
         "cve_id": cve, "category": category, "cwe": cwe, "split": split,

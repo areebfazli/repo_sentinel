@@ -22,6 +22,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
 from backend.app.core.diff_utils import parse_patch_changed_lines  # noqa: E402
 from scripts.build_pr_eval import (  # noqa: E402
+    LABEL_OVERRIDES,
     LEAK_ID_RE,
     MISLEADING_TITLE,
     PatchError,
@@ -30,12 +31,14 @@ from scripts.build_pr_eval import (  # noqa: E402
     build_bystander_item,
     build_vuln_items,
     file_entry,
+    label_override,
     main,
     make_misleading,
     neutral_pr_text,
     patch_line_numbers,
     reconstruct,
     reverse_entry,
+    sample_category,
     sample_dev,
     select_files,
     split_for_ids,
@@ -265,6 +268,30 @@ def test_reversed_and_real_fix_direction():
     assert (intro["advisory_id"], intro["cve_id"], intro["cwe"]) == (
         "CVE-2024-0001", "CVE-2024-0001", "CWE-78")
     assert [f["path"] for f in intro["files"]] == sorted(f["path"] for f in intro["files"])
+
+
+def test_label_overrides_fix_contradicted_cwe_tags():
+    # CVE-2020-7771 (prototype pollution tagged CWE-400) and CVE-2013-0270 (a
+    # request-size DoS tagged CWE-119): the corrected label, category via the
+    # corpus table.
+    assert label_override(["GHSA-5pxj-mhwj-x5gv"])[1]["category"] == "prototype_pollution"
+    osv_id, o = label_override(["PYSEC-2026-650", "GHSA-4ppj-4p4v-jf4p"])
+    assert (osv_id, o["cwe"], o["category"]) == ("GHSA-4ppj-4p4v-jf4p", "CWE-400", "redos")
+    assert label_override(["GHSA-aaaa-bbbb-cccc"]) is None
+    assert all(o["reason"] for o in LABEL_OVERRIDES.values())
+    base = "CVE-2024-0001_f_12345678"
+    items = build_vuln_items((REPO, SHA), [base], {base: _pair(base, VULN.split("\n\n\n")[0])},
+                             {base: [_prov("app/run.py", adv="GHSA-5pxj-mhwj-x5gv")]},
+                             _entries(), [], "dev", 6, 2000, Counter())
+    for it in items:  # intro and fix alike
+        assert (it["cwe"], it["category"]) == ("CWE-1321", "prototype_pollution")
+        assert it["meta"]["label_override"]["from"] == {"cwe": "CWE-78",
+                                                        "category": "cmd_injection"}
+        # The pre-registered sample keeps stratifying on the as-built category.
+        assert sample_category(it) == "cmd_injection"
+    plain, _ = _vuln_items(_entries())
+    assert "label_override" not in plain[0]["meta"]
+    assert sample_category(plain[0]) == plain[0]["category"] == "cmd_injection"
 
 
 def test_pr_text_is_neutral_and_misleading_variant():

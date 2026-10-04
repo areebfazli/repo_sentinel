@@ -93,7 +93,7 @@ class StubLLM:
         self.fail = fail
         self.prompts: list[tuple[str, str]] = []
 
-    async def generate(self, system, user, *, deadline=None):
+    async def generate(self, system, user, *, deadline=None, validate=None):
         self.prompts.append((system, user))
         if self.fail is not None:
             raise self.fail
@@ -375,6 +375,46 @@ def test_budget_stop_marks_item_not_run_and_resumes(tmp_path):
     # A token budget stops before the call that would exceed it.
     rec3, gate3 = _run(fix_item(), "pr", StubLLM(), _gate(token_budget=10))
     assert gate3.stopped == "token_budget" and rec3["status"] == "not_run"
+
+
+def test_cached_answer_failing_the_validator_is_a_miss_within_budget(tmp_path):
+    path = tmp_path / "cache.jsonl"
+    # A run whose verifier answer had no verdict (cached as is; the stub
+    # ignores the format check, the pipeline's own check marks it unverified).
+    bad = StubLLM(audit={"findings": [TRAVERSAL]}, verdict={"note": "no verdict"})
+    rec0, _ = _run(intro_item(), "pr", bad, _gate(LLMCache(path)))
+    shas = rec0["prompt_shas"]
+    assert rec0["candidates"][0]["status"] == "unverified"
+    # Replay without budget: the audit replays, the cached verifier answer fails
+    # the validator -> treated as a miss, and no real call is allowed.
+    llm = StubLLM(audit={"findings": [TRAVERSAL]})
+    rec1, gate1 = _run(intro_item(), "pr", llm, _gate(LLMCache(path), max_calls=0))
+    assert rec1["status"] == "not_run" and llm.prompts == []
+    assert rec1["call_log"][1]["cached_invalid"] == "no verdict"
+    # With budget: one real verifier call; the prompts (and cache keys) are unchanged.
+    rec2, gate2 = _run(intro_item(), "pr", llm, _gate(LLMCache(path), max_calls=5))
+    assert rec2["status"] == "ok" and gate2.calls == 1
+    assert [s for s, _ in llm.prompts] == [VERIFIER_SYSTEM_PROMPT]
+    assert rec2["prompt_shas"] == shas and rec2["candidates"][0]["status"] == "confirmed"
+    # The new answer replaced the entry: a third run replays everything.
+    rec3, gate3 = _run(intro_item(), "pr", StubLLM(), _gate(LLMCache(path), max_calls=0))
+    assert rec3["status"] == "cached" and gate3.calls == 0
+
+
+def test_router_bad_output_error_is_classified_and_kept_as_bad_output():
+    err = LLMError("All LLM clients failed: unusable answer: no verdict", bad_output=True)
+    llm = StubLLM(audit={"findings": [TRAVERSAL]})
+
+    async def failing_verify(system, user, **kw):
+        llm.prompts.append((system, user))
+        if system == VERIFIER_SYSTEM_PROMPT:
+            raise err
+        return llm.audit, llm.label
+
+    llm.generate = failing_verify
+    rec, _ = _run(intro_item(), "pr", llm)
+    assert rec["status"] == "error" and rec["error_kind"] == "bad_output"
+    assert rec["candidates"][0]["status_reason"] == "bad_output"
 
 
 def test_llm_errors_are_items_in_error_and_rate_limits_stop():

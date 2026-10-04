@@ -74,10 +74,12 @@ class PRRouter:
         self.audit_prompts: list[str] = []
         self.verify_prompts: list[str] = []
         self.systems: list[str] = []
+        self.validators: list = []
         self.label = label
 
-    async def generate(self, system, user, *, deadline=None):
+    async def generate(self, system, user, *, deadline=None, validate=None):
         self.systems.append(system)
+        self.validators.append(validate)
         if system == AUDIT_SYSTEM_PROMPT:
             i = len(self.audit_prompts)
             self.audit_prompts.append(user)
@@ -410,6 +412,52 @@ def test_bad_audit_answer_for_one_prompt_among_two_is_partial():
     assert {u["reason"] for u in result["units_not_reviewed"]} == {"bad_output"}
 
 
+def test_schema_checks_are_passed_to_the_router_as_validators():
+    router = PRRouter(audits=[{"need_context": [{"symbol": "clean"}]}, {"findings": [TRAVERSAL]}])
+    _review(_files(("app/files.py", PY_OLD, PY_NEW)), router, context_rounds=1)
+    audit_ctx, audit_final, verify = router.validators
+    bare = {"title": "Path traversal", "quoted_code": "return open(p).read()"}
+    asks = {"need_context": [{"symbol": "x"}]}
+    assert audit_ctx(bare) and audit_final(bare)  # a salvaged finding never passes
+    assert audit_ctx(asks) is None and audit_final(asks)  # context only while rounds remain
+    assert audit_ctx({"findings": []}) is None and audit_final({"findings": []}) is None
+    assert verify({"verdict": "rejected"}) is None and verify({"findings": []})
+
+
+class UnusableRouter(PRRouter):
+    """Every model's answer failed the format check (the router raises)."""
+
+    def __init__(self, fail_role, **kw):
+        super().__init__(**kw)
+        self.fail_role = fail_role
+
+    async def generate(self, system, user, *, deadline=None, validate=None):
+        role = "audit" if system == AUDIT_SYSTEM_PROMPT else "verifier"
+        if role == self.fail_role:
+            self.systems.append(system)
+            raise LLMError("All LLM clients failed: unusable answer: no findings list",
+                           bad_output=True)
+        return await super().generate(system, user, deadline=deadline, validate=validate)
+
+
+def test_audit_unusable_on_every_model_is_bad_output_and_failed_not_clean():
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), UnusableRouter("audit"))
+    assert result["review_status"] == "failed" and result["report_findings"] == []
+    assert {u["reason"] for u in result["units_not_reviewed"]} == {"bad_output"}
+    assert result["pr_review"]["bad_output"] == 1
+    assert "No security findings in the reviewed code" not in result["report_markdown"]
+
+
+def test_verifier_unusable_on_every_model_leaves_the_candidate_unverified():
+    router = UnusableRouter("verifier", audits=[{"findings": [TRAVERSAL]}])
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router)
+    [c] = result["candidates"]
+    assert (c["status"], c["status_reason"]) == ("unverified", "bad_output")
+    assert result["review_status"] == "partial" and result["report_findings"] == []
+    s = result["pr_review"]
+    assert (s["unverified"], s["bad_output"]) == (1, 1)
+
+
 def test_failed_call_after_a_context_request_does_not_count_as_reviewed():
     router = PRRouter(audits=[{"need_context": [{"symbol": "clean"}]}], fail_audit={1})
     result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router)
@@ -580,7 +628,7 @@ def test_time_budget_stops_audits():
         def clock(self):
             return self.now
 
-        async def generate(self, system, user, *, deadline=None):
+        async def generate(self, system, user, *, deadline=None, validate=None):
             self.now += 100.0
             return await super().generate(system, user, deadline=deadline)
 
@@ -604,7 +652,7 @@ def test_mock_router_reports_clean_with_note():
     class Mock:
         mock = True
 
-        async def generate(self, system, user, *, deadline=None):
+        async def generate(self, system, user, *, deadline=None, validate=None):
             return MOCK_RESPONSE, "mock"
 
     result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), Mock())

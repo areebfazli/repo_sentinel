@@ -152,6 +152,94 @@ def test_extract_json_complete_draft_before_truncated_final_returns_the_draft():
     assert extract_json(content) == {"findings": []}
 
 
+def _findings_list(obj):
+    return None if isinstance(obj.get("findings"), list) else "no findings list"
+
+
+def test_extract_json_validator_skips_a_trailing_example_object():
+    answer = {"findings": [{"title": "SQL injection", "line": 4}]}
+    content = (f"{json.dumps(answer)}\nFor reference, each finding looks like "
+               '{"title": "...", "line": 0}.')
+    assert extract_json(content, validate=_findings_list) == answer
+    # Without a validator the last complete object still wins (unchanged).
+    assert extract_json(content) == {"title": "...", "line": 0}
+
+
+def test_extract_json_validator_takes_the_last_passing_candidate():
+    content = 'Draft {"findings": []} final {"findings": [1]} note {"note": "x"}'
+    assert extract_json(content, validate=_findings_list) == {"findings": [1]}
+
+
+@pytest.mark.parametrize("prose", [
+    'He said "hi {" and meant it. ',
+    'An unclosed {"key in prose, ',
+    "Braces {\"a\": 1, ...} in prose. ",
+])
+def test_extract_json_unclosed_brace_or_quote_in_prose_does_not_hide_the_answer(prose):
+    content = f'{prose}Answer: {{"findings": [3]}}'
+    assert extract_json(content) == {"findings": [3]}
+    assert extract_json(content, validate=_findings_list) == {"findings": [3]}
+
+
+def test_extract_json_validator_never_takes_an_inner_object_of_truncated_output():
+    content = ('{"findings": [{"title": "Path traversal", "quoted_code": "open(p)"}, '
+               '{"title": "XSS", "quoted_co')
+    with pytest.raises(json.JSONDecodeError):
+        extract_json(content, validate=lambda o: None)
+
+
+@pytest.mark.parametrize("content", [
+    '{"title": "a bare finding"}',                      # plain JSON
+    'Answer: {"title": "a"} and {"note": "b"}',         # objects, none passes
+    '```json\n[{"title": "a"}]\n```',                 # a fenced list
+])
+def test_extract_json_no_passing_candidate_is_an_invalid_answer(content):
+    with pytest.raises(llm_client.InvalidAnswer, match="no findings list|not a list|"
+                                                       "object"):
+        extract_json(content, validate=lambda o: _findings_list(o) if isinstance(o, dict)
+                     else "not an object")
+
+
+def test_validator_failure_on_one_model_falls_through_to_the_next(monkeypatch):
+    from backend.app.core.pr_review import audit_schema_problem
+
+    _pin_openrouter(monkeypatch, retries=1)  # fallback: gemini
+    _patch_sleep(monkeypatch)
+    script = _Script()
+    # A bare finding (no findings list): parsed fine, but not an audit answer.
+    script.set(PRIMARY, [_ok('{"title": "Path traversal", "line": 7}')])
+    script.set(GEMINI, [_ok('{"findings": [{"title": "from gemini"}]}')])
+    _patch_script(monkeypatch, script)
+    data, label = asyncio.run(LLMRouter().generate(
+        "s", "u", validate=lambda d: audit_schema_problem(d, final=True)))
+    assert label == "gemini:gemini-2.0-flash" and data["findings"][0]["title"] == "from gemini"
+    assert script.call_count(PRIMARY) == 1  # not retried on the same client
+
+
+def test_every_model_failing_the_validator_raises_bad_output(monkeypatch):
+    from backend.app.core.pr_review import verifier_schema_problem
+
+    _pin_openrouter(monkeypatch, retries=1)
+    _patch_sleep(monkeypatch)
+    script = _Script()
+    script.set(PRIMARY, [_ok('{"note": "no verdict"}')])
+    script.set(GEMINI, [_ok('{"findings": []}')])
+    _patch_script(monkeypatch, script)
+    with pytest.raises(LLMError, match="unusable answer: no verdict") as info:
+        asyncio.run(LLMRouter().generate("s", "u", validate=verifier_schema_problem))
+    assert info.value.bad_output is True
+
+
+def test_other_failures_are_not_bad_output(monkeypatch):
+    _pin_openrouter(monkeypatch, retries=0, fallback_provider=None)
+    script = _Script()
+    script.set(PRIMARY, [_FakeResp(500, text="boom")])
+    _patch_script(monkeypatch, script)
+    with pytest.raises(LLMError) as info:
+        asyncio.run(LLMRouter().generate("s", "u", validate=lambda d: None))
+    assert info.value.bad_output is False
+
+
 # --- max_tokens and truncated output ---------------------------------------------------
 
 

@@ -265,6 +265,34 @@ class ShapeRouter:
         return answer, "groq:stub"
 
 
+class ValidatingRouter:
+    """Like LLMRouter: applies ``validate``; with every model's answer failing
+    it, raises the router's bad-output LLMError."""
+
+    mock = False
+
+    def __init__(self, answer):
+        self.answer = answer
+        self.validators = []
+
+    async def generate(self, system, user, *, deadline=None, validate=None):
+        self.validators.append(validate)
+        problem = validate(self.answer) if validate is not None else None
+        if problem:
+            raise LLMError(f"All LLM clients failed: unusable answer: {problem}",
+                           bad_output=True)
+        return self.answer, "groq:stub"
+
+
+def test_units_review_passes_its_schema_check_and_reports_bad_output(monkeypatch):
+    router = ValidatingRouter({"unit": "U1", "title": "t", "quoted_code": "y0 = x + 0"})
+    status, result = _run_files(1, router, monkeypatch)
+    assert status == "completed" and router.validators
+    assert router.validators[0]({"findings": []}) is None
+    assert result["review_status"] == "failed"
+    assert [u["reason"] for u in result["units_not_reviewed"]] == ["bad_output"]
+
+
 @pytest.mark.parametrize("answer", [
     {"unit": "U1", "title": "t", "quoted_code": "y0 = x + 0"},  # one finding, salvaged
     {}, {"findings": None}, {"findings": "none"}, ["findings"],
@@ -311,7 +339,7 @@ class DeadlineRouter:
     def clock(self):
         return self.now
 
-    async def generate(self, system, user, *, deadline=None):
+    async def generate(self, system, user, *, deadline=None, validate=None):
         self.deadlines.append(deadline)
         if self.calls >= self.give_up_after:
             raise LLMError("rate budget would end after the deadline", deadline_exceeded=True)

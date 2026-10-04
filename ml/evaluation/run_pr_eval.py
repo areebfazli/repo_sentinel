@@ -33,9 +33,13 @@ Every prompt uses deterministic nonces (``eval_nonce`` of the base id and the
 call's position), so prompts, and the cache, are reproducible. The LLM calls
 go through ``EvalGate``: a JSONL cache keyed by (item id, call prompt sha256,
 model, sampling, ``--llm-repeat-index``) so a re-run replays finished calls and
-resumes. Sampling defaults to each model's recommended parameters
-(settings.LLM_SAMPLING, what production sends; e.g. temperature 1.0, top_p
-0.95, top_k 20 for qwen/qwen3.8-27b) and is keyed as
+resumes. The pipeline's per-call format check (``validate``: the audit /
+verifier / units schema checks) is not part of the key, so entries cached
+before it existed still replay; a cached answer it rejects is a miss, re-asked
+within the run's call budget, and the new answer replaces the entry. Sampling
+defaults to each model's recommended parameters (settings.LLM_SAMPLING, what
+production sends; e.g. temperature 1.0, top_p 0.95, top_k 20 for
+qwen/qwen3.8-27b) and is keyed as
 ``llm_eval_common.sampling_key``: a plain number for a temperature-only run
 (``--llm-temperature 0`` replays the existing temperature-0 entries), a
 ``"sampling:{...}"`` string otherwise, so the two never replay each other.
@@ -558,7 +562,13 @@ class EvalGate:
         the model's recommended sampling under the default)."""
         return router_temperature(inner) if self.temperature is None else float(self.temperature)
 
-    async def call(self, inner, system: str, user: str) -> tuple:
+    async def call(self, inner, system: str, user: str, validate=None) -> tuple:
+        """``validate``: the pipeline's format check (``LLMRouter.generate``).
+        It never enters the cache key (prompt sha, model, sampling, repeat), so
+        entries cached before it existed still replay; a cached answer it
+        rejects is a miss (logged as ``cached_invalid``): a real call is made,
+        within the run's call / token budget like any other, and its answer
+        replaces the entry."""
         role = call_role(system)
         sha = call_sha256(system, user)
         model = model_key(inner)
@@ -571,9 +581,12 @@ class EvalGate:
         cached = (self.cache.get(self.item_id, sha, model, temp, self.repeat)
                   if self.cache is not None else None)
         if cached is not None and "llm_json" in cached:
-            entry.update(cached=True, provider=cached.get("provider_used"),
-                         latency_s=cached.get("latency_s"), usage=cached.get("usage"))
-            return cached["llm_json"], cached.get("provider_used")
+            problem = validate(cached["llm_json"]) if validate is not None else None
+            if problem is None:
+                entry.update(cached=True, provider=cached.get("provider_used"),
+                             latency_s=cached.get("latency_s"), usage=cached.get("usage"))
+                return cached["llm_json"], cached.get("provider_used")
+            entry["cached_invalid"] = problem
         if self.stopped is None:
             if self.calls >= self.max_calls:
                 self.stopped = "max_calls"
@@ -592,7 +605,8 @@ class EvalGate:
             self.tap.take()
         t0 = time.perf_counter()
         try:
-            llm_json, provider = await inner.generate(system, user)
+            kwargs = {"validate": validate} if validate is not None else {}
+            llm_json, provider = await inner.generate(system, user, **kwargs)
         except asyncio.CancelledError:
             self.stopped = "interrupted"
             self.item_not_run = True
@@ -616,7 +630,8 @@ class EvalGate:
                 self.consecutive_rl = 0
             self.last_tokens = (entry["usage"] or {}).get("total_tokens") or 0
             self.tokens_used += self.last_tokens
-            raise LLMError(f"eval call failed: {entry['error']}") from exc
+            raise LLMError(f"eval call failed: {entry['error']}",
+                           bad_output=bool(getattr(exc, "bad_output", False))) from exc
         latency = round(time.perf_counter() - t0, 3)
         events = self.tap.take() if self.tap is not None else []
         usage = _usage_totals(events)
@@ -651,8 +666,8 @@ class GatedRouter:
     def clock(self):
         return lambda: 0.0
 
-    async def generate(self, system, user, *, deadline=None):
-        return await self.gate.call(self.inner, system, user)
+    async def generate(self, system, user, *, deadline=None, validate=None):
+        return await self.gate.call(self.inner, system, user, validate)
 
 
 class NonceSeq:
@@ -816,7 +831,8 @@ async def run_item(item: dict, arm: str, *, router, verifier_router, gate: EvalG
     rec["calls"] = _call_summary(log)
     rec["call_log"] = [{k: e.get(k) for k in ("role", "sha", "cached", "provider", "latency_s",
                                                "prompt_tokens_est", "usage", "error_kind",
-                                               "not_run", "upstream_provider") if k in e}
+                                               "not_run", "upstream_provider", "cached_invalid")
+                        if k in e}
                        for e in log]
     rec["prompt_shas"] = [e["sha"] for e in log]
     if gate.keep_prompts:
@@ -1669,7 +1685,7 @@ class DryRunRouter:
     def __init__(self, item: dict):
         self.files = [f for f in item["files"] if f.get("new_content") is not None]
 
-    async def generate(self, system, user, *, deadline=None):
+    async def generate(self, system, user, *, deadline=None, validate=None):
         if system == AUDIT_SYSTEM_PROMPT:
             listed = next((ln for ln in user.splitlines()
                            if ln.startswith("Files in this request:")), "")

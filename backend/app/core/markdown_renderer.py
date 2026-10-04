@@ -413,6 +413,18 @@ def _cwe(value) -> str | None:
     return f"CWE-{m.group(1)}" if m else None
 
 
+def units_schema_problem(data) -> str | None:
+    """Why a per-unit review answer is not the ``{"findings": [...]}`` the
+    prompt asks for, or None (``LLMRouter.generate``'s ``validate``). A bare
+    finding salvaged from cut-off output is a failed call, never a clean
+    review."""
+    if not isinstance(data, dict):
+        return "response is not a JSON object"
+    if not isinstance(data.get("findings"), list):
+        return "findings is not a list" if "findings" in data else "no findings list"
+    return None
+
+
 def validate_findings(
     llm_findings, units: list[dict], allowed_cves: set[str], allowed_prs: set[str]
 ) -> list[dict]:

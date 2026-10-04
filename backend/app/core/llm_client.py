@@ -27,10 +27,12 @@ OpenRouter quirks handled here: an error object inside an HTTP 200 body
 (`{"error": {...}}`), and free models that reject `response_format` (HTTP 400 ->
 one retry without it, remembered for the client's lifetime). All providers'
 content goes through a tolerant JSON extractor (```json fences, <think> blocks
-or reasoning text before the object; the LAST complete top-level object wins);
-plain JSON parses exactly as before. A reply that isn't a JSON object, or that
-was cut at max_tokens (finish_reason "length") without a complete JSON document,
-is a bad-output failure: the next client is tried.
+or reasoning text before the object; the LAST complete top-level object wins,
+or with the caller's ``validate`` format check the last one that passes it);
+plain JSON parses exactly as before. A reply that isn't a JSON object, that has
+no object passing ``validate``, or that was cut at max_tokens (finish_reason
+"length") without a complete JSON document, is a bad-output failure: the next
+client is tried.
 
 Every request carries max_tokens (settings.LLM_MAX_OUTPUT_TOKENS, lowered for a
 client with a tokens-per-minute limit to what the prompt leaves of it; a prompt
@@ -124,12 +126,16 @@ class LLMError(Exception):
     """
 
     def __init__(self, message: str, provider_wide: bool = False,
-                 deadline_exceeded: bool = False):
+                 deadline_exceeded: bool = False, bad_output: bool = False):
         super().__init__(message)
         self.provider_wide = provider_wide
         # Some client was skipped because its rate budget would outlast the
         # caller's deadline (the scan's LLM time budget), not because it failed.
         self.deadline_exceeded = deadline_exceeded
+        # Some client answered, but no object of its reply passed the caller's
+        # format check (``LLMRouter.generate``'s ``validate``): callers report
+        # the call as "bad_output" rather than "llm_error".
+        self.bad_output = bad_output
 
 
 class _Retriable(Exception):
@@ -218,29 +224,66 @@ def _object_end(text: str, start: int) -> int | None:
 # Where a JSON object can start: "{" then a key or "}" (prose braces like
 # "{set}" are not candidates).
 _OBJECT_START_RE = re.compile(r'\{\s*["}]')
+_DECODER = json.JSONDecoder()
+
+
+def _truncated(text: str, exc: json.JSONDecodeError) -> bool:
+    """The decode failed because the text ENDED inside the value (output cut
+    off), not because of a syntax error part-way (prose that only looks like
+    the start of an object)."""
+    return exc.msg.startswith("Unterminated string") or exc.pos >= len(text.rstrip())
 
 
 def _top_level_objects(text: str) -> list[dict]:
-    """The complete top-level JSON objects in ``text``, in order. Objects
-    nested inside another are not top-level; an object that is never closed
-    (truncated output) ends the scan, so nothing nested in it is returned."""
+    """The complete top-level JSON objects in ``text``, in order.
+
+    Scanned from each possible object start: a complete object is a
+    candidate and the scan resumes after it (objects nested in it are not
+    top-level); an object that runs to the end of the text (truncated output)
+    ends the scan, so nothing nested in it is returned. A start that is not
+    valid JSON is skipped: a closed span (``{"a": 1, ...}``) as a whole, an
+    unclosed one (prose such as ``He said "hi {"``, whose quote never closes)
+    by one character, so it can't hide an answer that follows it."""
     out: list[dict] = []
     pos = 0
     while (m := _OBJECT_START_RE.search(text, pos)) is not None:
-        end = _object_end(text, m.start())
-        if end is None:
-            break
         try:
-            obj = json.loads(text[m.start():end])
-        except json.JSONDecodeError:
-            obj = None
+            obj, end = _DECODER.raw_decode(text, m.start())
+        except json.JSONDecodeError as exc:
+            if _truncated(text, exc):
+                break
+            end = _object_end(text, m.start())
+            pos = end if end is not None else m.start() + 1
+            continue
         if isinstance(obj, dict):
             out.append(obj)
         pos = end
     return out
 
 
-def extract_json(content: str):
+class InvalidAnswer(ValueError):
+    """The reply holds JSON, but no candidate object passes the caller's
+    format check (``extract_json``'s ``validate``); ``problem`` says why the
+    last candidate failed."""
+
+    def __init__(self, problem: str):
+        super().__init__(problem)
+        self.problem = problem
+
+
+def _first_valid(candidates, validate):
+    """(the first of ``candidates`` that ``validate`` accepts or None, the
+    problem of the first rejected one or None)."""
+    first_problem = None
+    for obj in candidates:
+        problem = validate(obj)
+        if problem is None:
+            return obj, None
+        first_problem = first_problem or problem
+    return None, first_problem
+
+
+def extract_json(content: str, validate=None):
     """Parse the model's JSON, tolerating reasoning-model wrappers.
 
     Plain JSON (Groq/Gemini with response_format) is parsed by the first
@@ -250,25 +293,52 @@ def extract_json(content: str):
     final one, and an inner object of a truncated answer (e.g. one finding of a
     cut-off findings list) is never mistaken for the answer. Failing that, the
     last Markdown code fence whose contents parse (e.g. a fenced list).
+
+    ``validate(obj) -> str | None`` (a problem description, or None when
+    ``obj`` is an acceptable answer): the LAST candidate it accepts is
+    returned, so a trailing example / note object after the answer, or a
+    draft after it, doesn't replace it. Candidates are the whole reply (plain
+    JSON), else the top-level objects, then the parsable fences, each group
+    from last to first. JSON was found but no candidate passes ->
+    ``InvalidAnswer``.
+
     Raises json.JSONDecodeError (from the plain parse) if nothing parses.
     """
+    check = validate or (lambda _obj: None)
     try:
-        return json.loads(content)
+        whole = json.loads(content)
     except json.JSONDecodeError as exc:
         original = exc
+    else:
+        problem = check(whole)
+        if problem is None:
+            return whole
+        raise InvalidAnswer(problem)
     text = _THINK_RE.sub("", content)
     try:
-        return json.loads(text.strip())
+        whole = json.loads(text.strip())
     except json.JSONDecodeError:
         pass
+    else:
+        problem = check(whole)
+        if problem is None:
+            return whole
+        raise InvalidAnswer(problem)
     objects = _top_level_objects(text)
-    if objects:
-        return objects[-1]
+    found, problem = _first_valid(reversed(objects), check)
+    if found is not None:
+        return found
+    fenced = []
     for candidate in reversed(_FENCE_RE.findall(text)):
         try:
-            return json.loads(candidate.strip())
+            fenced.append(json.loads(candidate.strip()))
         except json.JSONDecodeError:
             pass
+    found, fence_problem = _first_valid(fenced, check)
+    if found is not None:
+        return found
+    if objects or fenced:
+        raise InvalidAnswer(problem or fence_problem or "no acceptable JSON answer")
     raise original
 
 
@@ -614,12 +684,21 @@ class LLMRouter:
         return self.pacer.clock
 
     async def generate(
-        self, system: str, user: str, *, deadline: float | None = None
+        self, system: str, user: str, *, deadline: float | None = None, validate=None
     ) -> tuple[dict, str]:
         """Return (parsed_json, provider_used). Raises LLMError if all fail.
 
         provider_used is the answering client's "<provider>:<model>" label
         (e.g. "groq:qwen/qwen3.8-27b"), or "mock" in mock mode.
+
+        ``validate(obj) -> str | None`` is the caller's format check (a problem
+        description, or None for an acceptable answer), e.g. the PR review's
+        audit / verifier schema checks. The answer is the last JSON object of
+        the reply that passes it (``extract_json``); a reply with none is a
+        bad-output failure of that client (WARNING with the problem), and the
+        next client is tried. If every client fails and at least one failed
+        this way, the LLMError has ``bad_output`` set. Mock mode returns its
+        canned answer unchecked.
 
         Every attempt first takes its estimated tokens (prompt + an output
         allowance) from the client's per-minute budget (``self.pacer``), waiting
@@ -637,6 +716,7 @@ class LLMRouter:
         tokens = prompt_tokens + settings.LLM_OUTPUT_TOKENS_ESTIMATE
         last_error: Exception | None = None
         deadline_hit = False
+        bad_output = False  # some client answered, but not in an acceptable format
         dead_providers: set[str] = set()  # account-level failure (HTTP 402)
         for client in self.clients:
             if client.provider in dead_providers:
@@ -674,11 +754,17 @@ class LLMRouter:
                     break
                 try:
                     content = await client.complete(system, user, max_tokens=max_tokens)
-                    data = extract_json(content)
-                    if not isinstance(data, dict):
-                        raise _Retriable(f"{client.label} returned JSON that is not an object",
-                                         transient=False)
+                    data = extract_json(content, validate=_object_check(validate))
                     return data, client.label
+                except InvalidAnswer as exc:
+                    # Parsed, but not an answer the caller can use: no same-client
+                    # retry (the same prompt tends to give the same shape), next client.
+                    logger.warning("LLM client {} answer failed the format check: {}",
+                                   client.label, exc.problem)
+                    last_error = LLMError(f"{client.label} returned an unusable answer: "
+                                          f"{exc.problem}")
+                    bad_output = True
+                    break
                 except (_Retriable, httpx.TimeoutException, httpx.TransportError) as exc:
                     last_error = exc
                     transient = getattr(exc, "transient", True)
@@ -711,8 +797,17 @@ class LLMRouter:
                     break
         raise LLMError(
             f"All LLM clients failed ({', '.join(c.label for c in self.clients)}): {last_error}",
-            deadline_exceeded=deadline_hit,
+            deadline_exceeded=deadline_hit, bad_output=bad_output,
         )
+
+
+def _object_check(validate):
+    """``validate`` behind the router's own requirement: a JSON object."""
+    def check(obj):
+        if not isinstance(obj, dict):
+            return "JSON that is not an object"
+        return validate(obj) if validate is not None else None
+    return check
 
 
 def verifier_router_for(router):

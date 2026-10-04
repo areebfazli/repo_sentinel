@@ -34,6 +34,7 @@ from backend.app.core.markdown_renderer import (
     build_user_prompt,
     render_markdown,
     severity_from_cvss,
+    units_schema_problem,
     validate_findings,
 )
 from backend.app.core.review_plan import (
@@ -391,18 +392,22 @@ async def _review_batches(
         allowed_prs = {str(t.get("pr_id")) for u in batch for t in u["team"] if t.get("pr_id")}
         calls += 1
         try:
+            # The schema check doubles as the router's format check: an
+            # unusable answer falls through to the next model.
             llm_json, provider = await router.generate(
-                SYSTEM_PROMPT, build_user_prompt(batch, nonce_factory()), deadline=deadline
+                SYSTEM_PROMPT, build_user_prompt(batch, nonce_factory()), deadline=deadline,
+                validate=units_schema_problem,
             )
         except LLMError as exc:
             logger.warning("LLM review call failed for {} unit(s): {}", len(batch), exc)
-            reason = "time_budget" if getattr(exc, "deadline_exceeded", False) else "llm_error"
+            reason = ("time_budget" if getattr(exc, "deadline_exceeded", False)
+                      else "bad_output" if getattr(exc, "bad_output", False) else "llm_error")
             not_reviewed.extend({**u, "not_reviewed_reason": reason} for u in batch)
             continue
         if provider not in providers:
             providers.append(provider)
         raw_findings = llm_json.get("findings") if isinstance(llm_json, dict) else None
-        if not isinstance(raw_findings, list):
+        if units_schema_problem(llm_json):  # defence in depth: a router ignoring validate
             # Not the {"findings": [...]} the prompt asks for (e.g. one finding
             # salvaged from cut-off output): a failed call, never a clean review.
             logger.warning("LLM review answer from {} has no findings list; {} unit(s) not "

@@ -859,6 +859,15 @@ def report_finding(bundle: PRBundle, c: dict, verdict: dict | None,
     }
 
 
+def _failure_reason(exc: LLMError) -> str:
+    """not_reviewed / unverified reason of a failed call: "time_budget" (a
+    client skipped for the deadline), "bad_output" (answers arrived but none
+    passed the schema check), else "llm_error"."""
+    if getattr(exc, "deadline_exceeded", False):
+        return "time_budget"
+    return "bad_output" if getattr(exc, "bad_output", False) else "llm_error"
+
+
 def _empty_stats(config: PRReviewConfig) -> dict:
     return {
         "audit_calls": 0, "audit_prompts_planned": 0, "verifier_calls": 0,
@@ -929,17 +938,23 @@ async def run_pr_review(
             stats["audit_calls"] += 1
             stats["prompt_tokens_est"] += estimate_tokens(AUDIT_SYSTEM_PROMPT) + estimate_tokens(
                 user)
+            final = rounds_left <= 0
             try:
-                data, provider = await router.generate(AUDIT_SYSTEM_PROMPT, user,
-                                                       deadline=deadline)
+                # The schema check doubles as the router's format check: an
+                # unusable answer falls through to the next model.
+                data, provider = await router.generate(
+                    AUDIT_SYSTEM_PROMPT, user, deadline=deadline,
+                    validate=lambda d, final=final: audit_schema_problem(d, final=final))
             except LLMError as exc:
                 logger.warning("PR audit call failed ({} file(s)): {}", len(chunk.paths), exc)
-                failure = "time_budget" if getattr(exc, "deadline_exceeded", False) \
-                    else "llm_error"
+                failure = _failure_reason(exc)
+                if failure == "bad_output":
+                    stats["bad_output"] += 1
                 break
             if provider not in providers:
                 providers.append(provider)
-            problem = audit_schema_problem(data, final=rounds_left <= 0)
+            # Defence in depth (a router that ignores ``validate``).
+            problem = audit_schema_problem(data, final=final)
             if problem:
                 logger.warning("PR audit response from {} unusable ({} file(s)): {}", provider,
                                len(chunk.paths), problem)
@@ -1012,16 +1027,20 @@ async def run_pr_review(
         stats["prompt_tokens_est"] += estimate_tokens(VERIFIER_SYSTEM_PROMPT) + estimate_tokens(
             user)
         try:
-            data, label = await verifier_router.generate(VERIFIER_SYSTEM_PROMPT, user,
-                                                         deadline=deadline)
+            data, label = await verifier_router.generate(
+                VERIFIER_SYSTEM_PROMPT, user, deadline=deadline,
+                validate=verifier_schema_problem)
         except LLMError as exc:
             logger.warning("PR verifier call failed: {}", exc)
-            c.update(status="unverified", status_reason="time_budget" if getattr(
-                exc, "deadline_exceeded", False) else "llm_error")
+            reason = _failure_reason(exc)
+            c.update(status="unverified", status_reason=reason)
             stats["unverified"] += 1
+            if reason == "bad_output":
+                stats["bad_output"] += 1
             continue
         if label not in verifier_models:
             verifier_models.append(label)
+        # Defence in depth (a router that ignores ``validate``).
         problem = verifier_schema_problem(data)
         if problem:
             logger.warning("PR verifier response from {} unusable: {}", label, problem)
@@ -1212,8 +1231,11 @@ async def review_pr(
     missing, and used to rebuild old content when that is missing),
     ``changed_lines``, ``language``. ``language`` is the default for files
     whose extension doesn't say. ``router`` / ``verifier_router``: anything
-    with ``async generate(system, user, *, deadline=None) -> (json, label)``
-    (``llm_client.LLMRouter``; tests pass stubs). ``semgrep_scanner``: a
+    with ``async generate(system, user, *, deadline=None, validate=None) ->
+    (json, label)`` (``llm_client.LLMRouter``; tests pass stubs). ``validate``
+    is the call's schema check: the router answers with the last JSON object
+    that passes it, else tries its next model (the review re-checks the answer
+    in case a router ignores it). ``semgrep_scanner``: a
     ``SemgrepScanner`` or None (no static leads). ``nonce_factory``: e.g. a
     deterministic one for reproducible evals. ``retrieval``: an optional
     ``RagMerger.analyze_units`` result (only used for fix examples).

@@ -14,8 +14,10 @@ Arms (``--arm``):
   alerts, what production posts) and ``audit_only`` (every audit candidate
   that would be sent to the verifier - past the quote check, the hard
   exclusions and the audit's own confidence floor - plus the guard alerts).
-  ``audit_raw`` (every validated candidate, exclusions included) is recorded
-  too.
+  ``verified_plus_review`` is the report plus the non-blocking "worth a look"
+  items (``review_suggestions``: uncertain / below-cutoff candidates with
+  removed-control evidence; a subset of audit_only). ``audit_raw`` (every
+  validated candidate, exclusions included) is recorded too.
 - ``units``: the old per-function review (``REVIEW_MODE=units``), run
   in-process exactly as ``scan_runner`` does for files mode (plan_units with
   deletion points, Semgrep at SEMGREP_MIN_SEVERITY, guard_diff, the review
@@ -93,13 +95,18 @@ not-run items are reported separately (below), never silently dropped.
   observed; always at the FPR's exact 95% upper bound), Wilson CIs, calls /
   tokens / latency per PR, the candidate funnel, context rounds, verifier
   outcomes, review_status and per category / language.
-- What the verifier drops (audit_only vs verified, per kind) and the verifier
-  policy curve: confirmed >= k (k = 9..5), confirmed at any confidence,
-  confirmed or uncertain, no verifier, replayed from the cached verdicts.
+- What the verifier drops (audit_only vs verified, per kind), what the
+  worth-a-look tier adds (verified vs verified_plus_review), and the verifier
+  policy curve: confirmed >= k (k = 9..5), confirmed >= 8 / 7 plus the
+  worth-a-look items at that cutoff, confirmed at any confidence, confirmed or
+  uncertain, no verifier, replayed from the cached verdicts.
 
 Offline modes: ``--rescore RESULT.json`` (recompute every metric from the
 stored findings, e.g. at another tolerance; the facts and labels are
-recomputed from the run's dataset), ``--compare A.json B.json``
+recomputed from the run's dataset; a run recorded before the worth-a-look
+tier gets ``verified_plus_review`` replayed from its cached verdicts with
+guard_diff evidence only, labelled as such: its verifier prompt had no
+``removed_control_quote``), ``--compare A.json B.json``
 (exact McNemar on introducing localised TP and on fix FP, exact binomial CIs
 + paired table on benign FPR; items matched by base id; ``--view-a`` /
 ``--view-b`` pick verified / audit_only; two views of ONE run get the
@@ -136,9 +143,15 @@ if str(_ROOT) not in sys.path:
 
 from backend.app.config import BASE_DIR, settings  # noqa: E402
 from backend.app.core.llm_client import LLMError  # noqa: E402
+from backend.app.core.markdown_renderer import SEVERITY_ORDER  # noqa: E402
 from backend.app.core.markdown_renderer import SYSTEM_PROMPT as UNITS_SYSTEM_PROMPT  # noqa: E402
 from backend.app.core.pr_context import diff_lines  # noqa: E402
-from backend.app.core.pr_review import PRReviewConfig, review_pr  # noqa: E402
+from backend.app.core.pr_review import (  # noqa: E402
+    PRReviewConfig,
+    guard_removal_evidence,
+    review_pr,
+    review_suggestion_eligible,
+)
 from backend.app.core.prompts.pr_audit import (  # noqa: E402
     AUDIT_SYSTEM_PROMPT,
     VERIFIER_SYSTEM_PROMPT,
@@ -193,10 +206,12 @@ DEFAULT_PR_LLM_CACHE = RESULTS_DIR / "pr_llm_cache.jsonl"
 
 ARMS = ("pr", "units", "pr_misleading")
 PR_ARMS = ("pr", "pr_misleading")
-VIEWS_BY_ARM = {"pr": ("verified", "audit_only", "audit_raw"),
-                "pr_misleading": ("verified", "audit_only", "audit_raw"),
+VIEWS_BY_ARM = {"pr": ("verified", "verified_plus_review", "audit_only", "audit_raw"),
+                "pr_misleading": ("verified", "verified_plus_review", "audit_only",
+                                  "audit_raw"),
                 "units": ("verified",)}
-HEADLINE_VIEWS = {"pr": ("verified", "audit_only"), "pr_misleading": ("verified", "audit_only"),
+HEADLINE_VIEWS = {"pr": ("verified", "verified_plus_review", "audit_only"),
+                  "pr_misleading": ("verified", "verified_plus_review", "audit_only"),
                   "units": ("verified",)}
 KIND_INTRO, KIND_FIX, KIND_BENIGN = "vuln_introducing", "vuln_fix", "benign"
 PR_KINDS = (KIND_INTRO, KIND_FIX, KIND_BENIGN)
@@ -212,7 +227,9 @@ DEFAULT_LOCALISE_TOLERANCE = 2
 # free tier allows 1,000 requests/day with credits on the account.
 LLM_MAX_CALLS_CAP = 5000
 # Candidate statuses of a candidate that reached (or was due for) the verifier.
-VERIFIER_BOUND = ("confirmed", "rejected", "uncertain", "below_min_confidence", "unverified")
+VERIFIER_BOUND = ("confirmed", "rejected", "uncertain", "below_min_confidence",
+                  "review_suggested", "unverified")
+REVIEW_SOURCE = "review_suggestion"  # ``source`` of a worth-a-look item in a view
 SEMGREP_CACHE_VERSION = 1
 FINDING_KEYS = ("file_path", "line", "end_line", "cwe", "severity", "title", "source")
 # Pacing profiles for the dry-run's wall-time estimate: OpenRouter free models
@@ -746,7 +763,14 @@ def _candidate(c: dict) -> dict:
         "verdict_confidence": verdict.get("confidence"),
         "verdict_reason": (verdict.get("reason") or "")[:300] or None,
         "verifier": c.get("verifier"),
+        # Removed-control evidence kinds ("verifier_quote", "guard_diff"), for
+        # replaying the worth-a-look tier at other cutoffs.
+        "review_evidence": c.get("review_evidence"),
     }
+
+
+def _suggestion_finding(sug: dict) -> dict:
+    return {**{k: sug.get(k) for k in FINDING_KEYS}, "source": REVIEW_SOURCE}
 
 
 def view_findings(result: dict, arm: str) -> dict[str, list[dict]]:
@@ -758,6 +782,10 @@ def view_findings(result: dict, arm: str) -> dict[str, list[dict]]:
     cands = [_candidate(c) for c in result.get("candidates") or []]
     return {
         "verified": report,
+        # The report plus the non-blocking worth-a-look items (a subset of
+        # audit_only's candidates: review_suggested is verifier-bound).
+        "verified_plus_review": report + [_suggestion_finding(s) for s in
+                                          result.get("review_suggestions") or []],
         "audit_only": guard + [c for c in cands if c["status"] in VERIFIER_BOUND],
         "audit_raw": guard + cands,
     }
@@ -766,8 +794,8 @@ def view_findings(result: dict, arm: str) -> dict[str, list[dict]]:
 STAT_KEYS = ("audit_calls", "audit_prompts_planned", "verifier_calls", "context_rounds_used",
              "context_requested", "context_resolved", "candidates", "quote_not_found",
              "hard_excluded", "below_audit_confidence", "verified", "confirmed", "rejected",
-             "uncertain", "below_min_confidence", "unverified", "bad_output", "files_total",
-             "files_reviewed", "leads")
+             "uncertain", "below_min_confidence", "review_suggested", "unverified",
+             "bad_output", "files_total", "files_reviewed", "leads")
 
 
 def item_record(item: dict, arm: str) -> dict:
@@ -850,6 +878,7 @@ async def run_item(item: dict, arm: str, *, router, verifier_router, gate: EvalG
         stats = result.get("pr_review") or {}
         rec["pr_review"] = {k: stats.get(k) for k in STAT_KEYS}
         rec["candidates"] = [_candidate(c) for c in result.get("candidates") or []]
+        rec["review_evidence_source"] = "run"
     rec["findings"] = view_findings(result, arm)
     return rec
 
@@ -1253,8 +1282,24 @@ def _policy_confirmed_at_least(k: int):
     return lambda c: c.get("verdict") == "confirmed" and (c.get("verdict_confidence") or 0) >= k
 
 
+def _policy_with_review(k: int):
+    """confirmed >= k, plus the worth-a-look items at cutoff k (replayed from
+    each candidate's ``review_evidence``: guard_diff only for runs recorded
+    before the verifier's removed_control_quote, see ``attach_review_view``;
+    the per-scan cap is not applied)."""
+    confirmed = _policy_confirmed_at_least(k)
+
+    def keep(c):
+        return confirmed(c) or review_suggestion_eligible(
+            c.get("verdict"), c.get("verdict_confidence"), c.get("review_evidence"),
+            min_confidence=k, floor=settings.PR_REVIEW_SUGGEST_MIN_CONFIDENCE)
+    return keep
+
+
 VERIFIER_POLICIES = (
     *((f"confirmed>={k}", _policy_confirmed_at_least(k)) for k in (9, 8, 7, 6, 5)),
+    *((f"confirmed>={k} + worth a look (not blocking)", _policy_with_review(k))
+      for k in (8, 7)),
     ("confirmed (any confidence)", lambda c: c.get("verdict") == "confirmed"),
     ("confirmed or uncertain", lambda c: c.get("verdict") in ("confirmed", "uncertain")),
     ("no verifier (every verifier-bound candidate)", lambda c: True),
@@ -1325,6 +1370,9 @@ def funnel_stats(rec: dict) -> dict:
     cands = rec.get("candidates")
     if cands is not None:
         stats["confirmed"] = sum(1 for c in cands if c.get("status") == "confirmed")
+        # 0 in runs recorded before the worth-a-look tier (no such status).
+        stats["review_suggested"] = sum(1 for c in cands
+                                        if c.get("status") == "review_suggested")
     return stats
 
 
@@ -1357,7 +1405,8 @@ def operational_metrics(records: list[dict], arm: str) -> dict:
             stats = funnel_stats(r)
             for k in ("candidates", "quote_not_found", "hard_excluded", "below_audit_confidence",
                       "confirmed", "rejected", "uncertain", "below_min_confidence",
-                      "unverified", "bad_output", "context_rounds_used", "context_requested",
+                      "review_suggested", "unverified", "bad_output", "context_rounds_used",
+                      "context_requested",
                       "context_resolved", "audit_calls", "verifier_calls"):
                 funnel[k] += stats.get(k) or 0
         out["funnel"] = dict(funnel)
@@ -1374,16 +1423,25 @@ def operational_metrics(records: list[dict], arm: str) -> dict:
             for c in r.get("candidates") or []:
                 statuses[c["status"] + (f": {c['status_reason']}" if c.get("status_reason")
                                         else "")] += 1
-                if c["status"] in ("rejected", "uncertain", "below_min_confidence"):
+                if c["status"] in ("rejected", "uncertain", "below_min_confidence",
+                                   "review_suggested"):
                     reasons[reason_bucket(c.get("verdict_reason"))] += 1
         out["candidate_statuses"] = dict(statuses.most_common())
         out["verifier_rejection_reasons_heuristic"] = dict(reasons.most_common())
     return out
 
 
+def available_views(records: list[dict], arm: str) -> tuple[str, ...]:
+    """The arm's views every record with findings has (``verified_plus_review``
+    is missing from a run recorded before it when its dataset isn't
+    available to ``attach_review_view``)."""
+    recs = [r for r in records if r.get("findings")]
+    return tuple(v for v in VIEWS_BY_ARM[arm] if all(v in r["findings"] for r in recs))
+
+
 def summarize(records: list[dict], arm: str, tol: int) -> dict:
     attach_outcomes(records, tol)
-    views = VIEWS_BY_ARM[arm]
+    views = available_views(records, arm)
     out = {
         "status_counts": dict(Counter(r["status"] for r in records)),
         "coverage": coverage(records),
@@ -1393,6 +1451,13 @@ def summarize(records: list[dict], arm: str, tol: int) -> dict:
     }
     if arm in PR_ARMS:
         out["verifier_losses"] = view_losses(records, "verified", "audit_only")
+        if "verified_plus_review" in views:
+            # What the worth-a-look tier adds over the report (catches gained,
+            # false alarms added): the "lost" counts of verified vs plus_review.
+            out["review_tier_adds"] = view_losses(records, "verified", "verified_plus_review")
+        out["review_evidence_sources"] = dict(Counter(
+            r.get("review_evidence_source") or "none" for r in records
+            if r.get("candidates") is not None))
         out["verifier_policy_curve"] = policy_curve(records, tol)
     return out
 
@@ -1458,8 +1523,19 @@ def print_summary(summary: dict, arm: str) -> None:
         print(f"  {kind:<17} {c['n']:>3} / {c['scored']:>3} / {c['errored_partial']:>3} / "
               f"{c['errored_no_result']:>3} / {c['not_run']:>3}")
     labels = {"verified": f"{arm}: verified (the report)" if arm in PR_ARMS else "units",
+              "verified_plus_review": f"{arm}: verified + worth-a-look items (non-blocking "
+                                      "tier)",
               "audit_only": f"{arm}: audit only (candidates before verification)"}
+    sources = summary.get("review_evidence_sources") or {}
     for view in HEADLINE_VIEWS[arm]:
+        if view not in summary["views"]:
+            print(f"\n{labels[view]}: n/a (run recorded before the tier; rescore with its "
+                  "dataset to replay the guard_diff evidence)")
+            continue
+        if view == "verified_plus_review" and sources.get(REVIEW_EVIDENCE_RESCORED):
+            print(f"\n[{view}: {sources[REVIEW_EVIDENCE_RESCORED]} record(s) replayed by "
+                  f"--rescore: OLD verifier prompt, guard_diff evidence only (no "
+                  "removed_control_quote); at the run's own confidence cutoff]")
         print_view(labels[view], summary["views"][view])
         sens = (summary.get("sensitivity") or {}).get(view)
         if sens:
@@ -1479,7 +1555,16 @@ def print_summary(summary: dict, arm: str) -> None:
             row = vl[name]
             print(f"  {name:<28} {row['count']} of {row['n']}"
                   + (f" (verified-only {row['strict_only']})" if row["strict_only"] else ""))
-        print("\nVerifier policy curve (cached verdicts replayed, no LLM call; scored items):")
+        adds = summary.get("review_tier_adds")
+        if adds:
+            print("\nWhat the worth-a-look tier adds (verified_plus_review positive, verified "
+                  "negative; intro = catches gained, fix / benign = false alarms added):")
+            for _, _, name in LOSS_KEYS:
+                row = adds[name]
+                print(f"  {name.replace('lost', 'gained').replace('removed', 'added'):<28} "
+                      f"{row['count']} of {row['n']} {row['ids'][:8] if row['ids'] else ''}")
+        print("\nVerifier policy curve (cached verdicts replayed, no LLM call; scored items; "
+              "'+ worth a look' rows use each candidate's recorded removed-control evidence):")
         print(f"  {'policy':<46} {'intro strict':>12} {'intro fn':>9} {'fix':>7} {'benign':>7}")
         for row in summary.get("verifier_policy_curve") or []:
             print(f"  {row['policy']:<46} {_frac(row['intro_localised']):>12} "
@@ -1524,14 +1609,86 @@ def refresh_facts(records: list[dict], items: list[dict], parser=None) -> dict:
             "records_without_dataset_item": missing}
 
 
+REVIEW_EVIDENCE_RESCORED = "rescore_guard_diff_only"
+
+
+def attach_review_view(records: list[dict], items: list[dict] | None, parser,
+                       min_confidence: int) -> dict:
+    """Give records of a run recorded before the worth-a-look tier their
+    ``verified_plus_review`` view, replayed offline from the cached verdicts.
+
+    Only the guard_diff evidence (variant a) can be replayed: it is
+    deterministic, recomputed from the dataset item (``build_pr_bundle`` +
+    ``guard_evidence``, no LLM). The verifier-quote evidence (variant b) needs
+    the ``removed_control_quote`` field, which the old verifier prompt never
+    asked for. Eligibility is ``review_suggestion_eligible`` at the run's own
+    cutoff ``min_confidence`` (its verified view used it), with the current
+    PR_REVIEW_SUGGEST_MIN_CONFIDENCE floor and PR_REVIEW_MAX_SUGGESTIONS cap.
+    Records with the view already (recorded by a run) are left alone; without
+    the dataset nothing is replayed (the view is then reported as n/a)."""
+    from backend.app.core.evidence import guard_evidence
+    from backend.app.core.pr_context import build_pr_bundle
+
+    meta = {"evidence": "guard_diff only (old verifier prompt: no removed_control_quote)",
+            "min_confidence": min_confidence,
+            "floor": settings.PR_REVIEW_SUGGEST_MIN_CONFIDENCE,
+            "cap": settings.PR_REVIEW_MAX_SUGGESTIONS, "replayed": 0, "suggestions": 0,
+            "records_without_dataset_item": []}
+    by_id = {it["id"]: it for it in items or []}
+    for r in records:
+        if r.get("candidates") is None or "verified_plus_review" in (r.get("findings") or {}):
+            continue
+        item = by_id.get(r["base_id"])
+        if items is None or item is None:
+            if items is not None:
+                meta["records_without_dataset_item"].append(r["base_id"])
+            continue
+        cands = [dict(c) for c in r["candidates"]]
+        guard = bundle = None
+        for c in cands:
+            c["review_evidence"] = []
+            if c.get("verdict") not in ("confirmed", "uncertain") or c.get("line") is None:
+                continue
+            if bundle is None:
+                bundle = build_pr_bundle(item["files"], parser, language=item.get("language"),
+                                         max_units=settings.MAX_UNITS_PER_SCAN)
+                live = [f for f in bundle.files if f.new_content is not None]
+                guard = guard_evidence(live, bundle.units, parser)
+            if c.get("file_path") in bundle.by_path and guard_removal_evidence(bundle, guard, c):
+                c["review_evidence"] = ["guard_diff"]
+        eligible = sorted(
+            (c for c in cands if c.get("status") in VERIFIER_BOUND
+             and review_suggestion_eligible(
+                 c.get("verdict"), c.get("verdict_confidence"), c["review_evidence"],
+                 min_confidence=min_confidence,
+                 floor=settings.PR_REVIEW_SUGGEST_MIN_CONFIDENCE)),
+            key=lambda c: (SEVERITY_ORDER.get(c.get("severity"), 4),
+                           -(c.get("audit_confidence") or 0)))
+        kept = eligible[:max(settings.PR_REVIEW_MAX_SUGGESTIONS, 0)]
+        r["candidates"] = cands
+        r["findings"] = {**r["findings"], "verified_plus_review": (
+            list(r["findings"]["verified"])
+            + [{**{k: c.get(k) for k in FINDING_KEYS}, "source": REVIEW_SOURCE} for c in kept])}
+        r["review_evidence_source"] = REVIEW_EVIDENCE_RESCORED
+        meta["replayed"] += 1
+        meta["suggestions"] += len(kept)
+    return meta
+
+
 def rescore(data: dict, tol: int, items: list[dict] | None = None, parser=None) -> dict:
     """Recompute every metric from the stored findings. With the run's dataset
     ``items``, the facts (change anchors, scope labels, leaky-diff terms,
-    benign provenance) are recomputed first (``refresh_facts``); without, the
-    records' stored facts are used (none in runs older than the facts)."""
+    benign provenance) are recomputed first (``refresh_facts``) and a run
+    recorded before the worth-a-look tier gets its ``verified_plus_review``
+    view replayed (``attach_review_view``: guard_diff evidence only); without,
+    the records' stored facts are used (none in runs older than the facts)."""
     records = [dict(r) for r in data["items"]]
     meta = (refresh_facts(records, items, parser) if items is not None
             else {"facts": "as stored in the records"})
+    if data["config"]["arm"] in PR_ARMS:
+        cutoff = ((data["config"].get("pr_review") or {}).get("min_confidence")
+                  or settings.PR_REVIEW_MIN_CONFIDENCE)
+        meta["review_view"] = attach_review_view(records, items, parser, int(cutoff))
     summary = summarize(records, data["config"]["arm"], tol)
     return {**data, "config": {**data["config"], "localise_tolerance": tol},
             "rescore": meta, "summary": summary, "items": records}
@@ -1586,7 +1743,7 @@ def paired(a: dict[str, dict], b: dict[str, dict], kind: str, key: str) -> dict:
 
 # The PR arm's views, narrowest first: each keeps a subset of the next one's
 # findings by construction (verified = confirmed candidates + guard alerts).
-NESTED_VIEWS = ("verified", "audit_only", "audit_raw")
+NESTED_VIEWS = ("verified", "verified_plus_review", "audit_only", "audit_raw")
 
 
 def same_run(a: dict, b: dict) -> bool:
@@ -1920,10 +2077,8 @@ def build_parser() -> argparse.ArgumentParser:
                             "--localise-tolerance).")
     modes.add_argument("--compare", nargs=2, default=None, metavar=("A.json", "B.json"),
                        help="Offline: paired exact tests between two saved runs.")
-    p.add_argument("--view-a", default="verified", choices=("verified", "audit_only",
-                                                            "audit_raw"))
-    p.add_argument("--view-b", default="verified", choices=("verified", "audit_only",
-                                                            "audit_raw"))
+    p.add_argument("--view-a", default="verified", choices=NESTED_VIEWS)
+    p.add_argument("--view-b", default="verified", choices=NESTED_VIEWS)
     p.add_argument("--dry-run-completion-tokens", type=int,
                    default=settings.LLM_OUTPUT_TOKENS_ESTIMATE, metavar="T",
                    help="Assumed completion tokens per call in the dry-run totals (default "

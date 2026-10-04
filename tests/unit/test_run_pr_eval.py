@@ -892,3 +892,83 @@ def test_model_default_sampling_never_replays_temperature_zero_entries(tmp_path)
                                                          repeat=1))
     assert g4.calls == 1
     assert json.loads(path.read_text().splitlines()[-1])["repeat"] == 1
+
+
+# --- the worth-a-look tier ------------------------------------------------------------------
+
+SQL_OLD = ("def find(db, name):\n"
+           "    return db.execute('SELECT * FROM users WHERE name = ?', (name,))\n")
+SQL_NEW = ("def find(db, name):\n"
+           "    return db.execute(f\"SELECT * FROM users WHERE name = '{name}'\")\n")
+
+
+def sql_intro_item(item_id="pr_S_intro"):
+    return _item(item_id, "vuln_introducing", [_file("app/db.py", SQL_OLD, SQL_NEW)],
+                 "app/db.py", vuln=[2], changed=[2], pair_base="pr_S", category="sqli")
+
+
+def test_run_records_review_suggestions_as_their_own_view():
+    verdict = {"verdict": "uncertain", "confidence": 5, "reason": "caller not shown",
+               "removed_control_quote": "    p = clean(p)"}
+    rec, _ = _run(intro_item(), "pr", StubLLM(audit={"findings": [TRAVERSAL]}, verdict=verdict))
+    assert rec["findings"]["verified"] == []
+    [sug] = rec["findings"]["verified_plus_review"]
+    assert (sug["file_path"], sug["line"], sug["source"]) == ("app/files.py", 7,
+                                                              R.REVIEW_SOURCE)
+    [cand] = rec["candidates"]
+    assert cand["status"] == "review_suggested" and cand["review_evidence"] == ["verifier_quote"]
+    assert rec["findings"]["audit_only"] == [cand]  # still verifier-bound
+    assert rec["pr_review"]["review_suggested"] == 1 and rec["review_evidence_source"] == "run"
+    s = R.summarize([rec], "pr", 2)
+    assert s["views"]["verified"]["tpr_localised"]["k"] == 0
+    assert s["views"]["verified_plus_review"]["tpr_localised"]["k"] == 1
+    assert s["views"]["verified_plus_review"]["tpr_any_finding"]["k"] == 1
+    assert s["review_tier_adds"]["intro_catches_lost_strict"]["count"] == 1  # = gained
+    assert s["operational"]["funnel"]["review_suggested"] == 1
+    curve = {row["policy"]: row for row in s["verifier_policy_curve"]}
+    assert curve["confirmed>=7"]["intro_localised"]["k"] == 0
+    assert curve["confirmed>=7 + worth a look (not blocking)"]["intro_localised"]["k"] == 1
+    R.print_summary(s, "pr")  # renders the new view and rows
+
+
+def _old_pr_rec(item, cands):
+    """A record from a run before the tier: no verified_plus_review, no evidence."""
+    rec = _pr_rec(item, cands)
+    for c in rec["candidates"]:
+        c.update(severity="high", audit_confidence=8)
+    return rec
+
+
+def test_rescore_replays_the_tier_from_guard_diff_only_at_the_runs_cutoff(capsys):
+    p = "app/db.py"
+    recs = [
+        _old_pr_rec(sql_intro_item(), [_cand(p, 2, "uncertain", "uncertain", 5)]),
+        _old_pr_rec(sql_intro_item("pr_T_intro"),
+                    [_cand(p, 2, "below_min_confidence", "confirmed", 7)]),
+        _old_pr_rec(sql_intro_item("pr_U_intro"), [_cand(p, 2, "rejected", "rejected", 6)]),
+        # guard_diff sees nothing in this one (and no verifier quote in old runs)
+        _old_pr_rec(intro_item(), [_cand("app/files.py", 7, "uncertain", "uncertain", 5)]),
+    ]
+    items = [sql_intro_item(), sql_intro_item("pr_T_intro"), sql_intro_item("pr_U_intro"),
+             intro_item()]
+    data = {"config": {"arm": "pr", "pr_review": {"min_confidence": 8}}, "items": recs}
+    out = R.rescore(data, 2, items, parser=R._parser())
+    meta = out["rescore"]["review_view"]
+    assert meta["replayed"] == 4 and meta["suggestions"] == 2 and meta["min_confidence"] == 8
+    assert "guard_diff only" in meta["evidence"]
+    by_id = {r["base_id"]: r for r in out["items"]}
+    assert len(by_id["pr_S_intro"]["findings"]["verified_plus_review"]) == 1
+    assert len(by_id["pr_T_intro"]["findings"]["verified_plus_review"]) == 1  # 7 < 8
+    assert by_id["pr_U_intro"]["findings"]["verified_plus_review"] == []  # rejected
+    assert by_id["pr_A_intro"]["findings"]["verified_plus_review"] == []
+    assert by_id["pr_S_intro"]["candidates"][0]["review_evidence"] == ["guard_diff"]
+    assert data["items"][0]["candidates"][0].get("review_evidence") is None  # input untouched
+    assert out["summary"]["views"]["verified_plus_review"]["tpr_localised"]["k"] == 2
+    assert out["summary"]["review_evidence_sources"] == {R.REVIEW_EVIDENCE_RESCORED: 4}
+    R.print_summary(out["summary"], "pr")
+    assert "OLD verifier prompt, guard_diff evidence only" in capsys.readouterr().out
+    # Without the dataset nothing is replayed: the view is reported as n/a.
+    bare = R.rescore({"config": {"arm": "pr"}, "items": [_old_pr_rec(intro_item(), [])]}, 2)
+    assert "verified_plus_review" not in bare["summary"]["views"]
+    R.print_summary(bare["summary"], "pr")
+    assert "n/a (run recorded before the tier" in capsys.readouterr().out

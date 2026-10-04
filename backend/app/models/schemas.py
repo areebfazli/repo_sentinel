@@ -166,8 +166,9 @@ class GuardDiffOut(BaseModel):
 class UnitNotReviewed(BaseModel):
     """An analysis unit the LLM did not review: ``reason`` is "budget" (beyond
     LLM_MAX_CALLS_PER_SCAN prompts, or PR_REVIEW_MAX_AUDIT_CALLS in the PR
-    review), "too_large", "llm_error" or "time_budget" (LLM_SCAN_MAX_WALL_S ran
-    out, e.g. waiting on provider rate limits)."""
+    review), "too_large", "llm_error", "bad_output" (the call answered, but not
+    with the JSON the prompt asks for, e.g. output cut off) or "time_budget"
+    (LLM_SCAN_MAX_WALL_S ran out, e.g. waiting on provider rate limits)."""
 
     file_path: str | None = None
     function_name: str | None = None
@@ -194,12 +195,15 @@ class PRReviewStats(BaseModel):
     quote_not_found: int = 0
     hard_excluded: int = 0
     below_audit_confidence: int = 0
-    verified: int = 0
-    confirmed: int = 0
+    # hard_excluded + below_audit_confidence + confirmed + rejected + uncertain
+    # + below_min_confidence + unverified == candidates.
+    verified: int = 0  # verdicts received: confirmed + rejected + uncertain + below_min
+    confirmed: int = 0  # confirmed at/above PR_REVIEW_MIN_CONFIDENCE = reported
     rejected: int = 0
     uncertain: int = 0
     below_min_confidence: int = 0  # confirmed, but under PR_REVIEW_MIN_CONFIDENCE
-    unverified: int = 0  # verifier budget / time / errors: not reported
+    unverified: int = 0  # verifier budget / time / errors / unusable answer: not reported
+    bad_output: int = 0  # audit or verifier answers not in the requested JSON shape
     prompt_tokens_est: int = 0
     files_total: int = 0
     files_reviewed: int = 0

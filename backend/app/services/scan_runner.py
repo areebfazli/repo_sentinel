@@ -401,8 +401,15 @@ async def _review_batches(
             continue
         if provider not in providers:
             providers.append(provider)
-        reviewed.extend(batch)
         raw_findings = llm_json.get("findings") if isinstance(llm_json, dict) else None
+        if not isinstance(raw_findings, list):
+            # Not the {"findings": [...]} the prompt asks for (e.g. one finding
+            # salvaged from cut-off output): a failed call, never a clean review.
+            logger.warning("LLM review answer from {} has no findings list; {} unit(s) not "
+                           "reviewed.", provider, len(batch))
+            not_reviewed.extend({**u, "not_reviewed_reason": "bad_output"} for u in batch)
+            continue
+        reviewed.extend(batch)
         validated = validate_findings(raw_findings, batch, allowed_cves, allowed_prs)
         report_findings += _build_report_findings(
             validated, {u["uid"]: u for u in batch}, row_snaps
@@ -463,6 +470,7 @@ def _coverage_notes(reviewed: list[dict], not_reviewed: list[dict]) -> list[str]
                    f"~{settings.LLM_MAX_PROMPT_TOKENS} tokens"),
         ("too_large", "too large for one prompt"),
         ("llm_error", "LLM call failed"),
+        ("bad_output", "the LLM's answer was unusable: not the requested JSON, or cut off"),
         ("time_budget", f"LLM time budget of {settings.LLM_SCAN_MAX_WALL_S:g}s ran out, "
                         "provider rate limits"),
     ):

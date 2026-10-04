@@ -250,6 +250,42 @@ def test_all_llm_calls_failing_completes_with_review_status_failed(monkeypatch):
     assert result["llm_provider_used"] is None and result["is_vulnerable"] is False
 
 
+class ShapeRouter:
+    """Answers each call with ``answers[i]`` (the last one repeats)."""
+
+    mock = False
+
+    def __init__(self, answers):
+        self.answers = list(answers)
+        self.calls = 0
+
+    async def generate(self, system, user, **kwargs):
+        answer = self.answers[min(self.calls, len(self.answers) - 1)]
+        self.calls += 1
+        return answer, "groq:stub"
+
+
+@pytest.mark.parametrize("answer", [
+    {"unit": "U1", "title": "t", "quoted_code": "y0 = x + 0"},  # one finding, salvaged
+    {}, {"findings": None}, {"findings": "none"}, ["findings"],
+])
+def test_answer_without_a_findings_list_is_not_a_clean_review(monkeypatch, answer):
+    status, result = _run_files(1, ShapeRouter([answer]), monkeypatch)
+    assert status == "completed"
+    assert result["review_status"] == "failed"
+    assert [u["reason"] for u in result["units_not_reviewed"]] == ["bad_output"]
+    assert "answer was unusable" in result["report_markdown"]
+    assert "✅" not in result["report_markdown"]
+
+
+def test_one_unusable_answer_among_two_is_partial(monkeypatch):
+    router = ShapeRouter([{"findings": []}, {"oops": True}])
+    status, result = _run_files(2, router, monkeypatch, LLM_MAX_UNITS_PER_PROMPT=1)
+    assert status == "completed" and router.calls == 2
+    assert result["review_status"] == "partial"
+    assert [u["reason"] for u in result["units_not_reviewed"]] == ["bad_output"]
+
+
 @pytest.mark.parametrize("n_units", [1, 6])
 def test_scan_that_fits_is_one_call(monkeypatch, n_units):
     router = ScriptedRouter()

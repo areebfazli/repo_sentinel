@@ -46,6 +46,7 @@ API or DB (the eval's entry point); ``scan_runner`` calls ``run_pr_review`` /
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 import time
 from dataclasses import dataclass, field, fields
@@ -571,13 +572,21 @@ def locate_in_file(quote: str, content: str,
 
 
 def _confidence(value) -> int | None:
+    """A 1-10 confidence. The prompts ask for an integer 1-10, so values are
+    read on that scale (1 and 1.0 stay 1); only a fraction strictly between 0
+    and 1 (e.g. 0.85, a probability some models give anyway) is scaled to 1-10.
+    Rounds half up; clamps to 1-10."""
+    if isinstance(value, bool):
+        return None
     try:
         x = float(value)
     except (TypeError, ValueError):
         return None
-    if 0 < x <= 1:
+    if not math.isfinite(x):
+        return None
+    if 0 < x < 1:
         x *= 10
-    return max(1, min(10, round(x)))
+    return max(1, min(10, math.floor(x + 0.5)))
 
 
 def _int(value) -> int | None:
@@ -585,6 +594,38 @@ def _int(value) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def audit_schema_problem(data, *, final: bool) -> str | None:
+    """Why an audit response is not an answer the prompt's schema allows, or
+    None. An answer is an object with a ``findings`` list, or (only while more
+    context may still be requested, ``final`` False) a non-empty
+    ``need_context`` list. Anything else (a non-object, a bare finding dict
+    salvaged from cut-off output, ``need_context`` on the final call) is a
+    failed call, never "reviewed, no findings"."""
+    if not isinstance(data, dict):
+        return "response is not a JSON object"
+    if isinstance(data.get("findings"), list):
+        return None
+    if "findings" in data:
+        return "findings is not a list"
+    if isinstance(data.get("need_context"), list) and data["need_context"]:
+        return "need_context on the final call (no more context can be given)" if final \
+            else None
+    return "no findings list"
+
+
+def verifier_schema_problem(data) -> str | None:
+    """Why a verifier response is not a verdict, or None: it must be an
+    object with a ``verdict`` string (or the boolean ``keep_finding`` of the
+    upstream filter format)."""
+    if not isinstance(data, dict):
+        return "response is not a JSON object"
+    if isinstance(data.get("verdict"), str) and data["verdict"].strip():
+        return None
+    if isinstance(data.get("keep_finding"), bool):
+        return None
+    return "no verdict"
 
 
 def validate_audit_findings(raw, bundle: PRBundle, paths: list[str]) -> tuple[list[dict], int]:
@@ -745,9 +786,13 @@ def build_verifier_prompt(bundle: PRBundle, cand: dict, nonce: str, max_tokens: 
     return render(*choice, nonce)
 
 
+# Stripped from both ends of a verdict: "Confirmed." / "**rejected**" / '"uncertain"'.
+_VERDICT_STRIP = " \t\r\n.,;:!?*_`'\""
+
+
 def parse_verdict(data) -> dict:
     data = data if isinstance(data, dict) else {}
-    verdict = str(data.get("verdict") or "").strip().lower()
+    verdict = str(data.get("verdict") or "").strip().lower().strip(_VERDICT_STRIP)
     if verdict not in VERDICTS:
         keep = data.get("keep_finding")
         verdict = ("confirmed" if keep is True else "rejected" if keep is False
@@ -820,7 +865,7 @@ def _empty_stats(config: PRReviewConfig) -> dict:
         "context_rounds_used": 0, "context_requested": 0, "context_resolved": 0,
         "candidates": 0, "quote_not_found": 0, "hard_excluded": 0,
         "below_audit_confidence": 0, "verified": 0, "confirmed": 0, "rejected": 0,
-        "uncertain": 0, "below_min_confidence": 0, "unverified": 0,
+        "uncertain": 0, "below_min_confidence": 0, "unverified": 0, "bad_output": 0,
         "prompt_tokens_est": 0, "files_total": 0, "files_reviewed": 0,
         "leads": {"guard": 0, "semgrep": 0, "sinks": 0},
         "verifier_models": [], "min_confidence": config.min_confidence,
@@ -869,7 +914,7 @@ async def run_pr_review(
             not_reviewed.extend({**u, "not_reviewed_reason": reason} for u in chunk_units)
             continue
         ctx = ContextState()
-        answered = False
+        answered = False  # a findings answer (possibly empty) was received
         failure = None
         rounds_used = 0
         force_final = False
@@ -892,21 +937,34 @@ async def run_pr_review(
                 failure = "time_budget" if getattr(exc, "deadline_exceeded", False) \
                     else "llm_error"
                 break
-            answered = True
             if provider not in providers:
                 providers.append(provider)
-            data = data if isinstance(data, dict) else {}
-            found, dropped = validate_audit_findings(data.get("findings"), bundle, chunk.paths)
-            stats["quote_not_found"] += dropped
-            candidates.extend(found)
+            problem = audit_schema_problem(data, final=rounds_left <= 0)
+            if problem:
+                logger.warning("PR audit response from {} unusable ({} file(s)): {}", provider,
+                               len(chunk.paths), problem)
+                stats["bad_output"] += 1
+                failure = "bad_output"
+                break
+            if isinstance(data.get("findings"), list):
+                answered = True
+                found, dropped = validate_audit_findings(data["findings"], bundle, chunk.paths)
+                stats["quote_not_found"] += dropped
+                candidates.extend(found)
             requests = data.get("need_context")
-            if not requests or rounds_left <= 0 or clock() >= deadline:
+            if not requests or rounds_left <= 0:
+                break
+            if clock() >= deadline:
+                failure = failure or "time_budget"
                 break
             added = resolve_context(bundle, requests, ctx, config.context_max_tokens)
             rounds_used += 1
             stats["context_rounds_used"] += 1
             if added == 0:
-                if "findings" in data or spare - 1 < 0:
+                if "findings" in data:
+                    break
+                if spare - 1 < 0:
+                    failure = "budget"
                     break
                 force_final = True  # nothing new: one last call for the final answer
         stats["context_requested"] += ctx.requested
@@ -964,18 +1022,28 @@ async def run_pr_review(
             continue
         if label not in verifier_models:
             verifier_models.append(label)
+        problem = verifier_schema_problem(data)
+        if problem:
+            logger.warning("PR verifier response from {} unusable: {}", label, problem)
+            c.update(status="unverified", status_reason="bad_output")
+            stats["unverified"] += 1
+            stats["bad_output"] += 1
+            continue
         verdict = parse_verdict(data)
         stats["verified"] += 1
-        stats[verdict["verdict"]] += 1
         c.update(verdict=verdict, verifier=label)
+        # The stats partition the candidates: "confirmed" counts reported
+        # findings only; a confirmation under the cutoff is below_min_confidence.
         if verdict["verdict"] == "confirmed" and verdict["confidence"] >= config.min_confidence:
             c["status"] = "confirmed"
+            stats["confirmed"] += 1
             findings.append(report_finding(bundle, c, verdict, label))
         elif verdict["verdict"] == "confirmed":
             c["status"] = "below_min_confidence"
             stats["below_min_confidence"] += 1
         else:
             c["status"] = verdict["verdict"]
+            stats[verdict["verdict"]] += 1
     stats["verifier_models"] = verifier_models
     return {
         "findings": findings,
@@ -1022,14 +1090,17 @@ def _labels(items: list[str]) -> str:
 def pr_notes(outcome: dict) -> list[str]:
     """Trusted report lines on the PR review's coverage and funnel."""
     s, cfg = outcome["stats"], outcome["config"]
+    # The counts partition the candidates (see run_pr_review).
     notes = [
         f"_PR-level review: {s['audit_calls']} audit call(s) "
         f"({s['context_rounds_used']} context round(s), {s['context_resolved']} of "
         f"{s['context_requested']} context request(s) resolved); {s['candidates']} candidate "
-        f"finding(s): {s['confirmed']} confirmed by an independent verifier (confidence >= "
-        f"{cfg.min_confidence}), {s['rejected'] + s['uncertain'] + s['below_min_confidence']} "
-        f"rejected or not confident enough, {s['hard_excluded']} excluded by rule, "
-        f"{s['below_audit_confidence']} below the audit's own confidence floor._"
+        f"finding(s): {s['confirmed']} reported (confirmed by an independent verifier with "
+        f"confidence >= {cfg.min_confidence}), {s['rejected']} rejected by the verifier, "
+        f"{s['uncertain'] + s['below_min_confidence']} uncertain or confirmed below the "
+        f"confidence cutoff, {s['hard_excluded']} excluded by rule, "
+        f"{s['below_audit_confidence']} below the audit's own confidence floor, "
+        f"{s['unverified']} not verified._"
     ]
     reviewed = outcome["reviewed_units"]
     partial = sorted({u["file_path"] for u in reviewed if u.get("partial")})
@@ -1046,6 +1117,7 @@ def pr_notes(outcome: dict) -> list[str]:
                    f"~{cfg.max_prompt_tokens} tokens"),
         ("too_large", "too large for one prompt"),
         ("llm_error", "LLM call failed"),
+        ("bad_output", "the LLM's answer was unusable: not the requested JSON, or cut off"),
         ("time_budget", f"LLM time budget of {cfg.wall_s:g}s ran out, provider rate limits"),
     ):
         units = [u for u in outcome["not_reviewed"] if u.get("not_reviewed_reason") == reason]
@@ -1056,8 +1128,8 @@ def pr_notes(outcome: dict) -> list[str]:
                          f"{_labels(labels)}._")
     if s["unverified"]:
         notes.append(f"_⚠️ {s['unverified']} candidate finding(s) could not be verified "
-                     f"(verifier budget of {cfg.max_verifier_calls} call(s), time budget or LLM "
-                     "errors) and are not reported._")
+                     f"(verifier budget of {cfg.max_verifier_calls} call(s), time budget, LLM "
+                     "errors or unusable answers) and are not reported._")
     return notes
 
 

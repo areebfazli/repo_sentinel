@@ -150,17 +150,18 @@ def test_dedupe_key_matches_the_units_review_for_the_same_line():
 
 
 @pytest.mark.parametrize("verdict,kept,status", [
-    ({"verdict": "confirmed", "confidence": 8}, True, "confirmed"),
-    ({"verdict": "confirmed", "confidence": 7}, False, "below_min_confidence"),
+    ({"verdict": "confirmed", "confidence": 7}, True, "confirmed"),
+    ({"verdict": "confirmed", "confidence": 6}, False, "below_min_confidence"),
+    ({"verdict": "confirmed", "confidence": 1}, False, "below_min_confidence"),
+    ({"verdict": "Confirmed.", "confidence": 9}, True, "confirmed"),
     ({"verdict": "rejected", "confidence": 9, "counterevidence": "basename() upstream"},
      False, "rejected"),
     ({"verdict": "uncertain", "confidence": 6}, False, "uncertain"),
     ({"keep_finding": True, "confidence_score": 0.9}, True, "confirmed"),
-    ("not json at all", False, "uncertain"),
 ])
 def test_verifier_keeps_only_confident_confirmations(verdict, kept, status):
     router = PRRouter(audits=[{"findings": [TRAVERSAL]}], verdict=verdict)
-    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router)
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router, min_confidence=7)
     assert bool(result["report_findings"]) is kept
     assert [c["status"] for c in result["candidates"]] == [status]
     assert result["review_status"] == "complete"
@@ -169,8 +170,83 @@ def test_verifier_keeps_only_confident_confirmations(verdict, kept, status):
 def test_min_confidence_is_configurable():
     router = PRRouter(audits=[{"findings": [TRAVERSAL]}],
                       verdict={"verdict": "confirmed", "confidence": 7})
-    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router, min_confidence=7)
-    assert len(result["report_findings"]) == 1
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router, min_confidence=8)
+    assert result["report_findings"] == []
+    assert result["candidates"][0]["status"] == "below_min_confidence"
+
+
+@pytest.mark.parametrize("value,expected", [
+    (1, 1), (1.0, 1), ("1", 1), (10, 10), (7, 7), (7.5, 8), (8.5, 9),
+    (0.85, 9), (0.9, 9), (0.5, 5), (0.04, 1), (0, 1), (-3, 1), (42, 10),
+    (None, None), ("high", None), (True, None), (float("nan"), None),
+])
+def test_confidence_reads_the_1_to_10_scale(value, expected):
+    from backend.app.core.pr_review import _confidence
+
+    assert _confidence(value) == expected
+
+
+def test_audit_confidence_of_one_is_below_the_floor_not_ten():
+    router = PRRouter(audits=[{"findings": [{**TRAVERSAL, "confidence": 1}]}])
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router)
+    assert router.verify_prompts == []
+    assert result["candidates"][0]["audit_confidence"] == 1
+    assert result["candidates"][0]["status"] == "below_audit_confidence"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("confirmed", "confirmed"), ("Confirmed.", "confirmed"), ("  REJECTED!\n", "rejected"),
+    ("**uncertain**", "uncertain"), ('"confirmed"', "confirmed"), ("confirmed;", "confirmed"),
+    ("probably", "uncertain"), ("", "uncertain"),
+])
+def test_parse_verdict_normalises_case_whitespace_and_punctuation(raw, expected):
+    from backend.app.core.pr_review import parse_verdict
+
+    assert parse_verdict({"verdict": raw, "confidence": 8})["verdict"] == expected
+
+
+@pytest.mark.parametrize("verdict", [
+    "not json at all", {"confidence": 9, "reason": "looks fine"}, {"verdict": ""},
+    {"title": "Path traversal", "quoted_code": "x"}, ["confirmed"],
+])
+def test_verifier_answer_without_a_verdict_is_unverified_not_rejected(verdict):
+    router = PRRouter(audits=[{"findings": [TRAVERSAL]}], verdict=verdict)
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router)
+    assert result["report_findings"] == []
+    [c] = result["candidates"]
+    assert (c["status"], c["status_reason"]) == ("unverified", "bad_output")
+    s = result["pr_review"]
+    assert (s["unverified"], s["bad_output"], s["verified"]) == (1, 1, 0)
+    assert result["review_status"] == "partial"
+
+
+def test_funnel_stats_partition_the_candidates():
+    titles = ["A", "B", "C", "D", "E", "F", "G"]
+    cands = [{**TRAVERSAL, "title": f"Finding {t}", "cwe": f"CWE-{i}"}
+             for i, t in enumerate(titles, start=1)]
+    cands[5] = {**cands[5], "confidence": 2}                            # below audit floor
+    cands[6] = {**cands[6], "title": "Missing rate limiting on view"}  # hard-excluded
+    verdicts = iter([
+        {"verdict": "confirmed", "confidence": 9},   # reported
+        {"verdict": "confirmed", "confidence": 3},   # below_min_confidence
+        {"verdict": "rejected", "confidence": 2},
+        {"verdict": "uncertain", "confidence": 5},
+        {"note": "no verdict"},                      # unverified (bad output)
+    ])
+    router = PRRouter(audits=[{"findings": cands}], verdict=lambda _u: next(verdicts))
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router)
+    s = result["pr_review"]
+    parts = ("hard_excluded", "below_audit_confidence", "confirmed", "rejected", "uncertain",
+             "below_min_confidence", "unverified")
+    assert {k: s[k] for k in parts} == {
+        "hard_excluded": 1, "below_audit_confidence": 1, "confirmed": 1, "rejected": 1,
+        "uncertain": 1, "below_min_confidence": 1, "unverified": 1}
+    assert sum(s[k] for k in parts) == s["candidates"] == 7
+    assert s["verified"] == 4 and len(result["report_findings"]) == s["confirmed"] == 1
+    md = result["report_markdown"]
+    assert "7 candidate finding(s): 1 reported" in md
+    assert "1 rejected by the verifier, 2 uncertain or confirmed below the" in md
+    assert "1 not verified" in md
 
 
 def test_low_audit_confidence_is_not_verified():
@@ -286,12 +362,54 @@ def test_context_request_is_resolved_and_the_audit_re_asked():
 def test_context_rounds_are_capped():
     asks = {"need_context": [{"symbol": "clean"}]}
     router = PRRouter(audits=[asks, {"need_context": [{"symbol": "view"}]},
-                              {"need_context": [{"symbol": "read"}]}])
+                              {"findings": []}])
     result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router, context_rounds=2)
     assert len(router.audit_prompts) == 3  # 1 + 2 rounds, then no more
     assert "No more context can be provided" in router.audit_prompts[-1]
     assert result["pr_review"]["context_rounds_used"] == 2
     assert result["review_status"] == "complete"
+
+
+def test_need_context_on_the_final_call_is_not_a_clean_review():
+    # Asked for its final answer, the model asks for more context again: no
+    # findings answer was ever given, so the file was NOT reviewed.
+    asks = {"need_context": [{"symbol": "clean"}]}
+    router = PRRouter(audits=[asks, {"need_context": [{"symbol": "view"}]},
+                              {"need_context": [{"symbol": "read"}]}])
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router, context_rounds=2)
+    assert len(router.audit_prompts) == 3
+    assert result["review_status"] == "failed"
+    assert {u["reason"] for u in result["units_not_reviewed"]} == {"bad_output"}
+    assert result["pr_review"]["bad_output"] == 1
+    assert "answer was unusable" in result["report_markdown"]
+
+
+@pytest.mark.parametrize("answer", [
+    {"title": "Path traversal", "quoted_code": "return open(p).read()"},  # salvaged finding
+    {"findings": "none"}, {}, {"need_context": []}, ["findings"], "no json",
+])
+def test_audit_answer_without_a_findings_list_fails_the_review(answer):
+    router = PRRouter(audits=[answer])
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router)
+    assert result["review_status"] == "failed" and result["report_findings"] == []
+    assert {u["reason"] for u in result["units_not_reviewed"]} == {"bad_output"}
+    assert router.verify_prompts == []
+
+
+def test_bad_audit_answer_for_one_prompt_among_two_is_partial():
+    router = PRRouter(audits=[{"findings": []}, {"oops": True}])
+    result = _review(_two_big_files(), router, max_audit_calls=2, context_rounds=0)
+    assert len(router.audit_prompts) == 2
+    assert result["review_status"] == "partial"
+    assert {u["reason"] for u in result["units_not_reviewed"]} == {"bad_output"}
+
+
+def test_failed_call_after_a_context_request_does_not_count_as_reviewed():
+    router = PRRouter(audits=[{"need_context": [{"symbol": "clean"}]}], fail_audit={1})
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router)
+    assert len(router.audit_prompts) == 2
+    assert result["review_status"] == "failed"
+    assert {u["reason"] for u in result["units_not_reviewed"]} == {"llm_error"}
 
 
 def test_unresolvable_request_ends_the_loop_with_one_final_call():

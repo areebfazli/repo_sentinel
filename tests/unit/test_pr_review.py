@@ -567,6 +567,34 @@ def test_suggestions_can_be_turned_off_and_are_capped():
     assert result["candidates"][0]["review_evidence"] == ["verifier_quote"]
 
 
+def test_suggestions_past_the_cap_keep_their_verifier_status():
+    # Seven qualifying candidates (one spot, distinct CWEs), cap 5: the first
+    # five in verification order are suggestions; the rest stay "uncertain"
+    # (their evidence recorded) and the funnel still partitions the candidates.
+    cands = [{**TRAVERSAL, "title": f"Finding {i}", "cwe": f"CWE-{i}",
+              "confidence": 9 - (i % 3)} for i in range(1, 8)]
+    router = PRRouter(audits=[{"findings": cands}], verdict=UNCERTAIN_REMOVED)
+    result = _review(_files(("app/files.py", RM_OLD, RM_NEW)), router,
+                     max_review_suggestions=5)
+    assert len(router.verify_prompts) == 7
+    assert len(result["review_suggestions"]) == 5
+    statuses = [c["status"] for c in result["candidates"]]
+    assert sorted(statuses) == ["review_suggested"] * 5 + ["uncertain"] * 2
+    assert all(c["review_evidence"] == ["verifier_quote"] for c in result["candidates"])
+    # The suggestions are the five verified first (highest audit confidence).
+    suggested = {s["title"] for s in result["review_suggestions"]}
+    capped = [c for c in result["candidates"] if c["status"] == "uncertain"]
+    assert all(c["audit_confidence"] <= min(
+        c2["audit_confidence"] for c2 in result["candidates"] if c2["title"] in suggested)
+        for c in capped)
+    s = result["pr_review"]
+    parts = ("hard_excluded", "below_audit_confidence", "confirmed", "rejected", "uncertain",
+             "below_min_confidence", "review_suggested", "unverified")
+    assert (s["review_suggested"], s["uncertain"]) == (5, 2)
+    assert sum(s[k] for k in parts) == s["candidates"] == 7
+    assert "5 worth a look (not blocking" in result["report_markdown"]
+
+
 def test_suggestion_text_is_escaped_in_the_report():
     finding = {**TRAVERSAL, "title": "XSS <script>alert(1)</script> @admin [x](http://evil)"}
     verdict = {**UNCERTAIN_REMOVED, "reason": "see <img src=x onerror=1> @team"}

@@ -324,8 +324,10 @@ def _usage_totals(events: list[dict]) -> dict | None:
 
 def classify_llm_error(exc: BaseException, events: list[dict]) -> str:
     """'daily_limit' | 'rate_limit' | 'bad_output' | 'other' for a failed
-    router.generate ('bad_output': answers arrived, none passed the caller's
-    format check, ``LLMError.bad_output``)."""
+    router.generate ('bad_output': ``LLMError.bad_output``, every model called
+    answered unusably - failed the caller's format check, not JSON, cut off,
+    null content or a malformed 200; a 429 among the failures is
+    'rate_limit' first)."""
     text = str(exc)
     if any(e.get("daily_limit") for e in events) or any(m in text for m in DAILY_LIMIT_MARKERS):
         return "daily_limit"

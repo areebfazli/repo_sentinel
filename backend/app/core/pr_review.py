@@ -1126,8 +1126,10 @@ def report_finding(bundle: PRBundle, c: dict, verdict: dict | None,
 
 def _failure_reason(exc: LLMError) -> str:
     """not_reviewed / unverified reason of a failed call: "time_budget" (a
-    client skipped for the deadline), "bad_output" (answers arrived but none
-    passed the schema check), else "llm_error"."""
+    client skipped for the deadline), "bad_output" (``LLMError.bad_output``:
+    every model called answered unusably - failed the schema check, not
+    JSON, cut off at max_tokens, null content or a malformed 200), else
+    "llm_error" (any 429 / 5xx / timeout / HTTP error among the failures)."""
     if getattr(exc, "deadline_exceeded", False):
         return "time_budget"
     return "bad_output" if getattr(exc, "bad_output", False) else "llm_error"

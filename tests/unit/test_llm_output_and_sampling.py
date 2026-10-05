@@ -267,6 +267,64 @@ def test_other_failures_are_not_bad_output(monkeypatch):
     assert info.value.bad_output is False
 
 
+# Bad output in an HTTP 200, of every kind the client rejects.
+BAD_200 = {
+    "length_cut": lambda: _choice('{"findings": [{"title": "cut', "length", 16000),
+    "null_content": lambda: _choice(None, "length", 16000),
+    "no_choices": lambda: _FakeResp(200, {"choices": []}),
+    "error_in_200": lambda: _FakeResp(200, {"error": {"code": 400, "message": "bad"}}),
+    "not_json": lambda: _ok("I think the code is fine."),
+    "fails_validator": lambda: _ok('{"note": "no findings list"}'),
+}
+
+
+@pytest.mark.parametrize("primary", sorted(BAD_200))
+@pytest.mark.parametrize("fallback", ["length_cut", "not_json"])
+def test_every_client_answering_unusably_is_bad_output(monkeypatch, primary, fallback):
+    _pin_openrouter(monkeypatch, retries=1)  # fallback: gemini
+    _patch_sleep(monkeypatch)
+    script = _Script()
+    script.set(PRIMARY, [BAD_200[primary]()])
+    script.set(GEMINI, [BAD_200[fallback]()])
+    _patch_script(monkeypatch, script)
+    with pytest.raises(LLMError) as info:
+        asyncio.run(LLMRouter().generate("s", "u", validate=_findings_list))
+    assert info.value.bad_output is True
+    assert script.order == [PRIMARY, GEMINI]  # no same-client retry of bad output
+
+
+@pytest.mark.parametrize("other", [
+    _FakeResp(500, text="boom"),
+    _FakeResp(429, text="slow down"),
+    _FakeResp(404, text="model not found"),
+])
+@pytest.mark.parametrize("bad_first", [True, False])
+def test_bad_output_mixed_with_another_failure_is_not_bad_output(monkeypatch, other, bad_first):
+    # A rate limit / server / HTTP error among the failures: a retry might
+    # succeed, so the call is an llm_error, not bad_output.
+    _pin_openrouter(monkeypatch, retries=0)
+    script = _Script()
+    bad = BAD_200["length_cut"]()
+    script.set(PRIMARY, [bad if bad_first else other])
+    script.set(GEMINI, [other if bad_first else bad])
+    _patch_script(monkeypatch, script)
+    with pytest.raises(LLMError) as info:
+        asyncio.run(LLMRouter().generate("s", "u", validate=_findings_list))
+    assert info.value.bad_output is False
+
+
+def test_a_client_never_called_does_not_hide_bad_output(monkeypatch):
+    # Gemini's tokens/min limit can't take the prompt: skipped, not called.
+    _pin_openrouter(monkeypatch, retries=0)
+    monkeypatch.setattr(settings, "LLM_TPM_LIMITS", {"gemini": 1000})
+    script = _Script()
+    script.set(PRIMARY, [BAD_200["length_cut"]()])
+    _patch_script(monkeypatch, script)
+    with pytest.raises(LLMError) as info:
+        asyncio.run(LLMRouter().generate("s", "x" * 8000, validate=_findings_list))
+    assert script.order == [PRIMARY] and info.value.bad_output is True
+
+
 # --- max_tokens and truncated output ---------------------------------------------------
 
 

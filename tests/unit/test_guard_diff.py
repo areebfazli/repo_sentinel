@@ -233,6 +233,68 @@ def test_weights_only_deleted_from_a_multi_line_call():
     assert not r.alert and c.confidence < ALERT_MIN_CONFIDENCE
 
 
+@pytest.mark.parametrize("lang, old, new, kind", [
+    ("python", "def check(sig, key):\n    return verify(sig, key)\n",
+     "def check(sig, key, verify=False):\n    return verify(sig, key)\n", "tls_verify"),
+    ("python", "def load(path):\n    return torch.load(path)\n",
+     "def load(path, weights_only=False):\n    return torch.load(path)\n", "safe_api"),
+    ("python", "def run(cmd):\n    return launch(cmd)\n",
+     "def run(cmd, shell=True):\n    return launch(cmd)\n", "shell"),
+    ("python", "f = lambda u: get(u)\n", "f = lambda u, verify=False: get(u)\n", "tls_verify"),
+    ("javascript", "function connect(host) {\n  return tls.connect({ host });\n}\n",
+     "function connect(host, rejectUnauthorized = false) {\n"
+     "  return tls.connect({ host });\n}\n", "tls_verify"),
+    ("javascript", "const connect = (host) => tls.connect({ host });\n",
+     "const connect = (host, { rejectUnauthorized = false } = {}) => tls.connect({ host });\n",
+     "tls_verify"),
+])
+def test_a_flag_in_a_parameter_default_is_weak_evidence_never_an_alert(lang, old, new, kind):
+    from backend.app.core.guard_diff import SIGNATURE_FLAG_WEIGHT
+
+    r = guard_diff(old, new, lang)
+    (c,) = r.changes
+    assert (c.direction, c.kind) == ("weakened", kind)
+    assert c.confidence <= SIGNATURE_FLAG_WEIGHT < ALERT_MIN_CONFIDENCE
+    assert not r.alert and r.risk == "none"  # alone below RISK_MIN
+
+
+def test_a_signature_default_swapped_to_unsafe_is_not_an_alert():
+    r = guard_diff("def load(path, weights_only=True):\n    return torch.load(path)\n",
+                   "def load(path, weights_only=False):\n    return torch.load(path)\n",
+                   "python")
+    (c,) = r.changes
+    assert c.direction == "weakened" and c.confidence <= 0.4 and not r.alert
+
+
+@pytest.mark.parametrize("old, new, conf, alert", [
+    # Call-site kwargs keep their full weight (and the alert tier).
+    ("def fetch(url):\n    return requests.get(url)\n",
+     "def fetch(url):\n    return requests.get(url, verify=False)\n", 0.8, True),
+    ("def run(cmd):\n    subprocess.run(cmd)\n",
+     "def run(cmd):\n    subprocess.run(cmd, shell=True)\n", 0.8, True),
+    ("def load(p):\n    return torch.load(p, weights_only=True)\n",
+     "def load(p):\n    return torch.load(p, weights_only=False)\n", 0.6, False),
+    # A kwarg passed in the body of a function that also has the flag as a
+    # parameter default: the call site counts in full, the default doesn't
+    # cancel it.
+    ("def fetch(url, verify=False):\n    return requests.get(url)\n",
+     "def fetch(url, verify=False):\n    return requests.get(url, verify=False)\n", 0.8, True),
+])
+def test_call_site_flags_keep_their_weight(old, new, conf, alert):
+    r = guard_diff(old, new, "python")
+    (c,) = r.changes
+    assert c.direction == "weakened" and c.confidence == conf and r.alert is alert
+
+
+def test_call_site_flags_keep_their_weight_in_javascript():
+    r = guard_diff("function c(h) {\n  return https.request({ host: h });\n}\n",
+                   "function c(h) {\n"
+                   "  return https.request({ host: h, rejectUnauthorized: false });\n}\n",
+                   "javascript")
+    (c,) = r.changes
+    assert c.kind == "tls_verify" and c.confidence == 0.8 and r.alert
+
+
 def test_dropping_a_flag_whose_default_is_safe_is_no_change():
     # numpy.load defaults to allow_pickle=False; subprocess to shell=False.
     for old, new in (("np.load(p, allow_pickle=False)", "np.load(p)"),

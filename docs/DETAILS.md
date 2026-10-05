@@ -361,10 +361,16 @@ dropping the explicit `True` or writing `False` is weakened, at 0.6, i.e. `guard
 the alert tier, as dropping it is harmless from torch 2.6, where it is the default; numpy's
 `allow_pickle` only counts as an explicit `True`, its default being safe) and parameterised
 SQL turned into interpolated SQL. It nets them into `risk` (`guard_removed` / `guard_added` /
-`none`) plus a high-precision `alert` tier (swap/flag/SQL evidence only). Features are counted
-per kind with identifier-anonymised keys, so renames, reformatting and moved statements don't
-count. The vocabularies are module-level tables. Files mode already has what it needs:
-`old_code_for_units` reverse-applies the Action's `patch` to `content` to get the old file.
+`none`) plus a high-precision `alert` tier (swap/flag/SQL evidence only). A flag written in a
+function's parameter list (a default such as `def check(sig, verify=False)`,
+`def load(path, weights_only=False)`, JS `{ rejectUnauthorized = false } = {}`) is a default a
+caller may override, not a setting the code applies: it weighs at most `SIGNATURE_FLAG_WEIGHT`
+(0.4), alone or in a swap, so it is still evidence but never the alert tier (before,
+`verify=False` in a signature was an alert at 0.8); the same flag passed at a call site keeps
+its full weight. Features are counted per kind with identifier-anonymised keys, so renames,
+reformatting and moved statements don't count. The vocabularies are module-level tables. Files
+mode already has what it needs: `old_code_for_units` reverse-applies the Action's `patch` to
+`content` to get the old file.
 
 **In scans** (files mode only; a snippet has no previous version): units are planned with
 `patch_touched_lines(patch)` (deletion points count as changes, so a function whose only
@@ -387,6 +393,13 @@ CVEs), fix-direction FPR unchanged (14 / 502, 72 / 2865), the alert tier unchang
 gaining a `weights_only=False` parameter default); on the 476 PR-eval items (dev200 +
 misleading) only InspireMusic's CVE-2025-5148 changes (intro → `guard_removed`, fix →
 `guard_added`), no alert changes.
+Capping parameter-list defaults at 0.4: `guard_removed` TPR 115 → 113 / 502 held-out and
+692 → 691 / 2865 corpus, all fixes that set a safer *default* in a library signature and so
+fall below `RISK_MIN` alone (CVE-2020-10799 `svg2rlg` / `load_svg_file` adding
+`resolve_entities=False`; CVE-2019-6446 numpy `read_array` dropping `allow_pickle=True`);
+fix-direction FPR unchanged (14 / 502, 72 / 2865); the alert tier unchanged (16 / 502 at
+0 / 502; 69 / 2865 at 6 / 2865); broad-commit bystanders 50 → 49 / 2364 (`_load_pyfunc`'s
+`weights_only=False` default is no longer `guard_removed`); the dev200 rescore is identical.
 
 ## PR-level review (files mode)
 
@@ -547,7 +560,10 @@ fixes and 80 bystander benign PRs). Retrieval is off in every arm; no embedder o
   function-level 21/55 (16/55); fix PRs flagged 3/57 (2/57); benign 0/48 (0/48; only 48 of 80
   benign PRs scored). The function scope alone gave strict 15/55, function-level 20/55
   (open-webui back; the 10-line window had 19/55); `weights_only` adds InspireMusic
-  CVE-2025-5148 (a dropped `weights_only=True`) at both levels.
+  CVE-2025-5148 (a dropped `weights_only=True`) at both levels. The outermost-function
+  scope, the narrower alert dedupe and the parameter-default cap leave this rescore
+  identical (verified 12 / 16 / 2 / 0; verified + worth a look 16 / 21 / 3 / 0; confirmed
+  ≥ 7 + worth a look 17 / 23 / 3 / 1).
 - `--arm units`: the per-unit review (`REVIEW_MODE=units`), run in-process exactly as
   `scan_runner` runs files mode, on the same PRs.
 - `--arm pr_misleading`: the `pr` arm on the `_misleading` variants of the selected

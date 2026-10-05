@@ -24,7 +24,9 @@ Design (deterministic, cheap, no model):
    - ``flag``   — security-relevant flag values (``FLAGS``: ``shell=True``,
      ``verify=False``, ``rejectUnauthorized: false``, ``autoescape``, safe-load
      keywords such as ``Loader=SafeLoader``, ``weights_only=True``,
-     ``resolve_entities=False`` ...);
+     ``resolve_entities=False`` ...); one in a parameter list (a default such
+     as ``def check(sig, verify=False)``) weighs at most
+     ``SIGNATURE_FLAG_WEIGHT``, below the alert tier;
    - ``sql``    — SQL string literals that are interpolated (f-string, ``%``,
      ``+``, ``.format``, template literal) vs parameterised (placeholders).
 
@@ -379,6 +381,15 @@ FLAGS: list[tuple[str, str, str | None, bool, str, float]] = [
     ("allow_redirects|follow_redirects|followRedirects", r"True|true", r"False|false",
      False, "ssrf", 0.35),
 ]
+# A flag written in a function's parameter list (``def check(sig, verify=False)``,
+# ``def load(path, weights_only=False)``, JS ``{rejectUnauthorized = false} = {}``)
+# is a default the caller may override, not a setting the code applies: such a
+# match weighs at most this much, alone or in a swap, so it stays evidence but
+# never reaches ALERT_MIN_CONFIDENCE (and alone never RISK_MIN). The same flag
+# passed at a call site keeps its full weight.
+SIGNATURE_FLAG_WEIGHT = 0.4
+_SIGNATURE_NODES = {"python": ("parameters", "lambda_parameters"),
+                    "javascript": ("formal_parameters",)}
 
 # SQL: a string literal counts as SQL when it has two SQL keywords (at least one
 # written upper-case, or the string is an argument of an execute-like call).
@@ -875,17 +886,44 @@ def _flag_res():
     return out
 
 
-def _flag_features(code: str, line_off: int) -> list[_Feature]:
+def _signature_spans(root: Node, lang: str) -> list[tuple[int, int]]:
+    """Byte spans of the parameter lists of every function / lambda / arrow /
+    method in ``root`` (Python ``parameters`` / ``lambda_parameters``, JS
+    ``formal_parameters``)."""
+    wanted = _SIGNATURE_NODES.get(lang, ())
+    return [(n.start_byte, n.end_byte) for n in _walk(root) if n.type in wanted]
+
+
+def _flag_features(code: str, line_off: int,
+                   signatures: list[tuple[int, int]] | None = None) -> list[_Feature]:
+    """Flag features of ``code`` (the masked source). A match starting inside
+    one of ``signatures`` (byte spans of parameter lists) is a parameter
+    default: its weights are capped at SIGNATURE_FLAG_WEIGHT and its key is
+    marked, so it never cancels against the same flag at a call site."""
     feats: list[_Feature] = []
+
+    def in_signature(m: re.Match) -> bool:
+        if not signatures:
+            return False
+        at = len(code[:m.start()].encode("utf-8", "replace"))
+        return any(a <= at < b for a, b in signatures)
+
     for names, unsafe_re, safe_re, default_safe, kind, w in _flag_res():
         group = "flag:" + names
         for m in unsafe_re.finditer(code):
-            feats.append(_Feature("flag", kind, group, m.group(0), -1, w, w,
+            sig = in_signature(m)
+            weight = min(w, SIGNATURE_FLAG_WEIGHT) if sig else w
+            feats.append(_Feature("flag", kind, group, ("param:" if sig else "") + m.group(0),
+                                  -1, weight, weight,
                                   _line_of(code, m.start()) - line_off, _first_line(m.group(0))))
         if safe_re is not None:
             alone = 0.0 if default_safe else w
             for m in safe_re.finditer(code):
-                feats.append(_Feature("flag_safe", kind, group, m.group(0), 1, alone, w,
+                sig = in_signature(m)
+                cap = SIGNATURE_FLAG_WEIGHT if sig else 1.0
+                feats.append(_Feature("flag_safe", kind, group,
+                                      ("param:" if sig else "") + m.group(0), 1,
+                                      min(alone, cap), min(w, cap),
                                       _line_of(code, m.start()) - line_off,
                                       _first_line(m.group(0))))
     return feats
@@ -964,7 +1002,7 @@ def extract_features(code: str, lang: str
         *_cond_features(root, src, lang, guard_conds, off),
         *_call_features(root, src, lang, off),
         *_hazard_features(masked, lang, off),
-        *_flag_features(masked, off),
+        *_flag_features(masked, off, _signature_spans(root, lang)),
         *_sql_features(root, src, lang, off),
     ]
     return feats, note, _call_context(root, src, lang)

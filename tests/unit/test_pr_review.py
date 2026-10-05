@@ -612,6 +612,39 @@ def test_a_guard_deleted_from_the_end_of_the_function_still_counts():
         (3, 3, None)]
 
 
+@pytest.mark.parametrize("old, dropped", [
+    ("@app.route('/x')\n@login_required\ndef view(request, obj):\n"
+     + "".join(f"    s{i} = obj.step({i})\n" for i in range(5)) + "    obj.delete()\n",
+     "@login_required\n"),
+    ("class V:\n    @permission_required(\n        'admin',\n    )\n"
+     "    def post(self, request, obj):\n"
+     + "".join(f"        s{i} = obj.step({i})\n" for i in range(5)) + "        obj.delete()\n",
+     "    @permission_required(\n        'admin',\n    )\n"),
+])
+def test_a_decorator_removed_from_the_candidates_function_counts(old, dropped):
+    # CodeParser spans start at the def line; the decorators above it are
+    # still the function's own controls.
+    from backend.app.core.pr_review import guard_removal_checks
+
+    new = old.replace(dropped, "")
+    bundle, guard = _bundle_and_guard(_files(("app/views.py", old, new)))
+    line = new.splitlines().index(next(ln for ln in new.splitlines()
+                                       if "obj.delete()" in ln)) + 1
+    rows = guard_removal_checks(bundle, guard, {"file_path": "app/views.py", "line": line,
+                                                "end_line": line})
+    assert rows and all(r["reason"] is None for r in rows), rows
+
+
+def test_a_decorator_of_the_next_function_is_not_the_candidates():
+    from backend.app.core.pr_review import _decorated_start
+
+    lines = ("def a():\n    return f(\n        1,\n    )\n@login_required\n@app.route(\n"
+             "    '/x',\n)\ndef b():\n    pass\n")
+    assert _decorated_start(lines, 9) == 5   # b's decorators, multi-line one included
+    assert _decorated_start(lines, 1) == 1   # none above a()
+    assert _decorated_start(lines, 2) == 2   # not a function start: no '@' above
+
+
 def test_module_level_candidates_fall_back_to_a_line_window():
     from backend.app.core.pr_review import GUARD_EVIDENCE_FALLBACK_WINDOW
 

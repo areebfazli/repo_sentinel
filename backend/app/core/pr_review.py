@@ -881,6 +881,33 @@ def _deleted_lines_with(pr_file: PRFile, text: str, deleted: set[int]) -> list[i
             if n <= len(lines) and locate_quote(text, lines[n - 1]) is not None]
 
 
+def _decorated_start(content: str | None, start: int) -> int:
+    """First line of the decorators right above the function whose span starts
+    at ``start`` (``start`` itself when there are none). CodeParser spans begin
+    at the ``def`` / method line, but a removed ``@login_required`` is that
+    function's own control. Walks up over ``@`` lines at the function's
+    indentation, a multi-line decorator's deeper lines and closing brackets,
+    stopping at a blank line, a dedent or any other statement."""
+    lines = (content or "").splitlines()
+    if not 1 <= start <= len(lines):
+        return start
+
+    def indent(s: str) -> int:
+        return len(s) - len(s.lstrip())
+
+    base, top = indent(lines[start - 1]), start
+    for i in range(start - 1, 0, -1):
+        s = lines[i - 1]
+        if not s.strip() or indent(s) < base:
+            break
+        if indent(s) == base:
+            if s.strip().startswith("@"):
+                top = i
+            elif s.strip()[0] not in ")]}":
+                break
+    return top
+
+
 def _old_function_range(bundle: PRBundle, path: str, fn: dict) -> tuple[int, int] | None:
     """Old-file line range of the changed function ``fn`` (a ``function_at``
     span of the NEW file), when the bundle matched it to an old function."""
@@ -930,7 +957,8 @@ def guard_removal_checks(bundle: PRBundle, guard: dict, cand: dict) -> list[dict
     deletion point (``pr_context.new_line_for``) of the deleted old line
     holding its old code, the one nearest the candidate. Its scope is the
     candidate's function: the innermost CodeParser function of the new file
-    containing the candidate's line (``PRBundle.function_at``). Reasons:
+    containing the candidate's line (``PRBundle.function_at``), its
+    decorators included (``_decorated_start``). Reasons:
 
     - "no_old_code": nothing of the old side to show;
     - "not_located": no new-side anchor, and the old code is on no deleted line;
@@ -960,8 +988,11 @@ def guard_removal_checks(bundle: PRBundle, guard: dict, cand: dict) -> list[dict
     alert_lines, _alert_old = guard_alert_spots(bundle, guard, f.path)
     fn = bundle.function_at(f.path, line)
     if fn is not None:
-        new_scope = (int(fn["start_line"]), int(fn["end_line"]))
+        # The function's decorators are part of it (a removed @login_required).
+        new_scope = (_decorated_start(f.new_content, int(fn["start_line"])), int(fn["end_line"]))
         old_scope = _old_function_range(bundle, f.path, fn)
+        if old_scope is not None:
+            old_scope = (_decorated_start(f.old_content, old_scope[0]), old_scope[1])
         out_reason = "other_function"
     else:
         new_scope = (line - GUARD_EVIDENCE_FALLBACK_WINDOW, end + GUARD_EVIDENCE_FALLBACK_WINDOW)

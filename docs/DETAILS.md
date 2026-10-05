@@ -534,9 +534,12 @@ fixes and 80 bystander benign PRs). Retrieval is off in every arm; no embedder o
   the cached verdicts with **guard_diff evidence only** (recomputed from the dataset; the old
   verifier prompt had no `removed_control_quote`) at the run's own cutoff, and labels it so;
   without the dataset the view is reported n/a. Rescore of `pr_eval_pr_dev200.json` (old
-  prompt, cutoff 8, guard_diff evidence only, limited to the candidate's function):
-  introducing strict 15/55 (verified 12/55), function-level 20/55 (16/55); fix PRs flagged
-  3/57 (2/57); benign 0/48 (0/48; only 48 of 80 benign PRs scored).
+  prompt, cutoff 8, guard_diff evidence only, limited to the candidate's function, with
+  `weights_only` in guard_diff's vocabulary): introducing strict 16/55 (verified 12/55),
+  function-level 21/55 (16/55); fix PRs flagged 3/57 (2/57); benign 0/48 (0/48; only 48 of 80
+  benign PRs scored). The function scope alone gave strict 15/55, function-level 20/55
+  (open-webui back; the 10-line window had 19/55); `weights_only` adds InspireMusic
+  CVE-2025-5148 (a dropped `weights_only=True`) at both levels.
 - `--arm units`: the per-unit review (`REVIEW_MODE=units`), run in-process exactly as
   `scan_runner` runs files mode, on the same PRs.
 - `--arm pr_misleading`: the `pr` arm on the `_misleading` variants of the selected

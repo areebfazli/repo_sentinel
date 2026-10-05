@@ -402,6 +402,8 @@ def test_upstream_429_or_5xx_code_in_200_is_retried_on_same_client(monkeypatch, 
     {"code": "provider_error", "message": "a word"},  # non-numeric
     {"code": True, "message": "a bool"},
     {"code": 200, "message": "outside 400-599"},
+    {"code": 600, "message": "outside 400-599"},
+    {"code": "1001", "message": "outside 400-599"},
     "a bare string",
 ])
 def test_error_in_200_without_a_usable_code_is_bad_output(monkeypatch, err):

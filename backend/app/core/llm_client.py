@@ -591,7 +591,7 @@ class LLMClient:
             message = str(err.get("message", err) if isinstance(err, dict) else err)
             raw_code = err.get("code") if isinstance(err, dict) else None
             what = f"error in HTTP 200 body (code {raw_code})"
-            if code is not None and (code == 429 or code >= 500):
+            if code is not None and (code == 429 or 500 <= code <= 599):
                 raise _Retriable(f"{self.label} {what}: {message[:200]}", status=code)
             if code is not None and 400 <= code < 500:
                 self._raise_http_error(code, what, message, message, gone_text=resp.text)

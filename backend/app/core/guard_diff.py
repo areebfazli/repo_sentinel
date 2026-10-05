@@ -60,9 +60,11 @@ change is a deleted guard is never a unit: integration must plan with
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import textwrap
-from collections import Counter, defaultdict
+import threading
+from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Literal
@@ -1189,6 +1191,46 @@ def flip_direction(direction: str) -> str:
 # comparisons, and the safe forms of hazards, flags and SQL strings.
 _PROTECTIVE_FAMILIES = frozenset({"call", "block", "cond", "safe", "flag_safe", "sql_safe"})
 
+# control_kinds_on_lines parses the whole file it is given (an old file of the
+# PR, once per verifier quote checked against it: up to PR_REVIEW_MAX_VERIFIER_CALLS
+# per review, ~1 s each for an 11k-line file, on the event loop). Its protective
+# features are cached per (content hash, language), least recently used first out.
+CONTROL_CACHE_SIZE = 32
+_ControlSpans = tuple[tuple[str, tuple[tuple[int, int], ...]], ...]
+_control_cache: OrderedDict[tuple[str, str], _ControlSpans] = OrderedDict()
+_control_cache_lock = threading.Lock()
+
+
+def clear_control_cache() -> None:
+    with _control_cache_lock:
+        _control_cache.clear()
+
+
+def _protective_spans(code: str, lang: str) -> _ControlSpans:
+    """(kind, line spans) of each protective feature of ``code`` that counts
+    for something (``control_kinds_on_lines``), cached per content hash and
+    language. A failed analysis is cached as no features."""
+    key = (hashlib.sha256(code.encode("utf-8", "replace")).hexdigest(), lang)
+    with _control_cache_lock:
+        hit = _control_cache.get(key)
+        if hit is not None:
+            _control_cache.move_to_end(key)
+            return hit
+    try:
+        feats, _note, _ctx = extract_features(code, lang)
+        spans: _ControlSpans = tuple(
+            (f.kind, f.spans or ((f.line, f.line),)) for f in feats
+            if f.family in _PROTECTIVE_FAMILIES and f.polarity > 0
+            and max(f.weight, f.swap_weight) > 0)
+    except Exception:  # never break a review over the evidence check
+        spans = ()
+    with _control_cache_lock:
+        _control_cache[key] = spans
+        _control_cache.move_to_end(key)
+        while len(_control_cache) > CONTROL_CACHE_SIZE:
+            _control_cache.popitem(last=False)
+    return spans
+
 
 def control_kinds_on_lines(code: str, language: str | None, lines) -> set[str]:
     """This module's control classifier applied to some lines of ``code``
@@ -1200,21 +1242,16 @@ def control_kinds_on_lines(code: str, language: str | None, lines) -> set[str]:
     a log line before the exit, or the body of an ``if`` whose ``else``
     exits, is not the control. Unclassified guard blocks and features that
     count for nothing, not even in a swap, are left out. Empty for an unsupported
-    language or a failed analysis; never raises."""
+    language or a failed analysis; never raises. The file's features are
+    computed once per content and language (``_protective_spans``, an LRU of
+    CONTROL_CACHE_SIZE files), so checking several quotes against the same
+    old file parses it once."""
     lang = normalize_language(language)
     wanted = {int(n) for n in lines}
     if lang is None or not wanted or not code:
         return set()
-    try:
-        feats, _note, _ctx = extract_features(code, lang)
-    except Exception:  # never break a review over the evidence check
-        return set()
-    return {
-        f.kind for f in feats
-        if f.family in _PROTECTIVE_FAMILIES and f.polarity > 0
-        and max(f.weight, f.swap_weight) > 0
-        and any(a <= n <= b for a, b in (f.spans or ((f.line, f.line),)) for n in wanted)
-    }
+    return {kind for kind, spans in _protective_spans(code, lang)
+            if any(a <= n <= b for a, b in spans for n in wanted)}
 
 
 # Comment-looking line starts for languages without a grammar here.

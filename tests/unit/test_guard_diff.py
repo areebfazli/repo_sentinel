@@ -575,6 +575,54 @@ def test_control_kinds_on_lines_guard_block_is_its_header_and_exit(lines, kinds)
     assert control_kinds_on_lines(GUARD_SPANS_PY, "python", lines) == kinds
 
 
+def test_control_kinds_on_lines_parses_each_file_once(monkeypatch):
+    from backend.app.core import guard_diff as gd
+
+    calls = []
+    real = gd.extract_features
+
+    def counting(code, lang):
+        calls.append(len(code))
+        return real(code, lang)
+
+    monkeypatch.setattr(gd, "extract_features", counting)
+    gd.clear_control_cache()
+    assert control_kinds_on_lines(LINES_PY, "python", [4]) == {"auth_check"}
+    assert control_kinds_on_lines(LINES_PY, "python", [8]) == {"sanitiser"}
+    # Same content (a different string object), another language alias: cached.
+    assert control_kinds_on_lines("".join(list(LINES_PY)), "py", [9]) == {"auth_check"}
+    assert len(calls) == 1
+    # Other content (or another language) is parsed once more.
+    assert control_kinds_on_lines(GUARD_SPANS_PY, "python", [2]) == {"auth_check"}
+    assert control_kinds_on_lines(GUARD_SPANS_PY, "python", [3]) == set()
+    control_kinds_on_lines(LINES_PY, "javascript", [4])
+    assert len(calls) == 3
+    # Least recently used out first.
+    monkeypatch.setattr(gd, "CONTROL_CACHE_SIZE", 2)
+    control_kinds_on_lines(TORCH_MULTILINE_OLD, "python", [5])  # evicts LINES_PY / python
+    assert len(calls) == 4
+    control_kinds_on_lines(LINES_PY, "python", [4])
+    assert len(calls) == 5
+    gd.clear_control_cache()
+
+
+def test_control_kinds_on_lines_caches_a_failed_analysis_as_nothing(monkeypatch):
+    from backend.app.core import guard_diff as gd
+
+    calls = []
+
+    def broken(code, lang):
+        calls.append(1)
+        raise RuntimeError("tree-sitter edge case")
+
+    monkeypatch.setattr(gd, "extract_features", broken)
+    gd.clear_control_cache()
+    assert control_kinds_on_lines(LINES_PY, "python", [4]) == set()
+    assert control_kinds_on_lines(LINES_PY, "python", [8]) == set()
+    assert len(calls) == 1
+    gd.clear_control_cache()
+
+
 def test_control_kinds_on_lines_safe_forms_and_unsupported_languages():
     code = ("def load(s, db, name):\n"
             "    data = yaml.safe_load(s)\n"

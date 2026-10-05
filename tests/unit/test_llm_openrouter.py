@@ -378,6 +378,150 @@ def test_complete_raises_retriable_on_error_in_200(monkeypatch):
     assert info.value.transient is False and "boom" in str(info.value)
 
 
+@pytest.mark.parametrize("code", [503, "429", "502"])
+def test_upstream_429_or_5xx_code_in_200_is_retried_on_same_client(monkeypatch, code):
+    _pin_openrouter(monkeypatch, retries=1)
+    router = LLMRouter()
+    sleeps = _patch_sleep(monkeypatch)
+    script = _Script()
+    script.set(PRIMARY, [
+        _FakeResp(200, {"error": {"code": code, "message": "upstream trouble"}}),
+        _ok(OK_JSON),
+    ])
+    _patch_script(monkeypatch, script)
+
+    _, provider = _generate(router)
+    assert provider == f"openrouter:{OR_PRIMARY}"
+    assert script.order == [PRIMARY, PRIMARY]
+    assert len(sleeps) == 1
+
+
+@pytest.mark.parametrize("err", [
+    {"message": "Provider returned error"},           # no code
+    {"code": None, "message": "no code"},
+    {"code": "provider_error", "message": "a word"},  # non-numeric
+    {"code": True, "message": "a bool"},
+    {"code": 200, "message": "outside 400-599"},
+    "a bare string",
+])
+def test_error_in_200_without_a_usable_code_is_bad_output(monkeypatch, err):
+    _pin_openrouter(monkeypatch, retries=2, fallback_provider=None)
+    router = LLMRouter()
+    sleeps = _patch_sleep(monkeypatch)
+    script = _Script()
+    script.set(PRIMARY, [_FakeResp(200, {"error": err})])
+    _patch_script(monkeypatch, script)
+
+    with pytest.raises(LLMError) as info:
+        _generate(router)
+    assert script.order == [PRIMARY] and sleeps == []  # no same-client retry
+    assert info.value.bad_output is True
+    assert info.value.client_outcomes == [(f"openrouter:{OR_PRIMARY}", "bad_output")]
+
+
+@pytest.mark.parametrize("code", [400, 401, 403, 404, "400"])
+def test_4xx_code_in_200_is_an_http_error_not_bad_output(monkeypatch, code):
+    # Same as an HTTP status of that code: no same-client retry, outcome
+    # "failed" (llm_error), next client tried.
+    _pin_openrouter(monkeypatch, retries=2)  # fallback: gemini
+    router = LLMRouter()
+    sleeps = _patch_sleep(monkeypatch)
+    script = _Script()
+    script.set(PRIMARY, [_FakeResp(200, {"error": {"code": code, "message": "nope"}})])
+    script.set(GEMINI, [_ok("not json at all")])
+    _patch_script(monkeypatch, script)
+
+    with pytest.raises(LLMError) as info:
+        _generate(router)
+    assert script.order == [PRIMARY, GEMINI] and sleeps == []
+    assert info.value.client_outcomes == [
+        (f"openrouter:{OR_PRIMARY}", "failed"), (f"gemini:{GEMINI_MODEL}", "bad_output")]
+    assert info.value.bad_output is False  # mixed with bad output: still llm_error
+
+
+def test_4xx_code_in_200_alone_is_not_bad_output(monkeypatch):
+    _pin_openrouter(monkeypatch, retries=2, fallback_provider=None)
+    router = LLMRouter()
+    _patch_sleep(monkeypatch)
+    script = _Script()
+    script.set(PRIMARY, [_FakeResp(200, {"error": {"code": 400, "message": "bad request"}})])
+    _patch_script(monkeypatch, script)
+
+    with pytest.raises(LLMError, match=r"error in HTTP 200 body \(code 400\): bad request") as info:
+        _generate(router)
+    assert script.order == [PRIMARY]
+    assert info.value.bad_output is False
+    assert info.value.client_outcomes == [(f"openrouter:{OR_PRIMARY}", "failed")]
+
+
+def test_complete_raises_llm_error_for_a_4xx_code_in_200(monkeypatch):
+    _pin_openrouter(monkeypatch)
+    client = LLMClient("openrouter")
+    script = _Script()
+    script.set(PRIMARY, [_FakeResp(200, {"error": {"code": 404, "message": "No endpoints"}})])
+    _patch_script(monkeypatch, script)
+    warnings, sink_id = _capture_warnings()
+    try:
+        with pytest.raises(LLMError) as info:
+            asyncio.run(client.complete("s", "u"))
+    finally:
+        logger.remove(sink_id)
+    assert not isinstance(info.value, llm_client._Retriable)
+    assert info.value.provider_wide is False and "No endpoints" in str(info.value)
+    # A 404 code names a gone model, like HTTP 404.
+    assert any("not found or decommissioned" in m and OR_PRIMARY in m for m in warnings)
+
+
+def test_model_gone_message_in_a_400_code_in_200_warns(monkeypatch):
+    _pin_openrouter(monkeypatch)
+    client = LLMClient("openrouter")
+    script = _Script()
+    script.set(PRIMARY, [_FakeResp(200, {"error": {
+        "code": 400, "message": "The model has been decommissioned (model_decommissioned)"}})])
+    _patch_script(monkeypatch, script)
+    warnings, sink_id = _capture_warnings()
+    try:
+        with pytest.raises(LLMError):
+            asyncio.run(client.complete("s", "u"))
+    finally:
+        logger.remove(sink_id)
+    assert any("not found or decommissioned" in m for m in warnings)
+
+
+@pytest.mark.parametrize("code", [402, "402"])
+def test_402_code_in_200_skips_the_whole_provider(monkeypatch, code):
+    _pin_openrouter(monkeypatch, fallback_model=OR_FB, retries=3)  # then gemini
+    router = LLMRouter()
+    sleeps = _patch_sleep(monkeypatch)
+    warnings, sink_id = _capture_warnings()
+    script = _Script()
+    credits = {"error": {"code": code, "message": "Insufficient credits"}}
+    script.set(PRIMARY, [_FakeResp(200, credits)])
+    script.set(OR_FALLBACK, [])  # same account: must not be tried
+    script.set(GEMINI, [_ok(OK_JSON)])
+    _patch_script(monkeypatch, script)
+
+    try:
+        _, provider = _generate(router)
+    finally:
+        logger.remove(sink_id)
+
+    assert provider == f"gemini:{GEMINI_MODEL}"
+    assert script.order == [PRIMARY, GEMINI]
+    assert sleeps == []
+    assert any("insufficient credits" in m and "not retrying" in m for m in warnings)
+    assert any("Skipping LLM client" in m and OR_FB in m for m in warnings)
+
+
+@pytest.mark.parametrize("err, expected", [
+    ({"code": 429}, 429), ({"code": "503"}, 503), ({"code": " 400 "}, 400),
+    ({"code": "model_not_found"}, None), ({"code": True}, None), ({"code": 4.0e2}, None),
+    ({}, None), ("text", None), (None, None),
+])
+def test_error_object_code(err, expected):
+    assert llm_client.error_object_code(err) == expected
+
+
 # --- response_format rejected ------------------------------------------------------
 
 

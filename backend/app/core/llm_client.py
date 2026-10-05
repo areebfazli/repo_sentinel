@@ -22,12 +22,17 @@ bad-output failure (malformed/empty response, null content, output cut at
 max_tokens, unparseable JSON, no object passing ``validate``) or a non-retriable
 HTTP error (e.g. 404 for a retired model, 401) skips straight to the next client.
 When every client fails, ``LLMError.bad_output`` says whether it was only bad
-output (callers report "bad_output") or not ("llm_error"): see ``_all_bad_output``.
+output (callers report "bad_output") or not ("llm_error"), keyed on how each
+client ENDED (``LLMError.client_outcomes``): a 429 that was retried and then
+answered unusably ends that client as bad output. See ``_all_bad_output``.
 HTTP 402 (insufficient credits) is account-wide: no retry, and the provider's
 remaining models are skipped too.
 
 OpenRouter quirks handled here: an error object inside an HTTP 200 body
-(`{"error": {...}}`), and free models that reject `response_format` (HTTP 400 ->
+(`{"error": {...}}`; its integer or numeric-string `code` is handled like an
+HTTP status of that code: 429 / 5xx transient, 402 account-wide, other 4xx a
+non-retriable error; an error object without such a code is bad output), and
+free models that reject `response_format` (HTTP 400 ->
 one retry without it, remembered for the client's lifetime). All providers'
 content goes through a tolerant JSON extractor (```json fences, <think> blocks
 or reasoning text before the object; the LAST complete top-level object wins,
@@ -129,19 +134,32 @@ class LLMError(Exception):
     """
 
     def __init__(self, message: str, provider_wide: bool = False,
-                 deadline_exceeded: bool = False, bad_output: bool = False):
+                 deadline_exceeded: bool = False, bad_output: bool = False,
+                 client_outcomes: list[tuple[str, str]] | None = None):
         super().__init__(message)
         self.provider_wide = provider_wide
         # Some client was skipped because its rate budget would outlast the
         # caller's deadline (the scan's LLM time budget), not because it failed.
         self.deadline_exceeded = deadline_exceeded
-        # Every client that was called answered, but unusably: no object of the
-        # reply passed the caller's format check (``LLMRouter.generate``'s
-        # ``validate``), not JSON, cut off at max_tokens, null content or a
-        # malformed HTTP 200. Callers report the call as "bad_output" rather
-        # than "llm_error"; any transient / HTTP failure among them leaves it
-        # False (``_all_bad_output``).
+        # Every client that was called ENDED answering unusably: no object of
+        # the reply passed the caller's format check (``LLMRouter.generate``'s
+        # ``validate``), not JSON, cut off at max_tokens, null content, or a
+        # malformed HTTP 200 (incl. an error object without a usable code).
+        # Callers report the call as "bad_output" rather than "llm_error". A
+        # 429 / 5xx that was retried and then answered unusably still counts
+        # as bad output (only each client's final outcome matters); a client
+        # that ended on a transient / HTTP failure leaves it False
+        # (``_all_bad_output``).
         self.bad_output = bad_output
+        # Set by ``LLMRouter.generate`` when every client failed: one
+        # (client label, final outcome) per client that was called (or skipped
+        # for its rate budget), in chain order. Outcomes: "bad_output" (it
+        # answered, unusably), "rate_limit" (its last attempt got a 429 -
+        # HTTP or in an HTTP 200 body - or, after one, it was skipped for its
+        # rate budget), "failed" (anything else: 5xx, timeout, transport,
+        # non-retriable HTTP error, rate budget). Clients never called are
+        # absent. None on an LLMError not raised by the router as a whole.
+        self.client_outcomes = client_outcomes
 
 
 class _Retriable(Exception):
@@ -151,12 +169,16 @@ class _Retriable(Exception):
     HTTP layer) from a bad-output failure (malformed shape / null content on a 200)
     which goes straight to the next provider. `retry_after`, when the provider sent
     one (429/5xx only), overrides the exponential backoff for this attempt.
+    `status` is the HTTP status (or in-body error code) of a transient failure,
+    so the router can tell a client that ended on a 429 (rate limit) apart.
     """
 
-    def __init__(self, message: str, transient: bool = True, retry_after: float | None = None):
+    def __init__(self, message: str, transient: bool = True, retry_after: float | None = None,
+                 status: int | None = None):
         super().__init__(message)
         self.transient = transient
         self.retry_after = retry_after
+        self.status = status
 
 
 def _retry_after_seconds(resp: httpx.Response) -> float | None:
@@ -184,8 +206,27 @@ def _key_configured(api_key: str | None) -> bool:
 _MODEL_GONE_CODES = ("model_not_found", "model_decommissioned")
 
 
-def _model_gone(resp: httpx.Response) -> bool:
-    return resp.status_code == 404 or any(code in resp.text for code in _MODEL_GONE_CODES)
+def _model_gone(status: int, text: str) -> bool:
+    """HTTP status (or in-body error code) ``status`` with body ``text``: is the
+    model id itself gone?"""
+    return status == 404 or any(code in text for code in _MODEL_GONE_CODES)
+
+
+def error_object_code(err) -> int | None:
+    """The status-like code of an OpenAI-style error object (``{"code": 429,
+    "message": ...}``, as OpenRouter puts inside an HTTP 200 body): an int, or
+    a numeric string such as "429". None when there is none usable: ``err`` not
+    a dict, no code, a bool, or a non-numeric code (e.g. "model_not_found")."""
+    if not isinstance(err, dict):
+        return None
+    code = err.get("code")
+    if isinstance(code, bool):
+        return None
+    if isinstance(code, int):
+        return code
+    if isinstance(code, str) and re.fullmatch(r"[0-9]+", code.strip()):
+        return int(code.strip())
+    return None
 
 
 def _error_message(resp: httpx.Response) -> str:
@@ -477,6 +518,40 @@ class LLMClient:
                 json=body,
             )
 
+    def _raise_http_error(self, status: int, what: str, detail: str, log_detail: str,
+                          gone_text: str | None = None):
+        """Raise the non-transient failure of a request that failed with HTTP
+        status ``status`` (not 429 / 5xx), or of an error object with that code
+        in an HTTP 200 body: ``what`` names it ("HTTP 404", "error in HTTP 200
+        body (code 404)"), ``detail`` goes in the error, ``log_detail`` in the
+        402 log line, ``gone_text`` (default ``detail``) is searched for a
+        model-gone code. 402 -> provider-wide LLMError; anything else -> a
+        plain LLMError (the router's "failed" outcome, next client), with a
+        WARNING when the model id itself is gone."""
+        if status == 402:
+            # Account-level (insufficient credits): retrying, or trying another
+            # model on the same account, can't help.
+            logger.warning(
+                "LLM provider '{}' returned {} (insufficient credits) for "
+                "model '{}'; not retrying, skipping this provider's remaining "
+                "models: {}",
+                self.provider, what, self.model, log_detail[:200],
+            )
+            raise LLMError(
+                f"{self.label} {what} (insufficient credits): {detail[:200]}",
+                provider_wide=True,
+            )
+        if _model_gone(status, detail if gone_text is None else gone_text):
+            # Non-retriable, falls through to the next client like any other
+            # 4xx — but a retired/renamed model id must be obvious in the logs.
+            logger.warning(
+                "LLM model '{}' on provider '{}' not found or decommissioned "
+                "({}); update the model setting. Falling through to the next "
+                "client.",
+                self.model, self.provider, what,
+            )
+        raise LLMError(f"{self.label} {what}: {detail[:200]}")
+
     async def complete(self, system: str, user: str, max_tokens: int | None = None) -> str:
         """Return the raw assistant message content (expected to be JSON).
         ``max_tokens`` defaults to settings.LLM_MAX_OUTPUT_TOKENS."""
@@ -494,46 +569,33 @@ class LLMClient:
             self.use_response_format = False
             resp = await self._post(system, user, max_tokens)
         if resp.status_code != 200:
-            if resp.status_code == 402:
-                # Account-level (insufficient credits): retrying, or trying another
-                # model on the same account, can't help.
-                logger.warning(
-                    "LLM provider '{}' returned HTTP 402 (insufficient credits) for "
-                    "model '{}'; not retrying, skipping this provider's remaining "
-                    "models: {}",
-                    self.provider, self.model, _error_message(resp)[:200],
-                )
-                raise LLMError(
-                    f"{self.label} HTTP 402 (insufficient credits): {resp.text[:200]}",
-                    provider_wide=True,
-                )
             if resp.status_code == 429 or resp.status_code >= 500:
                 raise _Retriable(
                     f"{self.label} HTTP {resp.status_code}",
                     retry_after=_retry_after_seconds(resp),
+                    status=resp.status_code,
                 )
-            if _model_gone(resp):
-                # Non-retriable, falls through to the next client like any other
-                # 4xx — but a retired/renamed model id must be obvious in the logs.
-                logger.warning(
-                    "LLM model '{}' on provider '{}' not found or decommissioned "
-                    "(HTTP {}); update the model setting. Falling through to the next "
-                    "client.",
-                    self.model, self.provider, resp.status_code,
-                )
-            raise LLMError(f"{self.label} HTTP {resp.status_code}: {resp.text[:200]}")
+            self._raise_http_error(resp.status_code, f"HTTP {resp.status_code}",
+                                   resp.text, _error_message(resp))
         data = resp.json()
         # OpenRouter can report an (often upstream) error inside an HTTP 200 body.
-        # Upstream 429/5xx codes are transient (same-client retry); anything else is
-        # bad-output (straight to the next client). Never a crash.
+        # Its code is handled like an HTTP status of that code: 429 / 5xx are
+        # transient (same-client retry), 402 is account-wide and other 4xx are
+        # non-retriable errors (next client), exactly as the HTTP path above. An
+        # error object without a usable code (missing, non-numeric, outside
+        # 400-599) says nothing about retrying: bad output (next client, no
+        # same-client retry). Never a crash.
         err = data.get("error") if isinstance(data, dict) else None
         if err:
-            code = err.get("code") if isinstance(err, dict) else None
-            message = err.get("message", err) if isinstance(err, dict) else err
-            raise _Retriable(
-                f"{self.label} error in HTTP 200 body (code {code}): {str(message)[:200]}",
-                transient=isinstance(code, int) and (code == 429 or code >= 500),
-            )
+            code = error_object_code(err)
+            message = str(err.get("message", err) if isinstance(err, dict) else err)
+            raw_code = err.get("code") if isinstance(err, dict) else None
+            what = f"error in HTTP 200 body (code {raw_code})"
+            if code is not None and (code == 429 or code >= 500):
+                raise _Retriable(f"{self.label} {what}: {message[:200]}", status=code)
+            if code is not None and 400 <= code < 500:
+                self._raise_http_error(code, what, message, message, gone_text=resp.text)
+            raise _Retriable(f"{self.label} {what}: {message[:200]}", transient=False)
         # Malformed 200s (null content, empty choices) are bad-output, not transient —
         # try the fallback rather than crashing the whole scan, but no point retrying
         # the same provider for the same bad shape.
@@ -717,11 +779,12 @@ class LLMRouter:
         audit / verifier schema checks. The answer is the last JSON object of
         the reply that passes it (``extract_json``); a reply with none is a
         bad-output failure of that client (WARNING with the problem), and the
-        next client is tried. If every client fails, the LLMError has
-        ``bad_output`` set when all of them that were called failed with bad
-        output (this, a cut-off / null / malformed reply, non-JSON) and none
-        with a 429 / 5xx / timeout / HTTP error (``_all_bad_output``). Mock
-        mode returns its canned answer unchecked.
+        next client is tried. If every client fails, the LLMError carries how
+        each client ended (``client_outcomes``) and has ``bad_output`` set when
+        every client that was called ended with bad output (this, a cut-off /
+        null / malformed reply, non-JSON) - a 429 / 5xx retried before that
+        doesn't count - and none ended on a 429 / 5xx / timeout / HTTP error
+        (``_all_bad_output``). Mock mode returns its canned answer unchecked.
 
         Every attempt first takes its estimated tokens (prompt + an output
         allowance) from the client's per-minute budget (``self.pacer``), waiting
@@ -739,11 +802,14 @@ class LLMRouter:
         tokens = prompt_tokens + settings.LLM_OUTPUT_TOKENS_ESTIMATE
         last_error: Exception | None = None
         deadline_hit = False
-        # How each client ended: "bad_output" (it answered, unusably), "failed"
-        # (429 / 5xx / timeout / transport / HTTP error / rate budget), or
-        # nothing for one never called (provider dead after a 402, prompt too
-        # large for its tokens/min limit). See ``_all_bad_output``.
-        outcomes: list[str] = []
+        # How each client ENDED, (label, outcome): "bad_output" (it answered,
+        # unusably), "rate_limit" (its last attempt got a 429, or it was skipped
+        # for its rate budget after one), "failed" (5xx / timeout / transport /
+        # HTTP error / rate budget), or no entry for one never called (provider
+        # dead after a 402, prompt too large for its tokens/min limit). Only
+        # the final outcome counts: a retried 429 followed by bad output is
+        # "bad_output". See ``_all_bad_output`` / ``LLMError.client_outcomes``.
+        outcomes: list[tuple[str, str]] = []
         dead_providers: set[str] = set()  # account-level failure (HTTP 402)
         for client in self.clients:
             if client.provider in dead_providers:
@@ -766,6 +832,7 @@ class LLMRouter:
             # attempt 0 is the first try; attempts 1..LLM_RETRIES are same-client
             # retries of a transient failure. LLM_RETRIES=0 -> exactly today's
             # behavior (one try, immediate fallthrough on any failure).
+            rate_limited = False  # this client's latest attempt got a 429
             for attempt in range(settings.LLM_RETRIES + 1):
                 slot = await self.pacer.acquire(
                     client.label, client.provider, tokens,
@@ -778,7 +845,8 @@ class LLMRouter:
                            f"needs a wait over LLM_MAX_WAIT_S={settings.LLM_MAX_WAIT_S:g}s")
                     logger.warning("Skipping LLM client {}: rate budget {}.", client.label, why)
                     last_error = last_error or LLMError(f"{client.label}: rate budget {why}")
-                    outcomes.append("failed")
+                    # Its retry after a 429 can't be waited for: it ended rate-limited.
+                    outcomes.append((client.label, "rate_limit" if rate_limited else "failed"))
                     break
                 try:
                     content = await client.complete(system, user, max_tokens=max_tokens)
@@ -791,12 +859,13 @@ class LLMRouter:
                                    client.label, exc.problem)
                     last_error = LLMError(f"{client.label} returned an unusable answer: "
                                           f"{exc.problem}")
-                    outcomes.append("bad_output")
+                    outcomes.append((client.label, "bad_output"))
                     break
                 except (_Retriable, httpx.TimeoutException, httpx.TransportError) as exc:
                     last_error = exc
                     transient = getattr(exc, "transient", True)
                     retry_after = getattr(exc, "retry_after", None)
+                    rate_limited = getattr(exc, "status", None) == 429
                     if retry_after is not None:
                         # Honoured for every later call to this model too.
                         self.pacer.block(client.label, retry_after)
@@ -811,38 +880,47 @@ class LLMRouter:
                         continue  # the next acquire() waits out the block
                     logger.warning("LLM client {} failed (retriable): {}", client.label, exc)
                     # A non-transient _Retriable is a bad answer in an HTTP 200
-                    # (cut off at max_tokens, null content, malformed body, a
-                    # non-429/5xx error object); the rest are transport failures.
-                    outcomes.append("failed" if transient else "bad_output")
+                    # (cut off at max_tokens, null content, malformed body, an
+                    # error object without a usable code); a transient one is
+                    # a 429 (rate_limit) or a 5xx / timeout / transport failure.
+                    # This is the client's final outcome, whatever came before.
+                    outcomes.append((client.label,
+                                     "bad_output" if not transient
+                                     else "rate_limit" if rate_limited else "failed"))
                     break
                 except json.JSONDecodeError as exc:
                     logger.warning("LLM client {} returned non-JSON: {}", client.label, exc)
                     last_error = exc
-                    outcomes.append("bad_output")
+                    outcomes.append((client.label, "bad_output"))
                     break
                 except LLMError as exc:
-                    # Non-retriable (e.g. 4xx auth, 404 retired model) — no same-client
-                    # retry, but still try the next client in the chain.
+                    # Non-retriable (e.g. 4xx auth, 404 retired model, also as an
+                    # error code in an HTTP 200 body) — no same-client retry, but
+                    # still try the next client in the chain.
                     logger.warning("LLM client {} error: {}", client.label, exc)
                     last_error = exc
-                    outcomes.append("failed")
+                    outcomes.append((client.label, "failed"))
                     if exc.provider_wide:
                         dead_providers.add(client.provider)
                     break
         raise LLMError(
             f"All LLM clients failed ({', '.join(c.label for c in self.clients)}): {last_error}",
             deadline_exceeded=deadline_hit, bad_output=_all_bad_output(outcomes),
+            client_outcomes=outcomes,
         )
 
 
-def _all_bad_output(outcomes: list[str]) -> bool:
-    """``LLMError.bad_output`` of a call where every client failed: at least
-    one client answered, and every client that was called (or skipped for its
-    rate budget) failed by answering unusably - no 429 / 5xx / timeout /
-    transport or HTTP error, which a later retry might not hit. Clients never
-    called (provider dead after a 402, prompt too large for the client's
-    tokens/min limit) count neither way."""
-    return bool(outcomes) and all(o == "bad_output" for o in outcomes)
+def _all_bad_output(outcomes: list[tuple[str, str]]) -> bool:
+    """``LLMError.bad_output`` of a call where every client failed, from each
+    client's FINAL outcome ((label, outcome) pairs): at least one client
+    answered, and every client that was called (or skipped for its rate
+    budget) ended by answering unusably - none ended on a 429 / 5xx / timeout
+    / transport or HTTP error, which a later retry might not hit. A 429 / 5xx
+    that was retried on the same client and then answered unusably counts as
+    bad output (the eval's ``classify_llm_error`` follows the same rule).
+    Clients never called (provider dead after a 402, prompt too large for the
+    client's tokens/min limit) count neither way."""
+    return bool(outcomes) and all(o == "bad_output" for _, o in outcomes)
 
 
 def _object_check(validate):

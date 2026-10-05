@@ -16,7 +16,13 @@ from pathlib import Path
 import httpx
 
 from backend.app.config import settings
-from backend.app.core.llm_client import PROVIDERS, LLMClient, LLMRouter, TokenPacer
+from backend.app.core.llm_client import (
+    PROVIDERS,
+    LLMClient,
+    LLMRouter,
+    TokenPacer,
+    error_object_code,
+)
 
 # Precision is reported at these vulnerable base rates.
 BASE_RATES = (0.01, 0.02, 0.05)
@@ -246,10 +252,13 @@ def _http_event(resp: httpx.Response) -> dict:
             if isinstance(data.get("model"), str):
                 event["response_model"] = data["model"]
             # OpenRouter can put an error (incl. an upstream 429) in a 200 body.
+            # Its code is read as the router reads it (``error_object_code``:
+            # an int or a numeric string, e.g. "429" -> 429; else the raw value).
             err = data.get("error")
             if isinstance(err, dict):
-                event["error_code"] = err.get("code")
-                if err.get("code") == 429:
+                code = error_object_code(err)
+                event["error_code"] = code if code is not None else err.get("code")
+                if code == 429:
                     message = str(err.get("message", ""))
                     event["daily_limit"] = any(m in message for m in DAILY_LIMIT_MARKERS)
         except (ValueError, AttributeError):
@@ -324,21 +333,36 @@ def _usage_totals(events: list[dict]) -> dict | None:
 
 def classify_llm_error(exc: BaseException, events: list[dict]) -> str:
     """'daily_limit' | 'rate_limit' | 'bad_output' | 'other' for a failed
-    router.generate ('bad_output': ``LLMError.bad_output``, every model called
-    answered unusably - failed the caller's format check, not JSON, cut off,
-    null content or a malformed 200; a 429 among the failures is
-    'rate_limit' first)."""
+    router.generate, keyed on how each client ENDED (the router's rule):
+
+    1. 'daily_limit' when any HTTP event of the call hit a daily quota (or the
+       error text names one), whatever happened after: the quota is spent for
+       the rest of the run, so the run stops.
+    2. 'bad_output' when ``LLMError.bad_output``: every client called ended
+       answering unusably (failed the caller's format check, not JSON, cut off,
+       null content, a malformed 200) - even if one got a 429 first and its
+       retry then answered unusably.
+    3. 'rate_limit' when some client's final outcome was a 429
+       (``LLMError.client_outcomes``: its last attempt got one, or it was then
+       skipped for its rate budget). A 429 that was retried and followed by
+       anything else doesn't count. An error without ``client_outcomes`` (not
+       raised by ``LLMRouter.generate`` itself, e.g. a test stub) falls back
+       to: any 429 among the events, or "HTTP 429" in its text.
+    4. 'other' otherwise."""
     text = str(exc)
     if any(e.get("daily_limit") for e in events) or any(m in text for m in DAILY_LIMIT_MARKERS):
         return "daily_limit"
-    if (
-        any(e.get("status") == 429 or e.get("error_code") == 429 for e in events)
-        or "HTTP 429" in text
-    ):
-        return "rate_limit"
     if getattr(exc, "bad_output", False):
         return "bad_output"
-    return "other"
+    outcomes = getattr(exc, "client_outcomes", None)
+    if outcomes is not None:
+        rate_limited = any(outcome == "rate_limit" for _, outcome in outcomes)
+    else:
+        rate_limited = (
+            any(e.get("status") == 429 or e.get("error_code") == 429 for e in events)
+            or "HTTP 429" in text
+        )
+    return "rate_limit" if rate_limited else "other"
 
 
 def llm_model_key(router) -> str:

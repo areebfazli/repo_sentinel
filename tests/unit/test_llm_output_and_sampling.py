@@ -272,7 +272,12 @@ BAD_200 = {
     "length_cut": lambda: _choice('{"findings": [{"title": "cut', "length", 16000),
     "null_content": lambda: _choice(None, "length", 16000),
     "no_choices": lambda: _FakeResp(200, {"choices": []}),
-    "error_in_200": lambda: _FakeResp(200, {"error": {"code": 400, "message": "bad"}}),
+    # An error object without a usable code (missing / non-numeric): bad output.
+    # One WITH a status-like code is handled like that HTTP status instead
+    # (test_llm_openrouter.py: in-body 400 / 402 / 429 / 503).
+    "error_in_200": lambda: _FakeResp(200, {"error": {"message": "bad"}}),
+    "error_in_200_text_code": lambda: _FakeResp(
+        200, {"error": {"code": "provider_error", "message": "bad"}}),
     "not_json": lambda: _ok("I think the code is fine."),
     "fails_validator": lambda: _ok('{"note": "no findings list"}'),
 }
@@ -323,6 +328,149 @@ def test_a_client_never_called_does_not_hide_bad_output(monkeypatch):
     with pytest.raises(LLMError) as info:
         asyncio.run(LLMRouter().generate("s", "x" * 8000, validate=_findings_list))
     assert script.order == [PRIMARY] and info.value.bad_output is True
+
+
+# --- failure labels: each client's FINAL outcome (router and eval agree) ---------------
+
+PRIMARY_LABEL = f"openrouter:{OR_PRIMARY}"
+GEMINI_LABEL = f"gemini:{GEMINI[1]}"
+
+
+def _events(*responses):
+    """The eval's HTTP events (``HttpUsageTap``) for these scripted responses."""
+    from ml.evaluation.llm_eval_common import _http_event
+
+    return [_http_event(r) for r in responses]
+
+
+def _generate_error(script, monkeypatch):
+    _patch_script(monkeypatch, script)
+    with pytest.raises(LLMError) as info:
+        asyncio.run(LLMRouter().generate("s", "u", validate=_findings_list))
+    return info.value
+
+
+@pytest.mark.parametrize("first", [
+    _FakeResp(429, text="slow down"),
+    _FakeResp(200, {"error": {"code": 429, "message": "upstream rate-limited"}}),
+])
+@pytest.mark.parametrize("bad", ["length_cut", "null_content", "fails_validator"])
+def test_429_then_bad_output_on_the_retry_is_bad_output(monkeypatch, first, bad):
+    from ml.evaluation.llm_eval_common import classify_llm_error
+
+    _pin_openrouter(monkeypatch, retries=1, fallback_provider=None)
+    _patch_sleep(monkeypatch)
+    script = _Script()
+    responses = [first, BAD_200[bad]()]
+    script.set(PRIMARY, list(responses))
+    err = _generate_error(script, monkeypatch)
+    assert script.order == [PRIMARY, PRIMARY]  # the 429 was retried
+    assert err.client_outcomes == [(PRIMARY_LABEL, "bad_output")]
+    assert err.bad_output is True
+    # The eval keys on the final outcome too: the earlier 429 doesn't make it
+    # a rate limit.
+    assert classify_llm_error(err, _events(*responses)) == "bad_output"
+
+
+def test_429_then_bad_output_with_a_client_ending_on_a_5xx_is_other(monkeypatch):
+    from ml.evaluation.llm_eval_common import classify_llm_error
+
+    _pin_openrouter(monkeypatch, retries=1)  # fallback: gemini
+    _patch_sleep(monkeypatch)
+    script = _Script()
+    primary = [_FakeResp(429, text="slow down"), BAD_200["length_cut"]()]
+    gemini = [_FakeResp(500, text="boom"), _FakeResp(503, text="boom")]
+    script.set(PRIMARY, list(primary))
+    script.set(GEMINI, list(gemini))
+    err = _generate_error(script, monkeypatch)
+    assert err.client_outcomes == [(PRIMARY_LABEL, "bad_output"), (GEMINI_LABEL, "failed")]
+    assert err.bad_output is False
+    assert classify_llm_error(err, _events(*primary, *gemini)) == "other"
+
+
+@pytest.mark.parametrize("bad_first", [True, False])
+def test_a_client_ending_on_a_429_is_rate_limit(monkeypatch, bad_first):
+    from ml.evaluation.llm_eval_common import classify_llm_error
+
+    _pin_openrouter(monkeypatch, retries=1)  # fallback: gemini
+    _patch_sleep(monkeypatch)
+    script = _Script()
+    limited = [_FakeResp(429, text="slow down"), _FakeResp(429, text="slow down")]
+    bad = [BAD_200["not_json"]()]
+    script.set(PRIMARY, list(bad if bad_first else limited))
+    script.set(GEMINI, list(limited if bad_first else bad))
+    err = _generate_error(script, monkeypatch)
+    outcomes = dict(err.client_outcomes)
+    assert outcomes[PRIMARY_LABEL if bad_first else GEMINI_LABEL] == "bad_output"
+    assert outcomes[GEMINI_LABEL if bad_first else PRIMARY_LABEL] == "rate_limit"
+    assert err.bad_output is False
+    events = _events(*bad, *limited) if bad_first else _events(*limited, *bad)
+    assert classify_llm_error(err, events) == "rate_limit"
+
+
+def test_a_429_whose_retry_is_skipped_for_the_rate_budget_is_rate_limit(monkeypatch):
+    from ml.evaluation.llm_eval_common import classify_llm_error
+
+    _pin_openrouter(monkeypatch, retries=2, fallback_provider=None)
+    monkeypatch.setattr(settings, "LLM_MAX_WAIT_S", 5.0)
+    _patch_sleep(monkeypatch)
+    script = _Script()
+    limited = _FakeResp(429, text="slow down", headers={"Retry-After": "120"})
+    script.set(PRIMARY, [limited])
+    err = _generate_error(script, monkeypatch)
+    assert script.order == [PRIMARY]  # the retry needs a wait over LLM_MAX_WAIT_S
+    assert err.client_outcomes == [(PRIMARY_LABEL, "rate_limit")]
+    assert classify_llm_error(err, _events(limited)) == "rate_limit"
+
+
+def test_a_5xx_final_outcome_is_not_rate_limit_even_after_a_429(monkeypatch):
+    from ml.evaluation.llm_eval_common import classify_llm_error
+
+    _pin_openrouter(monkeypatch, retries=1, fallback_provider=None)
+    _patch_sleep(monkeypatch)
+    script = _Script()
+    responses = [_FakeResp(429, text="slow down"), _FakeResp(503, text="busy")]
+    script.set(PRIMARY, list(responses))
+    err = _generate_error(script, monkeypatch)
+    assert err.client_outcomes == [(PRIMARY_LABEL, "failed")]
+    assert classify_llm_error(err, _events(*responses)) == "other"
+
+
+@pytest.mark.parametrize("daily", [
+    _FakeResp(429, text="Rate limit reached on tokens per day (TPD)"),
+    _FakeResp(200, {"error": {"code": 429, "message": "Rate limit exceeded: free-models-per-day"}}),
+])
+def test_a_daily_limit_event_is_daily_limit_whatever_follows(monkeypatch, daily):
+    from ml.evaluation.llm_eval_common import classify_llm_error
+
+    # The daily 429 is retried and then answered unusably: the router says
+    # bad_output, but the quota is spent, so the eval still stops the run.
+    _pin_openrouter(monkeypatch, retries=1, fallback_provider=None)
+    _patch_sleep(monkeypatch)
+    script = _Script()
+    responses = [daily, BAD_200["length_cut"]()]
+    script.set(PRIMARY, list(responses))
+    err = _generate_error(script, monkeypatch)
+    assert err.bad_output is True
+    assert classify_llm_error(err, _events(*responses)) == "daily_limit"
+    # Whatever the router recorded after it.
+    for outcomes in ([(PRIMARY_LABEL, "failed")], [(PRIMARY_LABEL, "rate_limit")], []):
+        later = LLMError("x", client_outcomes=outcomes)
+        assert classify_llm_error(later, _events(daily, _ok(OK_JSON))) == "daily_limit"
+
+
+def test_classify_without_router_outcomes_falls_back_to_the_events():
+    from ml.evaluation.llm_eval_common import classify_llm_error
+
+    limited = _events(_FakeResp(429, text="slow down"))
+    assert classify_llm_error(LLMError("x"), limited) == "rate_limit"
+    assert classify_llm_error(LLMError("stub: HTTP 429"), []) == "rate_limit"
+    # bad_output means every client ended unusably: no client ended on that 429.
+    assert classify_llm_error(LLMError("x", bad_output=True), limited) == "bad_output"
+    assert classify_llm_error(LLMError("x"), []) == "other"
+    # With the router's outcomes, the events' 429 alone doesn't decide it.
+    assert classify_llm_error(
+        LLMError("x", client_outcomes=[(PRIMARY_LABEL, "failed")]), limited) == "other"
 
 
 # --- max_tokens and truncated output ---------------------------------------------------

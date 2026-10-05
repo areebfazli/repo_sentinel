@@ -400,6 +400,22 @@ def test_http_tap_recognizes_openrouter_daily_cap():
         assert run_eval.classify_llm_error(LLMError("HTTP 429"), [minute, event]) == "daily_limit"
 
 
+def test_http_event_reads_in_body_error_codes_as_the_router_does():
+    from ml.evaluation.llm_eval_common import _http_event
+
+    def event(err):
+        return _http_event(httpx.Response(200, json={"error": err}))
+
+    # A numeric-string code is that code (router: llm_client.error_object_code).
+    day = event({"code": "429", "message": "Rate limit exceeded: free-models-per-day"})
+    assert day["error_code"] == 429 and day["daily_limit"]
+    assert event({"code": "400", "message": "bad"})["error_code"] == 400
+    # No usable code: the raw value is kept, and it is never a daily limit.
+    word = event({"code": "provider_error", "message": "free-models-per-day"})
+    assert word["error_code"] == "provider_error" and not word["daily_limit"]
+    assert event({"message": "boom"})["error_code"] is None
+
+
 def test_openrouter_daily_cap_stops_the_stage():
     def respond(user):
         raise LLMError("Rate limit exceeded: free-models-per-day")

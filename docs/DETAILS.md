@@ -472,11 +472,20 @@ JSON object in the reply that passes it (`extract_json`: a trailing example / no
 or an unclosed brace / quote in reasoning prose no longer hides the answer; nothing nested in
 a cut-off object is ever returned); a reply with none is a bad-output failure of that client
 and the next model / provider in the chain answers instead, as are output cut at
-`max_tokens`, null content and a malformed HTTP 200. If every client that was called fails
-that way (no 429 / 5xx / timeout / HTTP error among them; clients skipped because the prompt
-doesn't fit their tokens/min limit don't count) the `LLMError` has `bad_output` set and the
+`max_tokens`, null content and a malformed HTTP 200. If every client that was called ENDS
+that way (none ends on a 429 / 5xx / timeout / HTTP error; a 429 retried on the same client
+before it answered unusably doesn't count; clients skipped because the prompt doesn't fit
+their tokens/min limit don't count) the `LLMError` has `bad_output` set and the
 units are `not_reviewed` (reason `bad_output`) or the candidate `unverified`, never
-"reviewed, no findings"; any other failure mix is `llm_error`. The checks also run after the call
+"reviewed, no findings"; any other failure mix is `llm_error`. Each client's final outcome is
+in `LLMError.client_outcomes` (`bad_output` / `rate_limit` / `failed`), and the eval's
+`classify_llm_error` uses the same rule: `bad_output` as above, `rate_limit` only if some
+client's last attempt was a 429 (or its retry after one was skipped for the rate budget),
+else `other`; a daily-limit 429 anywhere in the call is always `daily_limit` and stops the
+run. An `{"error": {...}}` object inside an HTTP 200 is handled like the HTTP status of its
+integer or numeric-string `code` (429 / 5xx a same-client retry, 402 skips the provider, any
+other 4xx a non-retriable error, i.e. `llm_error`); one without a usable code is bad output.
+The checks also run after the call
 (defence in depth). `review_pr(files, router, ...)` runs the whole stage
 on plain `{path, old_content, new_content, patch}` dicts without the API or DB (the eval's
 entry point).
@@ -604,7 +613,7 @@ tests/            pytest suite (unit + integration; slow eval regression)
   free models share an upstream pool and often 429 (`upstream_provider_shared_pool`), so set
   `GROQ_API_KEY` too; a retired model id (HTTP 404) is logged as a "not found or decommissioned"
   warning naming the model and falls through to the next one. For OpenRouter an error object
-  inside an HTTP 200 is treated as a failed call (not a crash), and replies wrapped in
+  inside an HTTP 200 is treated like the HTTP status of its code (not a crash), and replies wrapped in
   ```` ```json ```` fences or preceded by reasoning text are still parsed. An answer that
   fails the call's format check (e.g. a bare finding instead of `{"findings": [...]}`) falls
   through to the next model too.

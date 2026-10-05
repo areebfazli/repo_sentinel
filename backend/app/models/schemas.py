@@ -129,13 +129,14 @@ class ReportFinding(BaseModel):
 class ReviewSuggestion(BaseModel):
     """A non-blocking "worth a look" item of the PR-level review: a candidate
     the verifier did not confirm (verdict "uncertain", or "confirmed" below
-    PR_REVIEW_MIN_CONFIDENCE) at a spot where the change removed an existing
-    security control, shown by deterministic evidence: ``evidence`` lists
+    PR_REVIEW_MIN_CONFIDENCE) at a spot where the change deleted code that
+    looks like a security control, by deterministic checks: ``evidence`` lists
     "verifier_quote" (the verifier's quote of the control, found in the old
     file only on deleted, non-comment lines that guard_diff classifies as a
-    control, and in no new file) and / or "guard_diff" (a
-    guard_removed change in the unit). Never a finding: not in
-    ``report_findings``, ``is_vulnerable`` or any gate. Text fields are plain
+    control, and in no new file) and / or "guard_diff" (a removed / weakened
+    change of a guard_removed unit within GUARD_EVIDENCE_WINDOW lines, not
+    found in new code, not already a guard alert finding). Never a finding:
+    not in ``report_findings``, ``is_vulnerable`` or any gate. Text fields are plain
     text (LLM-written or PR code): escape them when rendering."""
 
     file_path: str

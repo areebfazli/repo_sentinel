@@ -231,6 +231,36 @@ def old_line_for(patch: str | None, new_line: int) -> int:
         return new_line
 
 
+def new_line_for(patch: str | None, old_line: int) -> int:
+    """New-file line of old-file ``old_line`` (``old_line`` itself without a
+    patch): a kept line's own new number; a deleted line maps to the deletion
+    point, the new-file line that follows it (as ``patch_touched_lines``)."""
+    if not patch:
+        return old_line
+    try:
+        hunks = _parse_hunks(patch)
+    except Exception:
+        return old_line
+    delta = 0
+    for a, b, c, d, lines in hunks:
+        old = a if b > 0 else a + 1
+        new = c if d > 0 else c + 1
+        if old > old_line:
+            break
+        for line in lines:
+            tag = line[0]
+            if tag == "+":
+                new += 1
+                continue
+            if old == old_line:
+                return new
+            old += 1
+            if tag != "-":
+                new += 1
+        delta = new - old
+    return old_line + delta
+
+
 def render_diff(rows: list[tuple[int | None, str]], max_rows: int | None = None) -> str:
     """Numbered diff text: ``"   12| +code"`` (new-file line numbers; blank
     for removed lines and hunk headers). ``max_rows`` clips, with a marker."""

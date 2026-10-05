@@ -228,3 +228,16 @@ def test_deleted_old_lines_and_old_line_mapping():
     assert deleted_old_lines(patch) == {2, 4}
     assert old_line_for(patch, 2) == 3 and old_line_for(patch, 4) == 5
     assert deleted_old_lines(None) == set() and old_line_for(None, 7) == 7
+
+
+def test_new_line_mapping_of_kept_and_deleted_lines():
+    from backend.app.core.pr_context import new_line_for
+
+    old = "a\nb\nc\nd\ne\nf\n"
+    new = "a\nc\nD\ne\nx\nf\n"  # b removed, d modified, x inserted
+    patch = synthesize_patch(old, new)
+    # Kept lines map to themselves; a deleted line to its deletion point.
+    assert [new_line_for(patch, n) for n in range(1, 7)] == [1, 2, 2, 3, 4, 6]
+    assert new_line_for(None, 7) == 7
+    # A deletion at the end of the file maps past the last line.
+    assert new_line_for(synthesize_patch("a\nb\n", "a\n"), 2) == 2

@@ -918,15 +918,19 @@ def test_model_default_sampling_never_replays_temperature_zero_entries(tmp_path)
 
 # --- the worth-a-look tier ------------------------------------------------------------------
 
-SQL_OLD = ("def find(db, name):\n"
-           "    return db.execute('SELECT * FROM users WHERE name = ?', (name,))\n")
-SQL_NEW = ("def find(db, name):\n"
-           "    return db.execute(f\"SELECT * FROM users WHERE name = '{name}'\")\n")
+# delete() loses its admin check right above the candidate's line: guard_diff
+# guard_removed, not an alert (a deterministic alert finding would already
+# report the change, so it is never also a worth-a-look item).
+GUARD_OLD = ("def delete(user, obj):\n"
+             "    if not user.is_admin:\n"
+             "        raise PermissionDenied\n"
+             "    obj.delete()\n")
+GUARD_NEW = "def delete(user, obj):\n    obj.delete()\n"
 
 
-def sql_intro_item(item_id="pr_S_intro"):
-    return _item(item_id, "vuln_introducing", [_file("app/db.py", SQL_OLD, SQL_NEW)],
-                 "app/db.py", vuln=[2], changed=[2], pair_base="pr_S", category="sqli")
+def guard_intro_item(item_id="pr_S_intro"):
+    return _item(item_id, "vuln_introducing", [_file("app/db.py", GUARD_OLD, GUARD_NEW)],
+                 "app/db.py", vuln=[2], changed=[2], pair_base="pr_S", category="authz")
 
 
 def test_run_records_review_suggestions_as_their_own_view():
@@ -964,14 +968,14 @@ def _old_pr_rec(item, cands):
 def test_rescore_replays_the_tier_from_guard_diff_only_at_the_runs_cutoff(capsys):
     p = "app/db.py"
     recs = [
-        _old_pr_rec(sql_intro_item(), [_cand(p, 2, "uncertain", "uncertain", 5)]),
-        _old_pr_rec(sql_intro_item("pr_T_intro"),
+        _old_pr_rec(guard_intro_item(), [_cand(p, 2, "uncertain", "uncertain", 5)]),
+        _old_pr_rec(guard_intro_item("pr_T_intro"),
                     [_cand(p, 2, "below_min_confidence", "confirmed", 7)]),
-        _old_pr_rec(sql_intro_item("pr_U_intro"), [_cand(p, 2, "rejected", "rejected", 6)]),
+        _old_pr_rec(guard_intro_item("pr_U_intro"), [_cand(p, 2, "rejected", "rejected", 6)]),
         # guard_diff sees nothing in this one (and no verifier quote in old runs)
         _old_pr_rec(intro_item(), [_cand("app/files.py", 7, "uncertain", "uncertain", 5)]),
     ]
-    items = [sql_intro_item(), sql_intro_item("pr_T_intro"), sql_intro_item("pr_U_intro"),
+    items = [guard_intro_item(), guard_intro_item("pr_T_intro"), guard_intro_item("pr_U_intro"),
              intro_item()]
     data = {"config": {"arm": "pr", "pr_review": {"min_confidence": 8}}, "items": recs}
     out = R.rescore(data, 2, items, parser=R._parser())
@@ -997,13 +1001,13 @@ def test_rescore_replays_the_tier_from_guard_diff_only_at_the_runs_cutoff(capsys
 
 
 def test_compare_replays_the_tier_view_of_a_run_recorded_before_it(tmp_path):
-    recs = [_old_pr_rec(sql_intro_item(), [_cand("app/db.py", 2, "uncertain", "uncertain", 5)])]
+    recs = [_old_pr_rec(guard_intro_item(), [_cand("app/db.py", 2, "uncertain", "uncertain", 5)])]
     run = {"config": {"arm": "pr", "model": "m", "pr_review": {"min_confidence": 8}},
            "items": recs}
     path = tmp_path / "old.json"
     path.write_text(json.dumps(run))
     ds = tmp_path / "ds.jsonl"
-    ds.write_text(json.dumps(sql_intro_item()) + "\n")
+    ds.write_text(json.dumps(guard_intro_item()) + "\n")
     args = ["--compare", str(path), str(path), "--view-a", "verified",
             "--view-b", "verified_plus_review"]
     cmp = R.main([*args, "--dataset", str(ds)])

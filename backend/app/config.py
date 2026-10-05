@@ -147,10 +147,12 @@ class Settings(BaseSettings):
     # "Worth a look" (non-blocking, never a finding or a gate): a candidate the
     # verifier left "uncertain" (or confirmed below PR_REVIEW_MIN_CONFIDENCE)
     # with at least PR_REVIEW_SUGGEST_MIN_CONFIDENCE, AND deterministic evidence
-    # that the change removed a security control at that spot (guard_diff
-    # guard_removed in its unit, or the verifier's removed_control_quote found
-    # in the old file only on deleted, non-comment lines that guard_diff
-    # classifies as a control, and in no new file). At most
+    # that the change deleted code that looks like a security control at that
+    # spot: a guard_diff removed / weakened change of a guard_removed unit
+    # within 10 lines of it, whose old code is in no new file and that no guard
+    # alert finding already reports; or the verifier's removed_control_quote
+    # found in the old file only on deleted, non-comment lines that guard_diff
+    # classifies as a control, and in no new file. At most
     # PR_REVIEW_MAX_SUGGESTIONS per scan; 0 turns the tier off.
     PR_REVIEW_MAX_SUGGESTIONS: int = 5
     PR_REVIEW_SUGGEST_MIN_CONFIDENCE: int = 4

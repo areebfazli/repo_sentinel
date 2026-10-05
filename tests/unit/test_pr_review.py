@@ -426,7 +426,10 @@ def test_a_control_moved_to_another_file_still_fails():
     result = _quote_review(_files(("app/views.py", AUTH_OLD, new),
                                   ("app/perms.py", "", helper)),
                            "if not user.is_admin:\n    raise PermissionDenied", "obj.delete()")
-    assert "verifier_quote" not in result["candidates"][0]["review_evidence"]
+    # Neither the verifier's quote nor guard_diff's removal (same text) counts.
+    assert result["review_suggestions"] == []
+    [c] = result["candidates"]
+    assert c["status"] == "uncertain" and c["review_evidence"] == []
 
 
 def test_rejected_never_qualifies_and_confirmed_below_cutoff_does():
@@ -448,18 +451,112 @@ def test_rejected_never_qualifies_and_confirmed_below_cutoff_does():
     assert len(result["report_findings"]) == 1 and result["review_suggestions"] == []
 
 
-def test_guard_diff_removal_in_the_unit_is_evidence_without_a_quote():
-    router = PRRouter(audits=[{"findings": [SQL_FINDING]}],
-                      verdict={"verdict": "uncertain", "confidence": 5, "reason": "caller?"})
-    result = _review(_files(("app/db.py", SQL_OLD, SQL_NEW)), router)
+UNCERTAIN_NO_QUOTE = {"verdict": "uncertain", "confidence": 5, "reason": "caller?"}
+
+
+def _guard_review(files, cand_quote, path="app/views.py", **overrides):
+    finding = {"file": path, "line": 1, "severity": "high", "cwe": "CWE-285",
+               "title": "Missing check", "quoted_code": cand_quote, "confidence": 8}
+    return _review(files, PRRouter(audits=[{"findings": [finding]}],
+                                   verdict=UNCERTAIN_NO_QUOTE), **overrides)
+
+
+def test_guard_diff_removal_next_to_the_candidate_is_evidence_without_a_quote():
+    new = AUTH_OLD.replace("    if not user.is_admin:\n        raise PermissionDenied\n", "")
+    result = _guard_review(_files(("app/views.py", AUTH_OLD, new)), "obj.delete()")
     _schema_ok(result)
     [sug] = result["review_suggestions"]
-    assert sug["evidence"] == ["guard_diff"]
-    assert sug["removed_control"] == "'SELECT * FROM users WHERE name = ?'"
-    assert sug["removed_control_line"] is None
-    # The guard alert itself is still the deterministic finding; the suggestion
-    # is not added to the findings.
+    assert sug["evidence"] == ["guard_diff"] and sug["line"] == 4
+    assert sug["removed_control"] == "if not user.is_admin:"
+    assert sug["removed_control_line"] == 4  # old-file line of the deleted guard
+    # Not an alert tier change: nothing deterministic in the report.
+    assert result["report_findings"] == []
+
+
+GUARD = "    if not user.is_admin:\n        raise PermissionDenied\n"
+
+
+def _far_or_near(far: bool) -> tuple[str, str]:
+    """delete() losing its admin guard; obj.delete() right after it or past
+    GUARD_EVIDENCE_WINDOW lines of filler."""
+    from backend.app.core.pr_review import GUARD_EVIDENCE_WINDOW
+
+    filler = "".join(f"    step{i} = obj.step({i})\n" for i in range(GUARD_EVIDENCE_WINDOW + 2))
+    body = filler + "    obj.delete()\n" if far else "    obj.delete()\n" + filler
+    old = "def delete(request, user, obj):\n" + GUARD + body
+    return old, old.replace(GUARD, "")
+
+
+@pytest.mark.parametrize("far", [True, False])
+def test_guard_diff_removal_must_be_near_the_candidate(far):
+    old, new = _far_or_near(far)
+    result = _guard_review(_files(("app/views.py", old, new)), "obj.delete()")
+    [c] = result["candidates"]
+    if far:
+        assert result["review_suggestions"] == []
+        assert c["status"] == "uncertain" and c["review_evidence"] == []
+    else:
+        assert c["status"] == "review_suggested" and c["review_evidence"] == ["guard_diff"]
+
+
+def _bundle_and_guard(files):
+    from backend.app.core.code_parser import CodeParser
+    from backend.app.core.evidence import guard_evidence
+    from backend.app.core.pr_context import build_pr_bundle
+
+    parser = CodeParser()
+    bundle = build_pr_bundle(files, parser)
+    return bundle, guard_evidence([f for f in bundle.files if f.new_content], bundle.units,
+                                  parser)
+
+
+def test_guard_removal_checks_explain_each_change():
+    from backend.app.core.pr_review import GUARD_EVIDENCE_WINDOW, guard_removal_checks
+
+    old, new = _far_or_near(far=True)
+    bundle, guard = _bundle_and_guard(_files(("app/views.py", old, new)))
+    cand_line = 2 + GUARD_EVIDENCE_WINDOW + 2  # obj.delete() in the new file
+
+    def guard_rows(line):
+        rows = guard_removal_checks(bundle, guard, {"file_path": "app/views.py", "line": line,
+                                                    "end_line": line})
+        return [(r["old_line"], r["new_line"], r["reason"]) for r in rows
+                if r["change"]["old_text"].startswith("if not")]
+
+    # The deleted guard (old line 2) sits at the deletion point, new line 2.
+    assert guard_rows(cand_line) == [(2, 2, "too_far")]
+    assert guard_rows(2 + GUARD_EVIDENCE_WINDOW) == [(2, 2, None)]
+
+
+def test_guard_alert_change_is_not_also_a_suggestion():
+    router = PRRouter(audits=[{"findings": [SQL_FINDING]}], verdict=UNCERTAIN_NO_QUOTE)
+    result = _review(_files(("app/db.py", SQL_OLD, SQL_NEW)), router)
+    _schema_ok(result)
+    # The deterministic alert already reports the swap: no duplicate suggestion,
+    # and the candidate keeps its verifier status.
+    assert result["review_suggestions"] == []
     assert [f["source"] for f in result["report_findings"]] == ["guard_diff"]
+    [c] = result["candidates"]
+    assert c["status"] == "uncertain" and c["review_evidence"] == []
+    s = result["pr_review"]
+    parts = ("hard_excluded", "below_audit_confidence", "confirmed", "rejected", "uncertain",
+             "below_min_confidence", "review_suggested", "unverified")
+    assert sum(s[k] for k in parts) == s["candidates"] == 1
+
+
+def test_a_removal_on_an_alert_line_is_not_also_a_suggestion():
+    from backend.app.core.evidence import guard_alert_findings
+    from backend.app.core.pr_review import guard_removal_checks
+
+    old = "def load(s):\n    data = yaml.safe_load(escape(s))\n    return data\n"
+    new = "def load(s):\n    data = yaml.load(s)\n    return data\n"
+    bundle, guard = _bundle_and_guard(_files(("app/conf.py", old, new)))
+    assert [a["line"] for a in guard_alert_findings(guard)] == [2]
+    rows = guard_removal_checks(bundle, guard, {"file_path": "app/conf.py", "line": 2,
+                                                "end_line": 2})
+    by_kind = {r["change"]["kind"]: r["reason"] for r in rows}
+    # The yaml swap is the alert itself; the escape() removal sits on its line.
+    assert by_kind == {"safe_api": "alert_reported", "sanitiser": "alert_reported"}
 
 
 def test_suggestions_can_be_turned_off_and_are_capped():

@@ -42,10 +42,13 @@ per-function in isolation. Stages:
    (or confirmed below the cutoff) with confidence >=
    ``PR_REVIEW_SUGGEST_MIN_CONFIDENCE`` becomes a ``review_suggestions`` item
    (status ``review_suggested``) only with deterministic evidence that the
-   change removed a security control there: a guard_diff ``guard_removed``
-   change in its unit, or the verifier's ``removed_control_quote`` found in
-   the OLD file near it only on deleted, non-comment lines that guard_diff
-   classifies as a control, and in no new file. At most
+   change removed a security control there: a removed / weakened guard_diff
+   change of its ``guard_removed`` unit within ``GUARD_EVIDENCE_WINDOW`` lines,
+   whose old code is in no new file and that no guard alert finding already
+   reports (``guard_removal_checks``), or the verifier's
+   ``removed_control_quote`` found in the OLD file near it only on deleted,
+   non-comment lines that guard_diff classifies as a control, and in no new
+   file. At most
    ``PR_REVIEW_MAX_SUGGESTIONS``; never a finding, never gating.
 
 ``review_pr`` runs all of it on a PR given as plain file dicts, without the
@@ -77,7 +80,11 @@ from backend.app.core.finding_keys import (
     legacy_llm_dedupe_key,
     llm_dedupe_key,
 )
-from backend.app.core.guard_diff import comment_only_lines, control_kinds_on_lines
+from backend.app.core.guard_diff import (
+    ALERT_MIN_CONFIDENCE,
+    comment_only_lines,
+    control_kinds_on_lines,
+)
 from backend.app.core.llm_client import LLMError
 from backend.app.core.markdown_renderer import (
     MAX_QUOTE_CHARS,
@@ -102,6 +109,7 @@ from backend.app.core.pr_context import (
     deleted_old_lines,
     diff_lines,
     fit_file_section,
+    new_line_for,
     numbered,
     old_line_for,
     render_diff,
@@ -852,27 +860,100 @@ def _strip_removed_markers(quote: str) -> str:
     return "\n".join(out)
 
 
-def guard_removal_evidence(bundle: PRBundle, guard: dict, cand: dict) -> dict | None:
-    """guard_diff evidence that the change removed or weakened a security
-    check in the candidate's unit: the planner unit containing the candidate's
-    line has risk ``guard_removed`` (the alert tier included) with a removed /
-    weakened change. The control shown is that change's old code."""
-    for u in bundle.units_of(cand["file_path"]):
-        if not (int(u.get("start_line") or 0) <= int(cand["line"])
-                <= int(u.get("end_line") or 0)):
+# A removed / weakened guard counts for a candidate only within this many
+# new-file lines of the candidate's quoted lines (a guard removed elsewhere in
+# a long function is not evidence about this spot).
+GUARD_EVIDENCE_WINDOW = 10
+
+
+def _deleted_lines_with(pr_file: PRFile, text: str, deleted: set[int]) -> list[int]:
+    """Old-file lines among ``deleted`` holding ``text`` (whitespace-insensitive)."""
+    lines = (pr_file.old_content or "").splitlines()
+    return [n for n in sorted(deleted)
+            if n <= len(lines) and locate_quote(text, lines[n - 1]) is not None]
+
+
+def guard_removal_checks(bundle: PRBundle, guard: dict, cand: dict) -> list[dict]:
+    """Each removed / weakened guard_diff change of a ``guard_removed`` unit
+    containing the candidate's line, with why it does or doesn't count as
+    evidence there: {change, new_line, old_line, reason (None = it counts)}.
+
+    The change's spot in the NEW file is guard_diff's own anchor
+    (``evidence.guard_to_dict``: the new-side line of a swap), else the
+    deletion point (``pr_context.new_line_for``) of the deleted old line
+    holding its old code, the one nearest the candidate. Reasons:
+
+    - "no_old_code": nothing of the old side to show;
+    - "not_located": no new-side anchor, and the old code is on no deleted line;
+    - "too_far": more than GUARD_EVIDENCE_WINDOW new-file lines from the
+      candidate's quoted lines;
+    - "moved": the old code is in some file's new content (whitespace-
+      insensitive, as the verifier-quote check): moved, not removed;
+    - "alert_reported": guard_diff's deterministic alert finding
+      (``evidence.guard_alert_findings``) already reports it - the change is
+      itself an alert change, or an alert finding sits on the same file and
+      line. The alert is in the report; the candidate keeps its verifier
+      status (uncertain / below_min_confidence), not review_suggested."""
+    f = bundle.by_path.get(cand["file_path"])
+    if f is None:
+        return []
+    line = int(cand["line"])
+    end = int(cand.get("end_line") or line)
+    target_old = old_line_for(f.patch, line)
+    deleted = deleted_old_lines(f.patch)
+    alert_lines = {a["line"] for a in guard_alert_findings(guard)
+                   if a["file_path"] == f.path and a.get("line") is not None}
+    out = []
+    for u in bundle.units_of(f.path):
+        if not (int(u.get("start_line") or 0) <= line <= int(u.get("end_line") or 0)):
             continue
         g = guard.get(unit_key(u))
         if not g or g.get("risk") != "guard_removed":
             continue
-        changes = [c for c in g.get("changes") or []
-                   if c.get("direction") in ("removed", "weakened")
-                   and (c.get("old_text") or "").strip()]
-        if changes:
-            best = max(changes, key=lambda c: float(c.get("confidence") or 0))
-            return {"evidence": "guard_diff",
-                    "removed_control": best["old_text"].strip()[:REMOVED_CONTROL_MAX_CHARS],
-                    "removed_control_line": None, "kind": best.get("kind")}
-    return None
+        for c in g.get("changes") or []:
+            if c.get("direction") not in ("removed", "weakened"):
+                continue
+            old_text = (c.get("old_text") or "").strip()
+            row = {"change": c, "new_line": c.get("line"), "old_line": None, "reason": None}
+            out.append(row)
+            if not old_text:
+                row["reason"] = "no_old_code"
+                continue
+            hits = _deleted_lines_with(f, old_text, deleted)
+            if hits:
+                row["old_line"] = min(hits, key=lambda n: abs(n - target_old))
+            if row["new_line"] is None and row["old_line"] is not None:
+                row["new_line"] = new_line_for(f.patch, row["old_line"])
+            at = row["new_line"]
+            if at is None:
+                row["reason"] = "not_located"
+            elif not (line - GUARD_EVIDENCE_WINDOW <= int(at) <= end + GUARD_EVIDENCE_WINDOW):
+                row["reason"] = "too_far"
+            elif _in_new_code(bundle, old_text):
+                row["reason"] = "moved"
+            elif (g.get("alert") and c["direction"] == "weakened"
+                  and float(c.get("confidence") or 0) >= ALERT_MIN_CONFIDENCE) \
+                    or int(at) in alert_lines:
+                row["reason"] = "alert_reported"
+    return out
+
+
+def guard_removal_evidence(bundle: PRBundle, guard: dict, cand: dict) -> dict | None:
+    """guard_diff evidence that the change removed or weakened a security
+    check AT the candidate's spot: a removed / weakened change of a
+    ``guard_removed`` unit (the alert tier included) containing the
+    candidate's line that ``guard_removal_checks`` accepts - within
+    GUARD_EVIDENCE_WINDOW new-file lines, not moved, not already reported by
+    a guard alert. The control shown is that change's old code (the most
+    confident change)."""
+    ok = [r for r in guard_removal_checks(bundle, guard, cand) if r["reason"] is None]
+    if not ok:
+        return None
+    best = max(ok, key=lambda r: float(r["change"].get("confidence") or 0))
+    c = best["change"]
+    return {"evidence": "guard_diff",
+            "removed_control": c["old_text"].strip()[:REMOVED_CONTROL_MAX_CHARS],
+            "removed_control_line": best["old_line"], "kind": c.get("kind")}
 
 
 def _in_new_code(bundle: PRBundle, text: str) -> bool:
@@ -1246,7 +1327,10 @@ async def run_pr_review(
         c["review_evidence"] = [e["evidence"] for e in evidence]
         # The stats partition the candidates: "confirmed" counts reported
         # findings only; a confirmation under the cutoff is below_min_confidence,
-        # unless it (or an uncertain one) is a review suggestion.
+        # unless it (or an uncertain one) is a review suggestion. A candidate
+        # whose only evidence a guard alert finding already reports has none
+        # (``guard_removal_checks``) and keeps its verifier status, as does one
+        # past the PR_REVIEW_MAX_SUGGESTIONS cap.
         if verdict["verdict"] == "confirmed" and verdict["confidence"] >= config.min_confidence:
             c["status"] = "confirmed"
             stats["confirmed"] += 1

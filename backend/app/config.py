@@ -149,7 +149,8 @@ class Settings(BaseSettings):
     # with at least PR_REVIEW_SUGGEST_MIN_CONFIDENCE, AND deterministic evidence
     # that the change removed a security control at that spot (guard_diff
     # guard_removed in its unit, or the verifier's removed_control_quote found
-    # in the old file on deleted lines and in no new file). At most
+    # in the old file only on deleted, non-comment lines that guard_diff
+    # classifies as a control, and in no new file). At most
     # PR_REVIEW_MAX_SUGGESTIONS per scan; 0 turns the tier off.
     PR_REVIEW_MAX_SUGGESTIONS: int = 5
     PR_REVIEW_SUGGEST_MIN_CONFIDENCE: int = 4

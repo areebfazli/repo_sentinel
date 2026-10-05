@@ -17,17 +17,18 @@ from ml.evaluation.llm_eval_common import LLMCache, mcnemar_exact
 PY_OLD = (
     "import os\n"
     "\n"
-    "def clean(p):\n"
+    "def validate_path(p):\n"
     "    return os.path.basename(p)\n"
     "\n"
     "def read(p):\n"
-    "    p = clean(p)\n"
+    "    p = validate_path(p)\n"
     "    return open(p).read()\n"
     "\n"
     "def view(req):\n"
     "    return read(req.args['f'])\n"
 )
-PY_NEW = PY_OLD.replace("    p = clean(p)\n", "")  # read() loses its guard; open() is line 7
+# read() loses its guard (a validation call); open() is line 7.
+PY_NEW = PY_OLD.replace("    p = validate_path(p)\n", "")
 UTIL_OLD = "def add(a, b):\n    return a + b\n"
 UTIL_NEW = "def add(a, b):\n    total = a + b\n    return total\n"
 QUOTE = "return open(p).read()"
@@ -930,7 +931,7 @@ def sql_intro_item(item_id="pr_S_intro"):
 
 def test_run_records_review_suggestions_as_their_own_view():
     verdict = {"verdict": "uncertain", "confidence": 5, "reason": "caller not shown",
-               "removed_control_quote": "    p = clean(p)"}
+               "removed_control_quote": "    p = validate_path(p)"}
     rec, _ = _run(intro_item(), "pr", StubLLM(audit={"findings": [TRAVERSAL]}, verdict=verdict))
     assert rec["findings"]["verified"] == []
     [sug] = rec["findings"]["verified_plus_review"]

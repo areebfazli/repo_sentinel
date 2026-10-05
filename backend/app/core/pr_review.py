@@ -44,7 +44,8 @@ per-function in isolation. Stages:
    (status ``review_suggested``) only with deterministic evidence that the
    change removed a security control there: a guard_diff ``guard_removed``
    change in its unit, or the verifier's ``removed_control_quote`` found in
-   the OLD file on deleted lines near it and in no new file. At most
+   the OLD file near it only on deleted, non-comment lines that guard_diff
+   classifies as a control, and in no new file. At most
    ``PR_REVIEW_MAX_SUGGESTIONS``; never a finding, never gating.
 
 ``review_pr`` runs all of it on a PR given as plain file dicts, without the
@@ -76,6 +77,7 @@ from backend.app.core.finding_keys import (
     legacy_llm_dedupe_key,
     llm_dedupe_key,
 )
+from backend.app.core.guard_diff import comment_only_lines, control_kinds_on_lines
 from backend.app.core.llm_client import LLMError
 from backend.app.core.markdown_renderer import (
     MAX_QUOTE_CHARS,
@@ -873,14 +875,33 @@ def guard_removal_evidence(bundle: PRBundle, guard: dict, cand: dict) -> dict | 
     return None
 
 
+def _in_new_code(bundle: PRBundle, text: str) -> bool:
+    """``text`` is (whitespace-insensitively) in some file's NEW content: a
+    control that moved, or still applies elsewhere in the PR, is not removed."""
+    return any(locate_quote(text, p.new_content) is not None
+               for p in bundle.files if p.new_content)
+
+
 def validate_removed_control(bundle: PRBundle, cand: dict, quote: str | None) -> dict | None:
     """The verifier's ``removed_control_quote`` as evidence, or None. It must
-    be (at most MAX_REMOVED_CONTROL_LINES lines) found in the file's OLD
-    content (``locate_quote``: whitespace-insensitive; diff markers tolerated),
-    within REMOVED_CONTROL_WINDOW old lines of the candidate, on lines the
-    patch deletes, and in NO file's new content (a control that moved or
-    still applies elsewhere in the PR is not removed). The control shown is
-    the old file's own lines, not the model's text."""
+    be (at most MAX_REMOVED_CONTROL_LINES lines, at least ``MIN_QUOTE_CHARS``)
+    found in the file's OLD content (``locate_quote``: whitespace-insensitive;
+    diff markers tolerated) within REMOVED_CONTROL_WINDOW old lines of the
+    candidate, and the old lines it matches must
+
+    - all be lines the patch deletes (blank lines aside): a quote reaching
+      into a kept line is about code that is still there;
+    - none be comment-only (``guard_diff.comment_only_lines``: ``#`` / ``//``
+      / ``/* */`` / docstring lines): a deleted comment removes no control;
+    - look like a security control to guard_diff's own classifier
+      (``guard_diff.control_kinds_on_lines``: guard calls such as sanitisers,
+      auth / permission checks or ``compare_digest``, guard blocks, bounds
+      checks, safe API forms, safe flags, parameterised SQL), so a deleted
+      ``log.debug(p)`` is not one (Python / JavaScript only: other languages
+      never qualify this way);
+
+    and the quote must be in NO file's new content (moved or kept). The
+    control shown is the old file's own lines, not the model's text."""
     f = bundle.by_path.get(cand["file_path"])
     if not quote or f is None or not f.old_content or not f.patch:
         return None
@@ -895,15 +916,22 @@ def validate_removed_control(bundle: PRBundle, cand: dict, quote: str | None) ->
     stripped = _strip_removed_markers(quote)
     if stripped != quote:
         variants.append(stripped)
-    news = [p.new_content for p in bundle.files if p.new_content]
+    comments = None
     for q in variants:
         span = locate_quote(q, "\n".join(lines[lo:hi])) if lo < hi else None
         if span is None:
             continue
         first, last = lo + span[0] + 1, lo + span[1] + 1
-        if not any(first <= n <= last for n in deleted):
+        matched = [n for n in range(first, last + 1) if lines[n - 1].strip()]
+        if not matched or any(n not in deleted for n in matched):
             continue
-        if any(locate_quote(q, content) is not None for content in news):
+        if comments is None:
+            comments = comment_only_lines(f.old_content, f.language)
+        if any(n in comments for n in matched):
+            continue
+        if not control_kinds_on_lines(f.old_content, f.language, matched):
+            continue
+        if _in_new_code(bundle, q):
             return None  # still in the PR's code: moved or kept, not removed
         return {"evidence": "verifier_quote",
                 "removed_control": "\n".join(lines[first - 1:last])[:REMOVED_CONTROL_MAX_CHARS],

@@ -132,7 +132,8 @@ class ReviewSuggestion(BaseModel):
     PR_REVIEW_MIN_CONFIDENCE) at a spot where the change removed an existing
     security control, shown by deterministic evidence: ``evidence`` lists
     "verifier_quote" (the verifier's quote of the control, found in the old
-    file on deleted lines and in no new file) and / or "guard_diff" (a
+    file only on deleted, non-comment lines that guard_diff classifies as a
+    control, and in no new file) and / or "guard_diff" (a
     guard_removed change in the unit). Never a finding: not in
     ``report_findings``, ``is_vulnerable`` or any gate. Text fields are plain
     text (LLM-written or PR code): escape them when rendering."""

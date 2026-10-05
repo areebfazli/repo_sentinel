@@ -9,6 +9,8 @@ from backend.app.core.analysis_planner import plan_units
 from backend.app.core.code_parser import CodeParser
 from backend.app.core.guard_diff import (
     PatchMismatch,
+    comment_only_lines,
+    control_kinds_on_lines,
     flip_direction,
     guard_diff,
     guard_diff_for_file,
@@ -437,3 +439,69 @@ def test_files_mode_prefers_base_content(parser):
                                            changed_lines=[5])], parser, max_units=50)
     (res,) = guard_diff_for_file(file, units, parser)
     assert res.risk == "guard_removed"
+
+
+# ---------------------------------------------------------------------------
+# Line-level checks for the PR review's removed-control evidence
+# ---------------------------------------------------------------------------
+
+LINES_PY = (
+    "def view(request, user, p, sig, expected):\n"           # 1
+    "    \"\"\"Docstring: # not code.\"\"\"\n"              # 2
+    "    # TODO tidy this later\n"                             # 3
+    "    if not user.is_admin:\n"                              # 4
+    "        raise PermissionDenied\n"                         # 5
+    "    log.debug(p)\n"                                       # 6
+    "    x = '# a string, not a comment'\n"                    # 7
+    "    name = escape(p)\n"                                   # 8
+    "    if not hmac.compare_digest(sig, expected):\n"         # 9
+    "        return None\n"                                    # 10
+    "    return render(\n"                                     # 11
+    "        *args)  # trailing comment\n"                     # 12
+)
+
+
+def test_comment_only_lines_python():
+    assert comment_only_lines(LINES_PY, "python") == {2, 3}
+
+
+def test_comment_only_lines_javascript_and_fallback():
+    js = ("function f(u) {\n"        # 1
+          "  // a comment\n"         # 2
+          "  /* block\n"             # 3
+          "   * more\n"              # 4
+          "   */\n"                  # 5
+          "  'use strict';\n"        # 6
+          "  const s = `x\n"         # 7
+          " * y`;\n"                 # 8: inside a template string, code
+          "  return escape(u);\n"    # 9
+          "}\n")
+    assert comment_only_lines(js, "typescript") == {2, 3, 4, 5, 6}
+    # No grammar: line-start check (conservative).
+    assert comment_only_lines("// x\nfoo();\n# y\n  * z\n", "go") == {1, 3, 4}
+
+
+@pytest.mark.parametrize("lines, kinds", [
+    ([4], {"auth_check"}),            # the guard block's if line
+    ([5], {"auth_check"}),            # ... and its exit
+    ([8], {"sanitiser"}),             # escape(...)
+    ([9], {"auth_check"}),            # hmac.compare_digest(...)
+    ([3], set()),                     # a comment
+    ([6], set()),                     # logging is not a control
+    ([7], set()),
+    ([6, 8], {"sanitiser"}),
+])
+def test_control_kinds_on_lines_uses_the_guard_vocabulary(lines, kinds):
+    assert control_kinds_on_lines(LINES_PY, "python", lines) == kinds
+
+
+def test_control_kinds_on_lines_safe_forms_and_unsupported_languages():
+    code = ("def load(s, db, name):\n"
+            "    data = yaml.safe_load(s)\n"
+            "    db.execute('SELECT * FROM t WHERE name = ?', (name,))\n"
+            "    print(s)\n")
+    assert control_kinds_on_lines(code, "python", [2]) == {"safe_api"}
+    assert control_kinds_on_lines(code, "python", [3]) == {"sql_param"}
+    assert control_kinds_on_lines(code, "python", [4]) == set()
+    assert control_kinds_on_lines("if (!ok) { throw err; }", "go", [1]) == set()
+    assert control_kinds_on_lines(code, "python", []) == set()

@@ -259,9 +259,14 @@ def test_funnel_stats_partition_the_candidates():
 
 # --- "worth a look": removed controls the verifier could not confirm ----------------
 
+# PY_OLD / PY_NEW with a guard_diff-recognised control (a validation call, too
+# weak alone for guard_diff's guard_removed), so the verifier's quote is the
+# only evidence.
+RM_OLD = PY_OLD.replace("clean", "validate_path")
+RM_NEW = PY_NEW.replace("clean", "validate_path")
 UNCERTAIN_REMOVED = {"verdict": "uncertain", "confidence": 5,
-                     "reason": "clean() was removed, the caller is not shown",
-                     "removed_control_quote": "    p = clean(p)"}
+                     "reason": "validate_path() was removed, the caller is not shown",
+                     "removed_control_quote": "    p = validate_path(p)"}
 SQL_FINDING = {"file": "app/db.py", "line": 2, "severity": "high", "cwe": "CWE-89",
                "title": "SQL injection in find()", "quoted_code": "return db.execute(f\"SELECT",
                "confidence": 8}
@@ -274,12 +279,12 @@ def _schema_ok(result):
 
 def test_uncertain_removed_control_is_a_non_blocking_review_suggestion():
     router = PRRouter(audits=[{"findings": [TRAVERSAL]}], verdict=UNCERTAIN_REMOVED)
-    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router)
+    result = _review(_files(("app/files.py", RM_OLD, RM_NEW)), router)
     _schema_ok(result)
     assert result["report_findings"] == [] and result["is_vulnerable"] is False
     [sug] = result["review_suggestions"]
     assert (sug["file_path"], sug["line"], sug["function_name"]) == ("app/files.py", 7, "read")
-    assert sug["removed_control"] == "    p = clean(p)" and sug["removed_control_line"] == 7
+    assert sug["removed_control"] == "    p = validate_path(p)" and sug["removed_control_line"] == 7
     assert sug["evidence"] == ["verifier_quote"] and sug["verdict"] == "uncertain"
     assert sug["confidence"] == 5 and sug["verifier"] == "stub:verifier"
     [c] = result["candidates"]
@@ -288,19 +293,19 @@ def test_uncertain_removed_control_is_a_non_blocking_review_suggestion():
     assert (s["review_suggested"], s["uncertain"], s["confirmed"], s["verified"]) == (1, 0, 0, 1)
     md = result["report_markdown"]
     assert md.startswith("## ✅") and result["review_status"] == "complete"
-    assert "### 👀 Worth a look (not blocking)" in md and "`    p = clean(p)`" not in md
-    assert "Removed control (line 7 before the change): `p = clean(p)`" in md
+    assert "### 👀 Worth a look (not blocking)" in md and "`    p = validate_path(p)`" not in md
+    assert "Removed control (line 7 before the change): `p = validate_path(p)`" in md
     assert "1 worth a look (not blocking" in md
 
 
 @pytest.mark.parametrize("quote", [
-    "     | -    p = clean(p)",       # copied from the verifier's numbered diff
-    "-    p = clean(p)",
-    "p=clean(p)",                     # whitespace-insensitive
+    "     | -    p = validate_path(p)",       # copied from the verifier's numbered diff
+    "-    p = validate_path(p)",
+    "p=validate_path(p)",                     # whitespace-insensitive
 ])
 def test_removed_control_quote_tolerates_diff_markers_and_whitespace(quote):
     verdict = {**UNCERTAIN_REMOVED, "removed_control_quote": quote}
-    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), PRRouter(
+    result = _review(_files(("app/files.py", RM_OLD, RM_NEW)), PRRouter(
         audits=[{"findings": [TRAVERSAL]}], verdict=verdict))
     assert [c["status"] for c in result["candidates"]] == ["review_suggested"]
 
@@ -312,7 +317,7 @@ def test_removed_control_quote_tolerates_diff_markers_and_whitespace(quote):
     {**UNCERTAIN_REMOVED, "confidence": 3},  # verifier: likely a false positive
 ])
 def test_unvalidated_or_weak_claims_are_not_suggestions(verdict):
-    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), PRRouter(
+    result = _review(_files(("app/files.py", RM_OLD, RM_NEW)), PRRouter(
         audits=[{"findings": [TRAVERSAL]}], verdict=verdict))
     assert result["review_suggestions"] == []
     assert [c["status"] for c in result["candidates"]] == ["uncertain"]
@@ -320,21 +325,117 @@ def test_unvalidated_or_weak_claims_are_not_suggestions(verdict):
 
 
 def test_a_moved_control_is_not_removed():
-    moved = PY_NEW.replace("    return read(req.args['f'])\n",
-                           "    p = req.args['f']\n    p = clean(p)\n    return read(p)\n")
-    result = _review(_files(("app/files.py", PY_OLD, moved)), PRRouter(
+    moved = RM_NEW.replace("    return read(req.args['f'])\n",
+                           "    p = req.args['f']\n    p = validate_path(p)\n    return read(p)\n")
+    result = _review(_files(("app/files.py", RM_OLD, moved)), PRRouter(
         audits=[{"findings": [TRAVERSAL]}], verdict=UNCERTAIN_REMOVED))
     assert result["review_suggestions"] == []
     assert result["candidates"][0]["status"] == "uncertain"
 
 
+def _quote_review(files, quote, cand_quote, path="app/views.py"):
+    """One uncertain candidate in ``path`` quoting ``cand_quote``; the
+    verifier claims ``quote`` as the removed control."""
+    finding = {"file": path, "line": 1, "severity": "high", "cwe": "CWE-285",
+               "title": "Missing check", "quoted_code": cand_quote, "confidence": 8}
+    verdict = {"verdict": "uncertain", "confidence": 5, "reason": "a control was removed",
+               "removed_control_quote": quote}
+    return _review(files, PRRouter(audits=[{"findings": [finding]}], verdict=verdict))
+
+
+PROBE_OLD = (
+    "import logging\n"
+    "log = logging.getLogger(__name__)\n"
+    "\n"
+    "def read(p):\n"
+    "    # TODO tidy this later\n"
+    "    p = validate_path(p)\n"
+    "    log.debug(p)\n"
+    "    return open(p).read()\n"
+)
+# The comment and the debug line go; the real control stays.
+PROBE_NEW = PROBE_OLD.replace("    # TODO tidy this later\n", "").replace("    log.debug(p)\n", "")
+
+
+@pytest.mark.parametrize("quote", [
+    "# TODO tidy this later",                    # a deleted comment
+    "log.debug(p)",                              # deleted, but not a control
+    "p = validate_path(p)\n    log.debug(p)",    # a kept line plus a deleted one
+    "# TODO tidy this later\n    p = validate_path(p)",
+])
+def test_removed_control_quote_must_be_deleted_control_code(quote):
+    result = _quote_review(_files(("app/views.py", PROBE_OLD, PROBE_NEW)), quote,
+                           "return open(p).read()")
+    [c] = result["candidates"]
+    assert c["status"] == "uncertain" and c["review_evidence"] == []
+    assert result["review_suggestions"] == []
+
+
+def test_a_deleted_docstring_or_js_comment_is_not_a_control():
+    old = 'def read(p):\n    """Validate the path first."""\n    return open(p).read()\n'
+    new = "def read(p):\n    return open(p).read()\n"
+    result = _quote_review(_files(("app/views.py", old, new)), '"""Validate the path first."""',
+                           "return open(p).read()")
+    assert result["review_suggestions"] == []
+    js_old = "function show(el, s) {\n  // escape(s) first\n  el.innerHTML = s;\n}\n"
+    js_new = "function show(el, s) {\n  el.innerHTML = s;\n}\n"
+    result = _quote_review(_files(("app/view.js", js_old, js_new)), "// escape(s) first",
+                           "el.innerHTML = s;", path="app/view.js")
+    assert result["review_suggestions"] == []
+
+
+AUTH_OLD = (
+    "import hmac\n"
+    "\n"
+    "def delete(request, user, obj):\n"
+    "    if not user.is_admin:\n"
+    "        raise PermissionDenied\n"
+    "    obj.delete()\n"
+    "\n"
+    "def render(name):\n"
+    "    name = escape(name)\n"
+    "    return '<b>' + name + '</b>'\n"
+    "\n"
+    "def webhook(sig, expected, body):\n"
+    "    if not hmac.compare_digest(sig, expected):\n"
+    "        return None\n"
+    "    return handle(body)\n"
+)
+
+
+@pytest.mark.parametrize("removed, quote, cand_quote, old_line", [
+    ("    if not user.is_admin:\n        raise PermissionDenied\n",
+     "if not user.is_admin:\n    raise PermissionDenied", "obj.delete()", 4),
+    ("    name = escape(name)\n", "name = escape(name)", "return '<b>' + name + '</b>'", 9),
+    ("    if not hmac.compare_digest(sig, expected):\n        return None\n",
+     "-    if not hmac.compare_digest(sig, expected):", "return handle(body)", 13),
+])
+def test_a_genuinely_removed_control_still_qualifies(removed, quote, cand_quote, old_line):
+    new = AUTH_OLD.replace(removed, "")
+    result = _quote_review(_files(("app/views.py", AUTH_OLD, new)), quote, cand_quote)
+    [sug] = result["review_suggestions"]
+    assert sug["evidence"][0] == "verifier_quote" and sug["removed_control_line"] == old_line
+    assert sug["removed_control"].strip().startswith(removed.strip().splitlines()[0].strip())
+
+
+def test_a_control_moved_to_another_file_still_fails():
+    new = AUTH_OLD.replace("    if not user.is_admin:\n        raise PermissionDenied\n", "")
+    helper = ("def require_admin(user):\n"
+              "    if not user.is_admin:\n"
+              "        raise PermissionDenied\n")
+    result = _quote_review(_files(("app/views.py", AUTH_OLD, new),
+                                  ("app/perms.py", "", helper)),
+                           "if not user.is_admin:\n    raise PermissionDenied", "obj.delete()")
+    assert "verifier_quote" not in result["candidates"][0]["review_evidence"]
+
+
 def test_rejected_never_qualifies_and_confirmed_below_cutoff_does():
     rejected = {**UNCERTAIN_REMOVED, "verdict": "rejected", "confidence": 6}
-    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), PRRouter(
+    result = _review(_files(("app/files.py", RM_OLD, RM_NEW)), PRRouter(
         audits=[{"findings": [TRAVERSAL]}], verdict=rejected))
     assert result["review_suggestions"] == [] and result["candidates"][0]["status"] == "rejected"
     low = {**UNCERTAIN_REMOVED, "verdict": "confirmed", "confidence": 6}
-    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), PRRouter(
+    result = _review(_files(("app/files.py", RM_OLD, RM_NEW)), PRRouter(
         audits=[{"findings": [TRAVERSAL]}], verdict=low))
     assert result["report_findings"] == []
     [sug] = result["review_suggestions"]
@@ -342,7 +443,7 @@ def test_rejected_never_qualifies_and_confirmed_below_cutoff_does():
         result["report_markdown"]
     # At/above the cutoff it is a finding, not a suggestion.
     high = {**UNCERTAIN_REMOVED, "verdict": "confirmed", "confidence": 7}
-    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), PRRouter(
+    result = _review(_files(("app/files.py", RM_OLD, RM_NEW)), PRRouter(
         audits=[{"findings": [TRAVERSAL]}], verdict=high))
     assert len(result["report_findings"]) == 1 and result["review_suggestions"] == []
 
@@ -363,7 +464,7 @@ def test_guard_diff_removal_in_the_unit_is_evidence_without_a_quote():
 
 def test_suggestions_can_be_turned_off_and_are_capped():
     router = PRRouter(audits=[{"findings": [TRAVERSAL]}], verdict=UNCERTAIN_REMOVED)
-    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router, max_review_suggestions=0)
+    result = _review(_files(("app/files.py", RM_OLD, RM_NEW)), router, max_review_suggestions=0)
     assert result["review_suggestions"] == []
     assert result["candidates"][0]["status"] == "uncertain"
     assert result["candidates"][0]["review_evidence"] == ["verifier_quote"]
@@ -372,7 +473,7 @@ def test_suggestions_can_be_turned_off_and_are_capped():
 def test_suggestion_text_is_escaped_in_the_report():
     finding = {**TRAVERSAL, "title": "XSS <script>alert(1)</script> @admin [x](http://evil)"}
     verdict = {**UNCERTAIN_REMOVED, "reason": "see <img src=x onerror=1> @team"}
-    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), PRRouter(
+    result = _review(_files(("app/files.py", RM_OLD, RM_NEW)), PRRouter(
         audits=[{"findings": [finding]}], verdict=verdict))
     md = result["report_markdown"].split("Worth a look")[1]
     assert "<script>" not in md and "<img" not in md

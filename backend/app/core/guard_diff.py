@@ -463,6 +463,9 @@ class _Feature:
     line: int
     text: str
     idents: frozenset[str] = frozenset()  # identifiers the guard tests / the call takes
+    # Last line the feature spans (a guard block: through its exit statement; a
+    # call: its closing paren); 0 = ``line`` only. Not part of the diffing.
+    end_line: int = 0
 
 
 def _mask(root: Node, src: bytes) -> str:
@@ -706,7 +709,8 @@ def _guard_block_features(root: Node, src: bytes, lang: str, params: set[str],
         line = n.start_point[0] + 1 - line_off
         feats.append(_Feature("block", kind, kind, f"{exit_name}|{_shape(cond, src)}", 1,
                               weight, weight, line, _first_line(_text(n, src)),
-                              frozenset(_identifiers(cond, src))))
+                              frozenset(_identifiers(cond, src)),
+                              end_line=stmt.end_point[0] + 1 - line_off))
     return feats, guard_conds
 
 
@@ -775,7 +779,7 @@ def _call_features(root: Node, src: bytes, lang: str, line_off: int) -> list[_Fe
         idents = frozenset(_identifiers(args, src)) if args is not None else frozenset()
         feats.append(_Feature("call", kind, kind, last.lower(), 1, weight, weight,
                               n.start_point[0] + 1 - line_off, _first_line(_text(n, src)),
-                              idents))
+                              idents, end_line=n.end_point[0] + 1 - line_off))
     return feats
 
 
@@ -1160,6 +1164,86 @@ def guard_diff(old_code: str | None, new_code: str | None, language: str | None)
 
 def flip_direction(direction: str) -> str:
     return _FLIP[direction]
+
+
+# ---------------------------------------------------------------------------
+# Line-level checks (the PR review's "worth a look" evidence)
+# ---------------------------------------------------------------------------
+
+# Feature families that are a control when present: guard calls / blocks, bounds
+# comparisons, and the safe forms of hazards, flags and SQL strings.
+_PROTECTIVE_FAMILIES = frozenset({"call", "block", "cond", "safe", "flag_safe", "sql_safe"})
+
+
+def control_kinds_on_lines(code: str, language: str | None, lines) -> set[str]:
+    """This module's control classifier applied to some lines of ``code``
+    (pass the whole file, so the lines are parsed in context): the kinds of the
+    protective features ``extract_features`` finds (guard calls, guard blocks
+    from their ``if`` / ``assert`` through the exit, bounds comparisons, the
+    safe forms of hazards / flags / SQL) that start on or span one of
+    ``lines`` (1-based). Unclassified guard blocks and features that count for
+    nothing, not even in a swap, are left out. Empty for an unsupported
+    language or a failed analysis; never raises."""
+    lang = normalize_language(language)
+    wanted = {int(n) for n in lines}
+    if lang is None or not wanted or not code:
+        return set()
+    try:
+        feats, _note, _ctx = extract_features(code, lang)
+    except Exception:  # never break a review over the evidence check
+        return set()
+    return {
+        f.kind for f in feats
+        if f.family in _PROTECTIVE_FAMILIES and f.polarity > 0
+        and max(f.weight, f.swap_weight) > 0
+        and any(f.line <= n <= max(f.end_line, f.line) for n in wanted)
+    }
+
+
+# Comment-looking line starts for languages without a grammar here.
+_COMMENT_LINE = re.compile(r"^\s*(#|//|/\*|\*)")
+_STRING_TYPES = frozenset({"string", "concatenated_string", "template_string"})
+
+
+def comment_only_lines(code: str, language: str | None) -> set[int]:
+    """1-based lines of ``code`` holding nothing but comments or a bare string
+    statement (a docstring, a ``"use strict"`` directive), whitespace aside;
+    blank lines are not included. Python / JavaScript (TypeScript via the JS
+    grammar) are parsed with tree-sitter, so ``#`` inside a string or a ``*``
+    continuing an expression are code. Other languages: a line starting with
+    ``#``, ``//``, ``/*`` or ``*`` (conservative: such a line is never taken
+    as evidence). Never raises."""
+    lang = normalize_language(language)
+    text_lines = (code or "").splitlines()
+    fallback = {i + 1 for i, ln in enumerate(text_lines) if _COMMENT_LINE.match(ln)}
+    if lang is None or not code:
+        return fallback
+    try:
+        root, src, off = _parse(code, lang)
+        noise = bytearray(len(src))
+        for n in _walk(root):
+            bare = (n.type == "expression_statement" and n.named_children
+                    and all(c.type in _STRING_TYPES for c in n.named_children))
+            if n.type == "comment" or bare:
+                noise[n.start_byte:n.end_byte] = b"\x01" * (n.end_byte - n.start_byte)
+        out: set[int] = set()
+        pos = 0
+        for i, raw in enumerate(src.split(b"\n")):
+            seen = only_noise = False
+            for j, ch in enumerate(raw):
+                if ch in b" \t\r\f\v":
+                    continue
+                seen = True
+                only_noise = bool(noise[pos + j])
+                if not only_noise:
+                    break
+            line = i + 1 - off
+            if seen and only_noise and 1 <= line <= len(text_lines):
+                out.add(line)
+            pos += len(raw) + 1
+        return out
+    except Exception:  # tree-sitter edge cases: fall back to the line-start check
+        return fallback
 
 
 # ---------------------------------------------------------------------------

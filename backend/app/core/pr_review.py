@@ -41,9 +41,10 @@ per-function in isolation. Stages:
 6. **Worth a look** (non-blocking): a candidate the verifier left "uncertain"
    (or confirmed below the cutoff) with confidence >=
    ``PR_REVIEW_SUGGEST_MIN_CONFIDENCE`` becomes a ``review_suggestions`` item
-   (status ``review_suggested``) only with deterministic evidence that the
-   change removed a security control there: a removed / weakened guard_diff
-   change of its ``guard_removed`` unit within ``GUARD_EVIDENCE_WINDOW`` lines,
+   (status ``review_suggested``) only when deterministic checks show the
+   change deleted code that looks like a security control there: a removed /
+   weakened guard_diff change of its ``guard_removed`` unit within
+   ``GUARD_EVIDENCE_WINDOW`` lines,
    whose old code is in no new file and that no guard alert finding already
    reports (``guard_removal_checks``), or the verifier's
    ``removed_control_quote`` found in the OLD file near it only on deleted,

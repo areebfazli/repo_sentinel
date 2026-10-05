@@ -993,3 +993,22 @@ def test_rescore_replays_the_tier_from_guard_diff_only_at_the_runs_cutoff(capsys
     assert "verified_plus_review" not in bare["summary"]["views"]
     R.print_summary(bare["summary"], "pr")
     assert "n/a (run recorded before the tier" in capsys.readouterr().out
+
+
+def test_compare_replays_the_tier_view_of_a_run_recorded_before_it(tmp_path):
+    recs = [_old_pr_rec(sql_intro_item(), [_cand("app/db.py", 2, "uncertain", "uncertain", 5)])]
+    run = {"config": {"arm": "pr", "model": "m", "pr_review": {"min_confidence": 8}},
+           "items": recs}
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps(run))
+    ds = tmp_path / "ds.jsonl"
+    ds.write_text(json.dumps(sql_intro_item()) + "\n")
+    args = ["--compare", str(path), str(path), "--view-a", "verified",
+            "--view-b", "verified_plus_review"]
+    cmp = R.main([*args, "--dataset", str(ds)])
+    assert cmp["nested_views"] and cmp["losses"]["intro_catches_lost_strict"]["count"] == 1
+    # Without its dataset items the view can't be replayed: a clear error, not a KeyError.
+    other = tmp_path / "other.jsonl"
+    other.write_text(json.dumps(intro_item()) + "\n")
+    with pytest.raises(SystemExit, match="no verified_plus_review view"):
+        R.main([*args, "--dataset", str(other)])

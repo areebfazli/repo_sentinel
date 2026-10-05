@@ -1678,6 +1678,12 @@ def attach_review_view(records: list[dict], items: list[dict] | None, parser,
     return meta
 
 
+def run_min_confidence(data: dict) -> int:
+    """The confidence cutoff a saved run's verified view used."""
+    return int((data["config"].get("pr_review") or {}).get("min_confidence")
+               or settings.PR_REVIEW_MIN_CONFIDENCE)
+
+
 def rescore(data: dict, tol: int, items: list[dict] | None = None, parser=None) -> dict:
     """Recompute every metric from the stored findings. With the run's dataset
     ``items``, the facts (change anchors, scope labels, leaky-diff terms,
@@ -1689,9 +1695,8 @@ def rescore(data: dict, tol: int, items: list[dict] | None = None, parser=None) 
     meta = (refresh_facts(records, items, parser) if items is not None
             else {"facts": "as stored in the records"})
     if data["config"]["arm"] in PR_ARMS:
-        cutoff = ((data["config"].get("pr_review") or {}).get("min_confidence")
-                  or settings.PR_REVIEW_MIN_CONFIDENCE)
-        meta["review_view"] = attach_review_view(records, items, parser, int(cutoff))
+        meta["review_view"] = attach_review_view(records, items, parser,
+                                                 run_min_confidence(data))
     summary = summarize(records, data["config"]["arm"], tol)
     return {**data, "config": {**data["config"], "localise_tolerance": tol},
             "rescore": meta, "summary": summary, "items": records}
@@ -2453,6 +2458,14 @@ def main(argv=None):
             if items is not None:
                 parser = parser or _parser()
                 refresh_facts(run["items"], items, parser)
+                if run["config"]["arm"] in PR_ARMS:
+                    # A run recorded before the worth-a-look tier gets its
+                    # verified_plus_review view replayed, as in --rescore.
+                    attach_review_view(run["items"], items, parser, run_min_confidence(run))
+        for run, view, path in ((a, args.view_a, a_path), (b, args.view_b, b_path)):
+            if any(r.get("findings") and view not in r["findings"] for r in run["items"]):
+                raise SystemExit(f"{_rel(path)} has no {view} view (a run recorded before it, "
+                                 "and its dataset is not available to replay it).")
         cmp = compare_runs(a["items"], b["items"], args.view_a, args.view_b,
                            args.localise_tolerance, same=same)
         print_comparison(f"{_rel(a_path)} ({a['config']['arm']}, {a['config'].get('model')})",

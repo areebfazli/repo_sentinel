@@ -16,7 +16,7 @@ Item format (one JSON object per line)::
      "pr_title", "pr_body",
      "files": [{"path", "old_content", "new_content", "patch"}],
      "target": {"path", "vuln_lines_new": [int], "changed_lines_new": [int]},
-     "source": "reversed_fix" | "real_fix" | "bystander" | "benign_commit",
+     "source": "reversed_fix" | "real_fix" | "bystander" | "real_commit",
      "notes": str, "meta": {...provenance...}}
 
 Kinds, per held-out fix commit (one commit per advisory; aliases sharing a commit
@@ -66,6 +66,30 @@ their repo's side.
 
     python scripts/build_pr_eval.py            # -> ml/evaluation/datasets/pr_eval/
     python scripts/build_pr_eval.py --check    # summary only, write nothing
+
+v2 (``--v2``; seconds, offline, never rebuilds or rewrites v1): reads the BUILT
+v1 files (sha256-checked against ``pr_eval_v1_manifest.json``) and the real
+benign commits fetched by ``scripts/fetch_benign_commits.py``
+(``pr_eval_benign_commits_v1.jsonl``, fetcher label ``benign_commit``) and writes
+
+- ``pr_eval_v2_real_commits.jsonl``: every fetched commit, validated like the
+  builder's own items (patch == the difflib diff of its old / new contents,
+  caps, neutral PR text, split == its repo's v1 side, not a known fix / eval
+  commit), ``source: real_commit`` (raw label in ``meta.fetched_source``);
+- ``pr_eval_v2_sample_dev.jsonl``: the v1 dev sample's 60 vuln_introducing +
+  60 vuln_fix items (same ids and content; ``LABEL_OVERRIDES`` applied) plus
+  ``--v2-benign-dev`` (120) dev real commits, language mix of the sampled vuln
+  items, round-robin over repos, at most ``--v2-benign-per-repo`` (2) per repo.
+  No bystanders (they stay in v1 for reference);
+- ``pr_eval_v2_test.jsonl``: every test vuln_introducing / vuln_fix item of v1
+  plus every test real commit;
+- ``pr_eval_v2_manifest.json`` (committed): input and output sha256s, counts,
+  ids, the dev/test leak check (``split_leak_check`` against
+  ``splits/v1.json``; the build fails on any leak) and real-commit vs
+  bystander size stats.
+
+    python scripts/build_pr_eval.py --v2
+    python scripts/build_pr_eval.py --v2 --check
 """
 from __future__ import annotations
 
@@ -625,6 +649,273 @@ def sample_dev(items: list[dict], seed: int, n_vuln: int = 60, n_benign: int = 8
 
 
 # ---------------------------------------------------------------------------
+# v2: real benign commits and the run samples (pure).
+# ---------------------------------------------------------------------------
+
+V2 = "v2"
+REAL_COMMIT_SOURCE = "real_commit"
+# ``scripts/fetch_benign_commits.py`` labels its items ``benign_commit``; v2
+# relabels them ``real_commit`` (the raw label is kept in ``meta.fetched_source``).
+FETCHED_COMMIT_SOURCES = ("benign_commit", REAL_COMMIT_SOURCE)
+DEFAULT_REAL_COMMITS = DEFAULT_OUT_DIR / "pr_eval_benign_commits_v1.jsonl"
+V2_BENIGN_DEV = 120
+V2_BENIGN_PER_REPO = 2
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def apply_label_override(item: dict) -> bool:
+    """Make sure a vuln item carries its ``LABEL_OVERRIDES`` correction
+    (idempotent). Returns True when it had to be applied here; raises if an
+    item claims an override that disagrees with the table."""
+    meta = item.setdefault("meta", {})
+    found = label_override(meta.get("osv_ids"))
+    if found is None:
+        if meta.get("label_override"):
+            raise ValueError(f"{item['id']}: label_override not in LABEL_OVERRIDES")
+        return False
+    osv_id, o = found
+    if meta.get("label_override"):
+        if (item.get("cwe"), item.get("category")) != (o["cwe"], o["category"]):
+            raise ValueError(f"{item['id']}: label {item.get('cwe')}/{item.get('category')} "
+                             f"disagrees with LABEL_OVERRIDES[{osv_id}]")
+        return False
+    meta["label_override"] = {"advisory": osv_id, "reason": o["reason"],
+                              "from": {"cwe": item.get("cwe"), "category": item.get("category")}}
+    item["cwe"], item["category"] = o["cwe"], o["category"]
+    return True
+
+
+def real_commit_item(item: dict, repo_side: dict[str, str], *, max_files: int = MAX_FILES,
+                     max_changed: int = MAX_CHANGED_LINES) -> dict:
+    """A fetched benign commit as a v2 item, validated like the builder's own
+    items: kind benign, a 40-hex ``meta.commit``, its split equal to its repo's
+    v1 side (``repo_side``: lower-cased repo -> dev / test), 1..``max_files``
+    code files whose patch is exactly ``unified_diff(old, new)`` (so
+    ``apply_patch(old, patch) == new``), 1..``max_changed`` changed lines, the
+    neutral path-only PR text and no target. Returns a copy with ``source:
+    real_commit`` (the raw label in ``meta.fetched_source``) and
+    ``meta.repo_side``. Raises ValueError."""
+    iid = item.get("id", "?")
+
+    def bad(why: str) -> ValueError:
+        return ValueError(f"real commit {iid}: {why}")
+
+    if item.get("kind") != "benign" or item.get("source") not in FETCHED_COMMIT_SOURCES:
+        raise bad(f"kind/source {item.get('kind')}/{item.get('source')}")
+    meta = dict(item.get("meta") or {})
+    if not _SHA_RE.match(str(meta.get("commit") or "")):
+        raise bad("meta.commit is not a 40-hex sha")
+    side = repo_side.get(str(item.get("repo") or "").lower())
+    if item.get("split") not in ("dev", "test") or item["split"] != side:
+        raise bad(f"split {item.get('split')!r} but its repo's v1 side is {side!r}")
+    if any(item.get(k) is not None for k in ("advisory_id", "cve_id", "category", "cwe")):
+        raise bad("carries a vulnerability label")
+    t = item.get("target") or {}
+    if t.get("path") is not None or t.get("vuln_lines_new") or t.get("changed_lines_new"):
+        raise bad("has a target")
+    files = item.get("files") or []
+    if not 1 <= len(files) <= max_files:
+        raise bad(f"{len(files)} files (1..{max_files})")
+    changed = 0
+    for f in files:
+        path, old, new, patch = f["path"], f.get("old_content"), f.get("new_content"), f["patch"]
+        if Path(path).suffix.lower() not in SUPPORTED_EXTENSIONS or _is_skipped_path(path):
+            raise bad(f"{path} is not a reviewed code path")
+        if old is None and new is None:
+            raise bad(f"{path} has no content")
+        if not patch or patch != unified_diff(old, new, path):
+            raise bad(f"{path}: patch is not the difflib diff of its contents")
+        try:
+            if apply_patch(old, patch) != (new or ""):
+                raise bad(f"{path}: patch does not reproduce new_content")
+        except PatchError as exc:
+            raise bad(f"{path}: {exc}") from None
+        added, removed = patch_line_numbers(patch)
+        changed += len(added) + removed
+    if not 0 < changed <= max_changed:
+        raise bad(f"{changed} changed lines (1..{max_changed})")
+    if meta.get("changed_lines") is not None and meta["changed_lines"] != changed:
+        raise bad(f"meta.changed_lines {meta['changed_lines']} != {changed}")
+    if (item.get("pr_title"), item.get("pr_body")) != neutral_pr_text([f["path"] for f in files]):
+        raise bad("PR text is not the neutral path-only text")
+    meta.update(changed_lines=changed, truncated=bool(meta.get("truncated")),
+                fetched_source=item["source"], repo_side=side)
+    return {**item, "source": REAL_COMMIT_SOURCE, "meta": meta}
+
+
+def sample_real_commits(pool: list[dict], n: int, seed: int,
+                        lang_mix: dict[str, int] | None = None,
+                        per_repo: int = V2_BENIGN_PER_REPO) -> tuple[list[dict], int]:
+    """``n`` items of ``pool`` spread over repos and languages, deterministic.
+
+    Language quotas follow ``lang_mix`` (e.g. the sampled vuln items' languages;
+    ``None`` = the pool's own mix), capped by what the pool holds. Within a
+    language, repos are walked in seeded order, round-robin: every repo gives
+    one item before any gives a second, and no repo gives more than
+    ``per_repo`` (summed over languages). A language short of its quota is
+    filled from the others (largest pool first); if the pool can't reach ``n``
+    at ``per_repo``, the cap is raised one step at a time. Returns ``(items sorted by id, the
+    per-repo cap used)``."""
+    pool = sorted(pool, key=lambda it: it["id"])
+    n = min(n, len(pool))
+    avail = Counter(it["language"] for it in pool)
+    mix = {k: (lang_mix or {}).get(k, 0) for k in avail} if lang_mix else dict(avail)
+    if not any(mix.values()):
+        mix = dict(avail)
+    want = _scaled_quotas(n, mix)
+    by_lang_repo: dict[str, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    for it in pool:
+        by_lang_repo[it["language"]][it["repo"]].append(it)
+    order: dict[str, list[str]] = {}
+    for lang in sorted(by_lang_repo):
+        repos = sorted(by_lang_repo[lang])
+        random.Random(f"{seed}:real_commits:{lang}").shuffle(repos)
+        order[lang] = repos
+        for repo in repos:
+            random.Random(f"{seed}:real_commits:{lang}:{repo}").shuffle(
+                by_lang_repo[lang][repo])
+
+    cap = max(per_repo, 1)
+    while True:
+        per: Counter = Counter()
+        chosen: list[dict] = []
+        for lang in sorted(order):
+            _round_robin(order[lang], by_lang_repo[lang], want.get(lang, 0), n, cap, per, chosen)
+        # A language short of its quota: fill from the others, largest pool first.
+        for lang in sorted(order, key=lambda k: (-avail[k], k)):
+            _round_robin(order[lang], by_lang_repo[lang], n - len(chosen), n, cap, per, chosen)
+        if len(chosen) >= n or cap >= len(pool):
+            return sorted(chosen, key=lambda it: it["id"]), cap
+        cap += 1
+
+
+def _scaled_quotas(n: int, weights: dict[str, int]) -> dict[str, int]:
+    """``n`` split proportionally to ``weights`` (largest remainder, ties by
+    key); unlike ``_quotas``, ``n`` may exceed the weights' sum."""
+    total = sum(weights.values())
+    raw = {k: n * w / total for k, w in weights.items()} if total else {}
+    q = {k: int(v) for k, v in raw.items()}
+    for k in sorted(raw, key=lambda k: (-(raw[k] - q[k]), str(k))):
+        if sum(q.values()) >= n:
+            break
+        q[k] += 1
+    return q
+
+
+def _round_robin(repos: list[str], items_of: dict[str, list[dict]], limit: int, n: int,
+                 cap: int, per: Counter, chosen: list[dict]) -> None:
+    """Take up to ``limit`` items (``chosen`` at most ``n``) from ``repos`` in
+    order, in rounds: round r only takes from a repo that has given r items so
+    far (all languages), so every repo gives one before any gives a second."""
+    taken = {it["id"] for it in chosen}
+    got = 0
+    for rnd in range(cap):
+        for repo in repos:
+            if got >= limit or len(chosen) >= n:
+                return
+            if per[repo] > rnd or per[repo] >= cap:
+                continue
+            left = [it for it in items_of[repo] if it["id"] not in taken]
+            if not left:
+                continue
+            taken.add(left[0]["id"])
+            per[repo] += 1
+            chosen.append(left[0])
+            got += 1
+
+
+def _eval_ids(item: dict) -> list[str]:
+    """The v1 split-file ids of a vuln item's eval pairs."""
+    return [f"{b}_{k}" for b in (item.get("meta") or {}).get("eval_pair_ids") or []
+            for k in ("vuln", "safe")]
+
+
+def _advisories(item: dict) -> set[str]:
+    meta = item.get("meta") or {}
+    return ({item.get("advisory_id"), item.get("cve_id"), *meta.get("osv_ids", []),
+             *meta.get("advisory_ids", [])} - {None})
+
+
+def split_leak_check(dev: list[dict], test: list[dict], side_of: dict[str, str],
+                     repo_side: dict[str, str]) -> dict:
+    """Assert that nothing of the test split reaches ``dev`` (and vice versa),
+    against the split file (``side_of``: eval id -> dev / test) and the repos'
+    v1 sides (``repo_side``: lower-cased repo -> dev / test). Every item must
+    be of its file's split; a vuln item's eval pair ids must all be on that
+    side of the split file; every repo must be on that side; and no repo,
+    advisory, commit or id may appear in both. Raises ValueError; returns the
+    summary for the manifest."""
+    problems: list[str] = []
+    for name, items in (("dev", dev), ("test", test)):
+        for it in items:
+            if it.get("split") != name:
+                problems.append(f"{it['id']}: split {it.get('split')!r} in the {name} file")
+            rs = repo_side.get(str(it.get("repo") or "").lower())
+            if rs != name:
+                problems.append(f"{it['id']}: repo {it.get('repo')} is on the {rs!r} side")
+            if it["kind"] in ("vuln_introducing", "vuln_fix"):
+                ids = _eval_ids(it)
+                if not ids:
+                    problems.append(f"{it['id']}: no eval pair ids")
+                sides = {side_of.get(i) for i in ids}
+                if sides != {name}:
+                    problems.append(f"{it['id']}: eval ids on split-file side(s) "
+                                    f"{sorted(map(str, sides))}")
+
+    def shared_keys(fn) -> set:
+        a, b = ({k for it in items for k in fn(it)} - {None} for items in (dev, test))
+        return a & b
+
+    shared = {
+        "repos": shared_keys(lambda it: [it["repo"].lower()]),
+        "advisories": shared_keys(_advisories),
+        "commits": shared_keys(lambda it: [(it.get("meta") or {}).get("commit")]),
+        "ids": shared_keys(lambda it: [it["id"]]),
+    }
+    for k, v in shared.items():
+        if v:
+            problems.append(f"{len(v)} {k} in both dev and test, e.g. {sorted(map(str, v))[:3]}")
+    if any(straddling(dev + test).values()):
+        problems.append(f"straddling: {straddling(dev + test)}")
+    if problems:
+        raise ValueError("dev/test leak: " + "; ".join(problems[:10]))
+    return {"ok": True, "dev_items": len(dev), "test_items": len(test),
+            "dev_repos": len({it["repo"].lower() for it in dev}),
+            "test_repos": len({it["repo"].lower() for it in test}),
+            **{f"shared_{k}": 0 for k in shared},
+            "checked": "item split, repo v1 side, vuln eval ids vs the split file, shared "
+                       "repos / advisories / commits / ids, straddling()"}
+
+
+def size_row(item: dict) -> dict:
+    """The size facts of one PR (``pr_size_stats`` aggregates them; small, so a
+    streamed 130 MB file can be summarised without keeping its contents)."""
+    files = item["files"]
+    return {"language": item["language"], "repo": item["repo"].lower(), "files": len(files),
+            "changed_lines": item["meta"]["changed_lines"],
+            "new_lines": sum(len(split_lines(f.get("new_content"))) for f in files),
+            "added": sum(f.get("old_content") is None for f in files),
+            "removed": sum(f.get("new_content") is None for f in files)}
+
+
+def pr_size_stats(rows: list[dict]) -> dict:
+    """Size of a set of PRs (``size_row`` each): files, changed lines, new-file
+    lines (what the reviewer reads), added / removed files, languages."""
+    if not rows:
+        return {"n": 0}
+    return {
+        "n": len(rows),
+        "by_language": _by(rows, lambda r: r["language"]),
+        "files_per_pr": _dist([r["files"] for r in rows]),
+        "changed_lines_per_pr": _dist([r["changed_lines"] for r in rows]),
+        "new_file_lines_per_pr": _dist([r["new_lines"] for r in rows]),
+        "files_added": sum(r["added"] for r in rows),
+        "files_removed": sum(r["removed"] for r in rows),
+        "repos": len({r["repo"] for r in rows}),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Cache side (reads data/osv_cache only; never the network).
 # ---------------------------------------------------------------------------
 
@@ -1078,6 +1369,208 @@ def write_jsonl(path: Path, items: list[dict]) -> None:
             fh.write(json.dumps(it, ensure_ascii=False) + "\n")
 
 
+def file_info(path: Path) -> dict:
+    """``{"items", "bytes", "sha256"}`` of a JSONL file, streamed."""
+    h = hashlib.sha256()
+    n = size = 0
+    with open(path, "rb") as fh:
+        for line in fh:
+            h.update(line)
+            size += len(line)
+            n += bool(line.strip())
+    return {"items": n, "bytes": size, "sha256": h.hexdigest()}
+
+
+def iter_jsonl(path: Path):
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip():
+                yield json.loads(line)
+
+
+VULN_KINDS = ("vuln_introducing", "vuln_fix")
+
+
+def build_v2(v1_dir: Path, real_commits: Path, split_path: Path, cache_dir: Path | None, *,
+             seed: int = 42, n_benign_dev: int = V2_BENIGN_DEV,
+             per_repo: int = V2_BENIGN_PER_REPO, max_files: int = MAX_FILES,
+             max_changed: int = MAX_CHANGED_LINES) -> tuple[dict[str, list[dict]], dict]:
+    """The v2 files from the BUILT v1 files (sha256-checked against their
+    manifest: v2 never rebuilds or rewrites v1) and the fetched real commits.
+
+    - ``pr_eval_v2_real_commits.jsonl``: every fetched commit, validated
+      (``real_commit_item``), ``source: real_commit``.
+    - ``pr_eval_v2_sample_dev.jsonl``: the v1 dev sample's 60 + 60 vuln items
+      (same ids and content, so runs compare; ``LABEL_OVERRIDES`` applied) plus
+      ``n_benign_dev`` dev real commits (``sample_real_commits`` with the
+      sampled vuln language mix, at most ``per_repo`` per repo). No bystanders.
+    - ``pr_eval_v2_test.jsonl``: every test vuln_introducing / vuln_fix item of
+      v1 plus every test real commit.
+
+    ``split_leak_check`` must pass on (dev sample, test file). Returns
+    ``(files, info)``; ``info`` goes into the v2 manifest."""
+    v1_manifest = json.loads((v1_dir / f"pr_eval_{VERSION}_manifest.json")
+                             .read_text(encoding="utf-8"))
+    full_name, sample_name = f"pr_eval_{VERSION}.jsonl", f"pr_eval_{VERSION}_sample_dev.jsonl"
+    inputs: dict[str, dict] = {}
+    for name in (full_name, sample_name):
+        got = file_info(v1_dir / name)
+        if got["sha256"] != v1_manifest["files"][name]["sha256"]:
+            raise ValueError(f"{name} does not match pr_eval_{VERSION}_manifest.json "
+                             "(rebuild v1 first: python scripts/build_pr_eval.py)")
+        inputs[name] = got
+    inputs[real_commits.name] = file_info(real_commits)
+    inputs[split_path.name] = {"sha256": hashlib.sha256(split_path.read_bytes()).hexdigest()}
+    side_of, _ = load_split(split_path, None)
+
+    # One pass over v1: repo sides, known commits, the test vuln items, bystander sizes.
+    sides: dict[str, set] = defaultdict(set)
+    known_commits: set[str] = set()
+    test_vuln: list[dict] = []
+    bystander_rows: list[dict] = []
+    for it in iter_jsonl(v1_dir / full_name):
+        for s in (it["split"], (it.get("meta") or {}).get("repo_side")):
+            if s in ("dev", "test"):
+                sides[it["repo"].lower()].add(s)
+        if (it.get("meta") or {}).get("commit"):
+            known_commits.add(it["meta"]["commit"])
+        if it["kind"] == "benign":
+            bystander_rows.append(size_row(it))
+        elif it["split"] == "test":
+            test_vuln.append(it)
+    bad = sorted(r for r, s in sides.items() if len(s) > 1)
+    if bad:
+        raise ValueError(f"v1 repos straddle dev and test: {bad[:5]}")
+    repo_side = {r: next(iter(s)) for r, s in sides.items()}
+    state = cache_dir / "processed_advisories.json" if cache_dir else None
+    if state is not None and state.exists():  # every commit the corpus builder mined
+        for entry in json.loads(state.read_text(encoding="utf-8")).values():
+            known_commits.update(p["commit"] for p in entry.get("pairs") or [])
+
+    sample = list(iter_jsonl(v1_dir / sample_name))
+    if [it["id"] for it in sample] != v1_manifest["sample_dev_ids"]:
+        raise ValueError(f"{sample_name} ids differ from the manifest's sample_dev_ids")
+    dev_vuln = [it for it in sample if it["kind"] in VULN_KINDS]
+    sample_bystanders = [size_row(it) for it in sample if it["kind"] == "benign"]
+    want_test = {i for k in VULN_KINDS for i in v1_manifest["ids"]["test"][k]}
+    if {it["id"] for it in test_vuln} != want_test:
+        raise ValueError("v1 test vuln items differ from the manifest's test ids")
+    overrides = sum(apply_label_override(it) for it in dev_vuln + test_vuln)
+
+    real = []
+    for raw in iter_jsonl(real_commits):
+        it = real_commit_item(raw, repo_side, max_files=max_files, max_changed=max_changed)
+        if it["meta"]["commit"] in known_commits:
+            raise ValueError(f"real commit {it['id']} is a known fix / eval commit")
+        real.append(it)
+    real.sort(key=lambda it: it["id"])
+    for key in ("id", "commit"):
+        vals = Counter(it["id"] if key == "id" else it["meta"]["commit"] for it in real)
+        dup = [v for v, c in vals.items() if c > 1]
+        if dup:
+            raise ValueError(f"duplicate real commit {key}s: {dup[:3]}")
+
+    mix = Counter(it["language"] for it in dev_vuln if it["kind"] == "vuln_introducing")
+    dev_pool = [it for it in real if it["split"] == "dev"]
+    dev_benign, cap = sample_real_commits(dev_pool, n_benign_dev, seed, dict(mix), per_repo)
+    dev = dev_vuln + dev_benign
+    test = test_vuln + [it for it in real if it["split"] == "test"]
+    leak = split_leak_check(dev, test, side_of, repo_side)
+    leaks = [it["id"] for it in dev + test + real
+             if LEAK_ID_RE.search(it["pr_title"] + "\n" + it["pr_body"])]
+    if leaks:
+        raise ValueError(f"advisory ids in PR text: {leaks[:5]}")
+
+    files = {f"pr_eval_{V2}_real_commits.jsonl": real,
+             f"pr_eval_{V2}_sample_dev.jsonl": dev,
+             f"pr_eval_{V2}_test.jsonl": test}
+    info = {
+        "inputs": inputs,
+        "label_overrides_applied_here": overrides,
+        "dev_benign": {"n": len(dev_benign), "language_mix_of": "sampled vuln_introducing",
+                       "vuln_language_mix": dict(sorted(mix.items())),
+                       "per_repo_cap": per_repo, "per_repo_cap_used": cap,
+                       "max_per_repo": max(Counter(it["repo"] for it in dev_benign).values(),
+                                           default=0),
+                       "pool": len(dev_pool)},
+        "leak_check": leak,
+        "sizes": {
+            "real_commit_all": pr_size_stats([size_row(it) for it in real]),
+            "real_commit_dev": pr_size_stats([size_row(it) for it in dev_pool]),
+            "real_commit_dev_sample": pr_size_stats([size_row(it) for it in dev_benign]),
+            "real_commit_test": pr_size_stats([size_row(it) for it in real
+                                               if it["split"] == "test"]),
+            "bystander_v1_all": pr_size_stats(bystander_rows),
+            "bystander_v1_sample_dev": pr_size_stats(sample_bystanders),
+        },
+    }
+    return files, info
+
+
+def main_v2(args, argv: list[str] | None) -> int:
+    files, info = build_v2(args.v1_dir, args.real_commits, args.split, args.cache_dir,
+                           seed=args.seed, n_benign_dev=args.v2_benign_dev,
+                           per_repo=args.v2_benign_per_repo, max_files=args.max_files,
+                           max_changed=args.max_changed_lines)
+    summaries = {name: counts(rows) for name, rows in files.items()}
+    print("=" * 78)
+    print(f"PR eval {V2}: real benign commits + run samples (from the built {VERSION} files)")
+    print("=" * 78)
+    for name, s in summaries.items():
+        print(f"{name}:")
+        for k in ("items", "by_kind", "by_kind_split", "by_kind_language", "by_source", "repos"):
+            print(f"  {k}: {json.dumps(s[k])}")
+    print(f"dev benign: {json.dumps(info['dev_benign'])}")
+    print(f"leak check: {json.dumps(info['leak_check'])}")
+    for k, v in info["sizes"].items():
+        print(f"size {k}: {json.dumps(v)}")
+    print("GitHub API calls made: 0 (offline)")
+    if args.check:
+        return 0
+    written = {}
+    for name, rows in files.items():
+        path = args.out_dir / name
+        write_jsonl(path, rows)
+        written[name] = file_info(path)
+        print(f"wrote {path} ({written[name]['bytes'] / 1e6:.1f} MB)")
+    manifest = {
+        "version": V2,
+        "built_with": " ".join(["python scripts/build_pr_eval.py",
+                                *(sys.argv[1:] if argv is None else argv)]),
+        "seed": args.seed, "max_files": args.max_files,
+        "max_changed_lines": args.max_changed_lines,
+        "provenance": {
+            "vuln_items": f"pr_eval_{VERSION}.jsonl / pr_eval_{VERSION}_sample_dev.jsonl "
+                          f"(sha256-checked against pr_eval_{VERSION}_manifest.json; "
+                          "LABEL_OVERRIDES applied)",
+            "real_commits": f"{args.real_commits.name}, fetched from the GitHub API by "
+                            "scripts/fetch_benign_commits.py (fetcher source label "
+                            "'benign_commit', relabelled 'real_commit'; raw label in "
+                            "meta.fetched_source; sha in meta.commit)",
+            "bystanders": f"not in v2 samples; they stay in pr_eval_{VERSION}*.jsonl",
+            "split": f"{_rel_root(args.split)} (repos take their v1 side)",
+        },
+        **info,
+        "files": written,
+        "counts": summaries,
+        "ids": {name: [it["id"] for it in rows] for name, rows in files.items()
+                if name != f"pr_eval_{V2}_real_commits.jsonl"},
+        "real_commit_ids": {s: [it["id"] for it in files[f"pr_eval_{V2}_real_commits.jsonl"]
+                                if it["split"] == s] for s in ("dev", "test")},
+    }
+    mpath = args.out_dir / f"pr_eval_{V2}_manifest.json"
+    mpath.write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
+    print(f"wrote {mpath}")
+    return 0
+
+
+def _rel_root(path: Path) -> str:
+    try:
+        return str(Path(path).resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
@@ -1098,7 +1591,22 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--sample-vuln", type=int, default=60)
     ap.add_argument("--sample-benign", type=int, default=80)
     ap.add_argument("--check", action="store_true", help="print the summary, write nothing")
+    v2 = ap.add_argument_group("v2 (real benign commits; reads the built v1 files, no cache)")
+    v2.add_argument("--v2", action="store_true",
+                    help="build the v2 files from the built v1 files + --real-commits "
+                         "(v1 is not rebuilt or rewritten)")
+    v2.add_argument("--v1-dir", type=Path, default=DEFAULT_OUT_DIR,
+                    help="where the built v1 files and their manifest are")
+    v2.add_argument("--real-commits", type=Path, default=DEFAULT_REAL_COMMITS,
+                    help="scripts/fetch_benign_commits.py output")
+    v2.add_argument("--v2-benign-dev", type=int, default=V2_BENIGN_DEV,
+                    help="real commits in the v2 dev sample")
+    v2.add_argument("--v2-benign-per-repo", type=int, default=V2_BENIGN_PER_REPO,
+                    help="at most this many dev-sample real commits per repo (raised only "
+                         "if the pool can't fill the sample)")
     args = ap.parse_args(argv)
+    if args.v2:
+        return main_v2(args, argv)
 
     items, stats = build_all(args.cache_dir, args.pairs, args.split, args.ordinary,
                              max_files=args.max_files, max_changed=args.max_changed_lines,

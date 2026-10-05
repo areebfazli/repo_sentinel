@@ -25,10 +25,13 @@ from scripts.build_pr_eval import (  # noqa: E402
     LABEL_OVERRIDES,
     LEAK_ID_RE,
     MISLEADING_TITLE,
+    REAL_COMMIT_SOURCE,
     PatchError,
+    apply_label_override,
     apply_patch,
     build_all,
     build_bystander_item,
+    build_v2,
     build_vuln_items,
     file_entry,
     label_override,
@@ -36,12 +39,15 @@ from scripts.build_pr_eval import (  # noqa: E402
     make_misleading,
     neutral_pr_text,
     patch_line_numbers,
+    real_commit_item,
     reconstruct,
     reverse_entry,
     sample_category,
     sample_dev,
+    sample_real_commits,
     select_files,
     split_for_ids,
+    split_leak_check,
     split_lines,
     straddling,
     unified_diff,
@@ -520,3 +526,225 @@ def test_build_all_end_to_end(tmp_path, monkeypatch):
                                              "vuln_introducing": 1}
     digest = hashlib.sha256((out / "pr_eval_v1.jsonl").read_bytes()).hexdigest()
     assert manifest["files"]["pr_eval_v1.jsonl"]["sha256"] == digest
+
+
+# ---------------------------------------------------------------------------
+# v2: real benign commits, run samples, leak check (offline fixtures)
+# ---------------------------------------------------------------------------
+
+
+def _raw_commit(repo, sha, split="dev", files=None, lang="python"):
+    """A fetched item exactly as scripts/fetch_benign_commits.py writes it."""
+    from scripts.fetch_benign_commits import build_benign_item
+
+    ext = ".py" if lang == "python" else ".js"
+    entries = files or [file_entry(f"src/mod{ext}", "a = 1\nb = 2\n", "a = 1\nb = 3\n")]
+    commit = {"sha": sha, "parents": [{"sha": "f" * 40}],
+              "commit": {"committer": {"date": "2026-10-01T00:00:00Z"}}, "files": []}
+    return build_benign_item(repo, commit, entries, split)
+
+
+def test_real_commit_item_validates_and_relabels():
+    raw = _raw_commit("o/a", "1" * 40)
+    assert raw["source"] == "benign_commit"
+    it = real_commit_item(raw, {"o/a": "dev"})
+    assert it["source"] == REAL_COMMIT_SOURCE and it["id"] == raw["id"]
+    assert it["meta"]["fetched_source"] == "benign_commit"
+    assert it["meta"]["repo_side"] == "dev" and it["meta"]["commit"] == "1" * 40
+    assert it["meta"]["changed_lines"] == 2 and it["files"] == raw["files"]
+    assert raw["source"] == "benign_commit"  # the input is not modified
+    assert real_commit_item(it, {"o/a": "dev"})["source"] == REAL_COMMIT_SOURCE  # idempotent
+
+    def rejects(mutate, sides=None):
+        bad = json.loads(json.dumps(raw))
+        mutate(bad)
+        with pytest.raises(ValueError):
+            real_commit_item(bad, sides or {"o/a": "dev"}, max_files=2, max_changed=50)
+
+    with pytest.raises(ValueError):  # its repo is on the test side
+        real_commit_item(raw, {"o/a": "test"})
+    with pytest.raises(ValueError):  # repo not in v1 at all
+        real_commit_item(raw, {})
+    rejects(lambda b: b.update(kind="vuln_fix"))
+    rejects(lambda b: b.update(source="bystander"))
+    rejects(lambda b: b["meta"].update(commit="abc"))
+    rejects(lambda b: b.update(cwe="CWE-79"))
+    rejects(lambda b: b.update(pr_title="Fix XSS in mod.py"))  # not the neutral text
+    rejects(lambda b: b["files"][0].update(new_content="a = 1\nb = 4\n"))  # patch mismatch
+    rejects(lambda b: b["files"][0].update(path="tests/test_mod.py"))
+    rejects(lambda b: b["files"].extend([b["files"][0]] * 2))  # over max_files
+    big = _raw_commit("o/a", "2" * 40, files=[file_entry("src/big.py", None, "x = 1\n" * 60)])
+    with pytest.raises(ValueError):
+        real_commit_item(big, {"o/a": "dev"}, max_changed=50)
+
+
+def _real(i, repo, lang="python", split="dev"):
+    return {"id": f"pr_benign_{i:03d}", "repo": repo, "language": lang, "split": split}
+
+
+def test_sample_real_commits_spreads_repos_and_languages():
+    pool = [_real(i, f"o/py{i % 20}") for i in range(60)]                    # 20 py repos x 3
+    pool += [_real(100 + i, f"o/js{i % 4}", "javascript") for i in range(12)]  # 4 js repos x 3
+    got, cap = sample_real_commits(pool, 30, 42, {"python": 4, "javascript": 1})
+    assert cap == 2 and len(got) == 30
+    langs = Counter(i["language"] for i in got)
+    assert langs == {"python": 24, "javascript": 6}
+    per = Counter(i["repo"] for i in got)
+    assert max(per.values()) <= 2
+    assert all(per[f"o/py{k}"] >= 1 for k in range(20))  # every repo before a second one
+    assert [i["id"] for i in got] == sorted(i["id"] for i in got)
+    again, _ = sample_real_commits(list(reversed(pool)), 30, 42, {"python": 4, "javascript": 1})
+    assert again == got
+    assert sample_real_commits(pool, 30, 7, {"python": 4, "javascript": 1})[0] != got
+    # js is short of its quota at 2/repo (4 repos -> 8): python fills the rest.
+    short, _ = sample_real_commits(pool, 30, 42, {"python": 1, "javascript": 1})
+    assert Counter(i["language"] for i in short) == {"python": 22, "javascript": 8}
+    # The pool can't fill 50 at 2/repo (24 repos -> 48): the cap is raised to 3.
+    many, cap = sample_real_commits(pool, 50, 42)
+    assert len(many) == 50 and cap == 3
+
+
+def test_apply_label_override_is_idempotent():
+    it = {"id": "x", "cwe": "CWE-400", "category": "redos",
+          "meta": {"osv_ids": ["GHSA-5pxj-mhwj-x5gv"]}}
+    assert apply_label_override(it) is True
+    assert (it["cwe"], it["category"]) == ("CWE-1321", "prototype_pollution")
+    assert it["meta"]["label_override"]["from"] == {"cwe": "CWE-400", "category": "redos"}
+    assert apply_label_override(it) is False and it["cwe"] == "CWE-1321"
+    plain = {"id": "y", "cwe": "CWE-79", "category": "xss", "meta": {"osv_ids": ["GHSA-x"]}}
+    assert apply_label_override(plain) is False and plain["cwe"] == "CWE-79"
+    with pytest.raises(ValueError):  # claims an override that disagrees with the table
+        apply_label_override({**it, "cwe": "CWE-79"})
+
+
+def _vuln(base, kind, repo, split, adv, commit):
+    return {"id": f"{base}_{'intro' if kind == 'vuln_introducing' else 'fix'}", "kind": kind,
+            "language": "python", "repo": repo, "split": split, "advisory_id": adv,
+            "cve_id": adv, "category": "xss", "cwe": "CWE-79",
+            "meta": {"commit": commit, "osv_ids": [], "pair_base": base,
+                     "eval_pair_ids": [f"{adv}_f_00000000"]}}
+
+
+def test_split_leak_check_passes_and_catches_leaks():
+    side_of = {"CVE-1_f_00000000_vuln": "dev", "CVE-1_f_00000000_safe": "dev",
+               "CVE-2_f_00000000_vuln": "test", "CVE-2_f_00000000_safe": "test"}
+    repo_side = {"o/d": "dev", "o/t": "test", "o/d2": "dev"}
+    dev = [_vuln("pr_1", k, "o/d", "dev", "CVE-1", "c1") for k in
+           ("vuln_introducing", "vuln_fix")] + [
+        {**_real(1, "o/d2"), "kind": "benign", "advisory_id": None, "cve_id": None,
+         "meta": {"commit": "c3"}}]
+    test = [_vuln("pr_2", k, "o/t", "test", "CVE-2", "c2") for k in
+            ("vuln_introducing", "vuln_fix")]
+    out = split_leak_check(dev, test, side_of, repo_side)
+    assert out["ok"] and out["shared_repos"] == 0 and out["dev_repos"] == 2
+
+    def leaks(dev_items, test_items=test):
+        with pytest.raises(ValueError, match="dev/test leak"):
+            split_leak_check(dev_items, test_items, side_of, repo_side)
+
+    leaks(dev + [{**test[0], "split": "dev"}])                      # a test repo in dev
+    leaks(dev + [test[0]])                                          # a test item in dev
+    leaks([{**dev[0], "meta": {**dev[0]["meta"], "eval_pair_ids": ["CVE-2_f_00000000"]}}])
+    leaks([{**dev[2], "repo": "o/t"}])                              # real commit, test repo
+    leaks(dev, test + [{**dev[2], "split": "test", "repo": "o/t", "meta": {"commit": "c3"}}])
+
+
+def _v1_dir(tmp_path):
+    """A tiny built v1: one dev pair, one test pair, one bystander, the dev
+    sample and a manifest pinning them."""
+    d = tmp_path / "v1"
+    d.mkdir()
+    pair = lambda base, repo, split, adv, commit: [  # noqa: E731
+        {**_vuln(base, k, repo, split, adv, commit),
+         "files": [file_entry("src/v.py", "a\n", "b\n") and
+                   {k2: v for k2, v in file_entry("src/v.py", "a\n", "b\n").items()
+                    if not k2.startswith("_")}],
+         "pr_title": "Update src/v.py", "pr_body": "Changes:\n- src/v.py",
+         "target": {"path": "src/v.py", "vuln_lines_new": [1], "changed_lines_new": [1]},
+         "source": "reversed_fix" if k == "vuln_introducing" else "real_fix", "notes": ""}
+        for k in ("vuln_introducing", "vuln_fix")]
+    dev_pair = pair("pr_CVE-1_d_c1", "o/d", "dev", "CVE-1", "c" * 40)
+    test_pair = pair("pr_CVE-2_t_c2", "o/t", "test", "CVE-2", "d" * 40)
+    for it in dev_pair + test_pair:
+        it["meta"]["changed_lines"], it["meta"]["truncated"] = 2, False
+        it["meta"]["vuln_lines_mode"] = "deleted_or_modified"
+    by = {"id": "pr_bystander_o_d_eeeeeeeeee", "kind": "benign", "language": "python",
+          "repo": "o/d", "split": "dev", "advisory_id": None, "cve_id": None,
+          "category": None, "cwe": None, "pr_title": "Update src/u.py",
+          "pr_body": "Changes:\n- src/u.py",
+          "files": [{k: v for k, v in file_entry("src/u.py", "x\n", "y\n").items()
+                     if not k.startswith("_")}],
+          "target": {"path": None, "vuln_lines_new": [], "changed_lines_new": []},
+          "source": "bystander", "notes": "",
+          "meta": {"commit": "e" * 40, "bystander_of": "eval_fix_commit",
+                   "changed_lines": 2, "truncated": False, "repo_side": "dev"}}
+    full = sorted(dev_pair + test_pair + [by], key=lambda it: it["id"])
+    sample = dev_pair + [by]
+    names = {"pr_eval_v1.jsonl": full, "pr_eval_v1_sample_dev.jsonl": sample}
+    for name, rows in names.items():
+        (d / name).write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    manifest = {
+        "files": {n: {"sha256": hashlib.sha256((d / n).read_bytes()).hexdigest()}
+                  for n in names},
+        "sample_dev_ids": [it["id"] for it in sample],
+        "ids": {"test": {"vuln_introducing": [test_pair[0]["id"]],
+                         "vuln_fix": [test_pair[1]["id"]], "benign": []}},
+    }
+    (d / "pr_eval_v1_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    split = tmp_path / "split.json"
+    split.write_text(json.dumps({
+        "dev": {"ids": ["CVE-1_f_00000000_vuln", "CVE-1_f_00000000_safe"]},
+        "test": {"ids": ["CVE-2_f_00000000_vuln", "CVE-2_f_00000000_safe"]}}),
+        encoding="utf-8")
+    return d, split
+
+
+def test_build_v2_end_to_end(tmp_path):
+    v1, split = _v1_dir(tmp_path)
+    before = {p.name: p.read_bytes() for p in v1.iterdir()}
+    raws = [_raw_commit("o/d", "1" * 40), _raw_commit("o/d", "2" * 40),
+            _raw_commit("o/d", "3" * 40, lang="javascript"),
+            _raw_commit("o/t", "4" * 40, split="test")]
+    real = tmp_path / "benign_commits.jsonl"
+    real.write_text("".join(json.dumps(r) + "\n" for r in raws), encoding="utf-8")
+    out = tmp_path / "out"
+    argv = ["--v2", "--v1-dir", str(v1), "--real-commits", str(real), "--split", str(split),
+            "--cache-dir", str(tmp_path / "no_cache"), "--out-dir", str(out),
+            "--v2-benign-dev", "2"]
+    assert main(argv) == 0
+    read = lambda n: [json.loads(x) for x in (out / n).read_text().splitlines()]  # noqa: E731
+    dev, test = read("pr_eval_v2_sample_dev.jsonl"), read("pr_eval_v2_test.jsonl")
+    assert [i["id"] for i in dev[:2]] == ["pr_CVE-1_d_c1_intro", "pr_CVE-1_d_c1_fix"]
+    assert Counter(i["source"] for i in dev) == {"reversed_fix": 1, "real_fix": 1,
+                                                 "real_commit": 2}
+    assert not any(i["source"] == "bystander" for i in dev)
+    assert max(Counter(i["repo"] for i in dev if i["kind"] == "benign").values()) <= 2
+    assert Counter(i["source"] for i in test) == {"reversed_fix": 1, "real_fix": 1,
+                                                  "real_commit": 1}
+    assert all(i["split"] == "test" for i in test) and all(i["split"] == "dev" for i in dev)
+    assert len(read("pr_eval_v2_real_commits.jsonl")) == 4
+    manifest = json.loads((out / "pr_eval_v2_manifest.json").read_text())
+    for name in ("pr_eval_v2_sample_dev.jsonl", "pr_eval_v2_test.jsonl",
+                 "pr_eval_v2_real_commits.jsonl"):
+        digest = hashlib.sha256((out / name).read_bytes()).hexdigest()
+        assert manifest["files"][name]["sha256"] == digest
+    assert manifest["leak_check"]["ok"] and manifest["leak_check"]["shared_repos"] == 0
+    assert manifest["counts"]["pr_eval_v2_test.jsonl"]["by_kind"] == {
+        "benign": 1, "vuln_fix": 1, "vuln_introducing": 1}
+    assert manifest["inputs"]["benign_commits.jsonl"]["items"] == 4
+    assert {p.name: p.read_bytes() for p in v1.iterdir()} == before  # v1 untouched
+    first = (out / "pr_eval_v2_sample_dev.jsonl").read_bytes()
+    assert main(argv) == 0 and (out / "pr_eval_v2_sample_dev.jsonl").read_bytes() == first
+
+    # A v1 file that no longer matches its manifest is refused.
+    (v1 / "pr_eval_v1_sample_dev.jsonl").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="manifest"):
+        main(argv)
+
+
+def test_build_v2_refuses_a_known_fix_commit(tmp_path):
+    v1, split = _v1_dir(tmp_path)
+    real = tmp_path / "benign_commits.jsonl"
+    real.write_text(json.dumps(_raw_commit("o/d", "c" * 40)) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="known fix"):
+        build_v2(v1, real, split, None, n_benign_dev=1)

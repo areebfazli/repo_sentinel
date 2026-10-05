@@ -1017,3 +1017,58 @@ def test_compare_replays_the_tier_view_of_a_run_recorded_before_it(tmp_path):
     other.write_text(json.dumps(intro_item()) + "\n")
     with pytest.raises(SystemExit, match="no verified_plus_review view"):
         R.main([*args, "--dataset", str(other)])
+
+
+# --- test-split guard on the selected items, benign provenance by source ---------------
+
+
+def test_test_split_items_need_the_explicit_flag(tmp_path):
+    test_benign = {**benign_item("pr_benign_t"), "split": "test", "source": "real_commit"}
+    dev_benign = {**benign_item("pr_benign_d"), "source": "real_commit"}
+    ds = str(_write_jsonl(tmp_path / "test.jsonl", [intro_item(), test_benign]))
+    with pytest.raises(SystemExit, match="held-out test split"):  # no --split at all
+        R.select_items(R.parse_args(["--dataset", ds, "--dry-run"]))
+    items, meta = R.select_items(R.parse_args(["--dataset", ds, "--split", "test",
+                                               R.TEST_SPLIT_FLAG, "--dry-run"]))
+    assert [i["id"] for i in items] == ["pr_benign_t"]
+    assert meta["benign_by_source"] == {"real_commit": 1}
+    items, _ = R.select_items(R.parse_args(["--dataset", ds, "--split", "dev", "--dry-run"]))
+    assert [i["id"] for i in items] == ["pr_A_intro"]
+    dev = str(_write_jsonl(tmp_path / "dev.jsonl", [intro_item(), fix_item(), dev_benign]))
+    items, meta = R.select_items(R.parse_args(["--dataset", dev, "--dry-run"]))  # no flag
+    assert len(items) == 3 and meta["benign_by_source"] == {"real_commit": 1}
+
+
+def test_benign_metrics_by_source_real_commits_vs_bystanders():
+    assert R.benign_source("benign_commit") == R.benign_source("real_commit") == "real_commit"
+    assert R.benign_source("bystander") == "bystander" and R.benign_source(None) == "unknown"
+    hit = [_f("app/util.py", 2)]
+    by_items = [{**benign_item(f"pr_bystander_{k}"), "source": "bystander",
+                 "meta": {"commit": f"b{k}", "bystander_of": "other_fix_commit"}}
+                for k in range(2)]
+    real_items = [{**benign_item(f"pr_benign_{k}"),
+                   "source": "benign_commit" if k == 0 else "real_commit",
+                   "meta": {"commit": f"r{k}"}} for k in range(4)]
+    items = [intro_item("pr_A_intro", "pr_A"), *by_items, *real_items]
+    flagged = {"pr_bystander_0", "pr_benign_0"}
+    recs = [_scored_rec(it, {"verified": [_f("app/files.py", 7)] if it["kind"] != "benign"
+                             else hit if it["id"] in flagged else []}) for it in items]
+    facts = R.selection_facts(items)
+    for r in recs:
+        r["facts"] = facts[r["id"]]
+    intro, real = recs[0], recs[3:]
+    R.attach_outcomes(recs, 2)
+    m = R.view_metrics(recs, "verified")
+    rows = m["benign_by_source"]
+    assert set(rows) == {"bystander", "real_commit"}
+    assert (rows["real_commit"]["fpr"]["k"], rows["real_commit"]["fpr"]["n"]) == (1, 4)
+    assert (rows["bystander"]["fpr"]["k"], rows["bystander"]["fpr"]["n"]) == (1, 2)
+    assert rows["real_commit"]["precision_at_base_rate"]["0.01"] == pytest.approx(
+        0.01 / (0.01 + 0.25 * 0.99), abs=1e-4)
+    assert rows["real_commit"]["fpr_upper95_exact"] > 0.25
+    bp = m["benign_provenance"]
+    assert bp["by_source"] == {"bystander": 2, "real_commit": 4}
+    assert bp["by_bystander_of"] == {"other_fix_commit": 2}  # bystanders only
+    clean = R.view_metrics([intro, *real[1:]], "verified")["benign_by_source"]["real_commit"]
+    assert clean["fpr"]["k"] == 0 and clean["precision_at_base_rate"] is None
+    R.print_view("v", m)  # prints the per-source rows without error

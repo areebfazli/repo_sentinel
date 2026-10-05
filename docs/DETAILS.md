@@ -23,6 +23,7 @@ root. Plans and dated results live in [ROADMAP.md](../ROADMAP.md).
   - [Ordinary-function negatives](#ordinary-function-negatives)
   - [Dev/test split and static-first candidate recall](#devtest-split-and-static-first-candidate-recall)
   - [PR-shaped eval (`pr_eval_v1`)](#pr-shaped-eval-pr_eval_v1)
+  - [PR-shaped eval v2 (real benign commits)](#pr-shaped-eval-v2-real-benign-commits)
 
 ---
 
@@ -570,7 +571,10 @@ sensitivity view and the bounds. The wall-clock budget is disabled in the eval.
 `--llm-model` / `--llm-upstream` / `--verifier-model` pin models; `--llm-temperature T`
 forces a temperature (default: each model's `LLM_SAMPLING`, as production sends; the cache
 key carries the sampling sent, so `--llm-temperature 0` replays temperature-0 entries); `--split dev|test` (test needs `--i-know-this-is-the-test-set`);
-`--sample-kinds vulnerable=N,fix=N,benign=N --seed S` keeps pairs together.
+`--sample-kinds vulnerable=N,fix=N,benign=N --seed S` keeps pairs together. A selection
+holding any test-split item (e.g. `pr_eval_v2_test.jsonl`) is refused without `--split test
+--i-know-this-is-the-test-set`. Benign FPR is also reported per provenance
+(`benign_by_source`: `real_commit` vs `bystander`, see the v2 dataset below).
 
 Semgrep leads are precomputed once (one engine run over every file of the selection, all
 severities) and served from the cache by a stub scanner; without `--semgrep-cache` there are
@@ -832,3 +836,39 @@ python scripts/build_pr_eval.py --check    # summary only
   python scripts/fetch_benign_commits.py --dry-run --max-commits 300 --per-repo 3
   python scripts/fetch_benign_commits.py --max-commits 300 --per-repo 3 --wait-on-rate-limit
   ```
+
+### PR-shaped eval v2 (real benign commits)
+
+The fetch kept 300 real commits (dev 203 from 80 repos, test 97 from 40; Python 231,
+JavaScript 69). `python scripts/build_pr_eval.py --v2` (offline, a few seconds) turns them
+into eval items and the next run samples. It reads the built v1 files after checking their
+sha256 against the v1 manifest, and never rebuilds or rewrites v1.
+
+- `pr_eval_v2_real_commits.jsonl`: all 300 commits, validated like the builder's own items
+  (each patch is the difflib diff of the stored old/new contents, ≤ 6 files and ≤ 2,000
+  changed lines, neutral PR text, split equal to the repo's v1 side, not a mined fix or eval
+  commit). `source: real_commit`; the fetcher's label stays in `meta.fetched_source`, the
+  commit sha in `meta.commit`. Real commits are kept apart from the v1 `bystander` benigns.
+- `pr_eval_v2_sample_dev.jsonl` (240): the v1 dev sample's 60 `vuln_introducing` + 60
+  `vuln_fix` items (same ids and content as v1, so runs compare; label overrides applied)
+  plus 120 dev real commits. Their language mix follows the sampled vulnerable items (96
+  Python / 24 JavaScript). Repos are taken round-robin, at most 2 per repo, which covers all
+  80 dev repos. There are no bystanders.
+- `pr_eval_v2_test.jsonl` (217): all 60 + 60 test vuln items and all 97 test real commits.
+- `pr_eval_v2_manifest.json` (committed): input and output sha256s, counts, ids, the leak
+  check and size stats. The build fails if any item, repo, advisory, commit or eval-pair id
+  would cross dev/test. It checks every item against its file's split, every repo against
+  its v1 side and every vuln item's eval-pair ids against `splits/v1.json`. Result: 0 shared
+  repos, advisories, commits or ids.
+- **Size.** Real commits are smaller changes than bystanders: 1.5 files per PR vs 2.2, median
+  8 changed lines vs 22 (p90 72 vs 157). The files they touch are as large (median 546 vs 645
+  new-file lines, with a longer tail up to 34.5K), so prompt sizes are similar.
+- **Running.** `run_pr_eval` reports benign FPR per provenance (`benign_by_source`:
+  `real_commit` vs `bystander`, each with its exact 95 % upper bound and precision at the
+  base rates; the real-commit row is the realistic one). Any selection holding a test-split
+  item, such as `pr_eval_v2_test.jsonl`, needs `--split test --i-know-this-is-the-test-set`,
+  in every mode. The v2 dev sample runs without it.
+- **Dry run** (`--arm pr`, current defaults incl. 12K prompts, no Semgrep cache yet): dev
+  sample 296 / 680 / 2,677 requests (floor / scenario / ceiling), 2.3M / 5.7M / 32M tokens;
+  test file 257 / 588 / 2,417 requests, 2.0M / 5.2M / 29M tokens. No dev PR and one test PR
+  (a real commit touching a 23.6K-line Ghost file) come out pipeline-partial.

@@ -82,8 +82,11 @@ not-run items are reported separately (below), never silently dropped.
   added lines in ``target.path`` (``target.changed_lines_new``), and the same
   two looser levels (on a fix anchor / in a fixed function).
 - ``benign``: FP (alert) iff any kept finding; findings per PR; FPR on all
-  benign PRs and on those sharing no commit with a vuln item of the selection
-  (provenance: every benign PR is a bystander of a security-fix commit).
+  benign PRs and on those sharing no commit with a vuln item of the selection.
+  Per provenance (``benign_by_source``): ``real_commit`` (ordinary commits of
+  the same repos, ``scripts/fetch_benign_commits.py``: the realistic benign
+  base rate, with its own exact upper bound and precision at the base rates)
+  vs ``bystander`` (files of a security-fix commit; v1 only).
 - Coverage per kind (scored / errored with a partial result / errored with no
   result / not run); a sensitivity view adding the errored items' partial
   results; bounds over all items with every unknown outcome either way.
@@ -113,6 +116,11 @@ guard_diff evidence only, labelled as such: its verifier prompt had no
 verifier-loss counts instead of a degenerate McNemar), and ``--dry-run`` (every prompt
 built with a stub router, no network: calls and estimated tokens per PR, run
 totals, pacing time and budget cut-offs).
+
+Test-split guard: a selection holding ANY ``split: test`` item (e.g.
+``pr_eval_v2_test.jsonl``, or ``pr_eval_v1.jsonl`` without ``--split dev``) is
+refused unless ``--split test --i-know-this-is-the-test-set`` is given, in
+every mode that selects items (live, dry run, Semgrep precompute).
 
     python -m ml.evaluation.run_pr_eval --dry-run --arm pr
     python -m ml.evaluation.run_pr_eval --semgrep-precompute \\
@@ -221,6 +229,7 @@ KIND_ALIASES = {
     "benign": KIND_BENIGN,
 }
 SPLITS = ("dev", "test")
+SOURCE_BYSTANDER, SOURCE_REAL_COMMIT = "bystander", "real_commit"
 MISLEADING_SUFFIX = "_misleading"
 DEFAULT_LOCALISE_TOLERANCE = 2
 # Real calls per run: the dev sample needs ~500-900 (see --dry-run); OpenRouter's
@@ -266,6 +275,14 @@ def pair_key(item: dict) -> str:
         if bid.endswith(suffix):
             return bid[: -len(suffix)]
     return bid
+
+
+def benign_source(source: str | None) -> str:
+    """A benign item's provenance: ``bystander`` (files of a security-fix
+    commit), ``real_commit`` (an ordinary commit fetched by
+    ``scripts/fetch_benign_commits.py``; its raw label ``benign_commit`` is
+    the same thing) or the source as given."""
+    return {"benign_commit": SOURCE_REAL_COMMIT}.get(source or "", source or "unknown")
 
 
 def _as_paths(value) -> list[Path]:
@@ -370,6 +387,11 @@ def select_items(args) -> tuple[list[dict], dict]:
     """Load, split-filter, sample and (pr_misleading) swap in the variants.
     Returns (items, selection meta)."""
     items = load_items(args.dataset, split=args.split)
+    n_test = sum(1 for i in items if i.get("split") == "test")
+    if n_test and not getattr(args, "allow_test_split", False):
+        raise SystemExit(f"{n_test} selected item(s) are from the held-out test split: pass "
+                         f"--split test {TEST_SPLIT_FLAG} only for the final, pre-registered "
+                         "run (or --split dev to drop them).")
     meta: dict = {"datasets": [_rel(p) for p in _as_paths(args.dataset)], "split": args.split,
                   "n_loaded": len(items)}
     if args.sample_kinds is not None:
@@ -381,6 +403,8 @@ def select_items(args) -> tuple[list[dict], dict]:
                     n_without_misleading_variant=len(missing))
     meta["n_items"] = len(items)
     meta["by_kind"] = dict(Counter(i["kind"] for i in items))
+    meta["benign_by_source"] = dict(Counter(benign_source(i.get("source"))
+                                            for i in items if i["kind"] == KIND_BENIGN))
     return items, meta
 
 
@@ -1082,13 +1106,40 @@ def benign_provenance_metrics(recs: list[dict], view: str) -> dict | None:
         "fpr_no_shared_commit_upper95_exact": fpr_upper95_exact(fpr_clean["k"],
                                                                 fpr_clean["n"]),
         "n": len(benign),
-        "by_bystander_of": dict(Counter(str(p["bystander_of"]) for p in provs)),
+        "by_source": dict(Counter(benign_source(p.get("source")) for p in provs)),
+        "by_bystander_of": dict(Counter(str(p["bystander_of"]) for p in provs
+                                        if benign_source(p.get("source")) == SOURCE_BYSTANDER)),
         "shares_commit_with_intro": sum(p["shares_commit_with_intro"] for p in provs),
         "shares_commit_with_fix": sum(p["shares_commit_with_fix"] for p in provs),
         "shares_commit_with_any_vuln_item": sum(bool(p["shares_commit_with"]) for p in provs),
         "identical_subset_of_fix_files": sum(p["identical_subset_of_fix_files"] for p in provs),
         "no_shared_commit": len(clean),
     }
+
+
+def benign_by_source(recs: list[dict], view: str, tpr: float | None,
+                     base_rates=BASE_RATES) -> dict:
+    """Benign FPR per provenance (``benign_source``: ``real_commit`` vs
+    ``bystander``), each with its exact 95% upper bound and precision at the
+    base rates (localised TPR ``tpr``; no point estimate at 0 FPs). The
+    ``real_commit`` row is the realistic benign base rate; bystanders come from
+    security-fix commits."""
+    out = {}
+    benign = [r for r in recs if r["kind"] == KIND_BENIGN]
+    for src in sorted({benign_source(r.get("source")) for r in benign}):
+        sub = [r for r in benign if benign_source(r.get("source")) == src]
+        fpr = _rate_of(sub, view, KIND_BENIGN, "fp")
+        upper = fpr_upper95_exact(fpr["k"], fpr["n"])
+        out[src] = {
+            "fpr": fpr, "fpr_upper95_exact": upper,
+            "findings_per_pr": _mean([r["outcomes"][view]["n_findings"] for r in sub]),
+            "precision_at_base_rate": None if not fpr["k"] else {
+                str(pi): precision_at_observed_fpr(tpr, fpr["k"], fpr["n"], pi)
+                for pi in base_rates},
+            "precision_at_base_rate_fpr_upper95": {
+                str(pi): precision_at_base_rate(tpr, upper, pi) for pi in base_rates},
+        }
+    return out
 
 
 def view_metrics(records: list[dict], view: str, base_rates=BASE_RATES) -> dict:
@@ -1163,6 +1214,7 @@ def view_metrics(records: list[dict], view: str, base_rates=BASE_RATES) -> dict:
         "in_scope": scope_metrics(recs, view),
         "leaky_split": leaky_split(recs, view),
         "benign_provenance": benign_provenance_metrics(recs, view),
+        "benign_by_source": benign_by_source(recs, view, tpr["rate"], base_rates),
         "by_category": breakdown("category"),
         "by_language": breakdown("language"),
     }
@@ -1507,9 +1559,16 @@ def print_view(title: str, m: dict) -> None:
             row = lk[key]
             print(f"    {label:<16} leaky {_frac(row['leaky'])}, not leaky "
                   f"{_frac(row['not_leaky'])}; exact Fisher p = {row['p_fisher_exact']:.3g}")
+    for src, row in (m.get("benign_by_source") or {}).items():
+        point = row["precision_at_base_rate"] or "n/a (0 FPs)"
+        print(f"  benign PRs [{src}], alert rate        {_fmt_rate(row['fpr'])}  (findings/PR "
+              f"{row['findings_per_pr']}; exact 95% upper {row['fpr_upper95_exact']}); "
+              f"precision @ base rate point {point}, FPR at upper "
+              f"{row['precision_at_base_rate_fpr_upper95']}")
     bp = m["benign_provenance"]
     if bp:
-        print(f"  benign provenance: {bp['n']} bystanders {bp['by_bystander_of']}; share a "
+        print(f"  benign provenance: {bp['n']} benign {bp.get('by_source')} (bystanders "
+              f"{bp['by_bystander_of']}); share a "
               f"commit with an intro item {bp['shares_commit_with_intro']}, with a fix item "
               f"{bp['shares_commit_with_fix']}; identical subset of the fix item's files "
               f"{bp['identical_subset_of_fix_files']}; no shared commit {bp['no_shared_commit']}")
@@ -2315,8 +2374,8 @@ def run_dry(args) -> dict:
     items, meta = select_items(args)
     semgrep_cache, semgrep_meta = _load_semgrep(args, items)
     config = pr_review_config()
-    print(f"Dry run ({args.arm}): {len(items)} items {meta['by_kind']}; no network.",
-          flush=True)
+    print(f"Dry run ({args.arm}): {len(items)} items {meta['by_kind']}, benign by source "
+          f"{meta['benign_by_source']}; no network.", flush=True)
     records = dry_run_all(items, args.arm, semgrep_cache=semgrep_cache,
                           keep_prompts=args.arm == "pr_misleading", workers=args.workers)
     summary = summarize_dry_run(records, args.arm, config,
@@ -2403,7 +2462,8 @@ def run_real(args) -> dict:
     routing = config["openrouter_provider_routing"]
     temp = ("model default" if args.llm_temperature is None
             else f"forced {args.llm_temperature:g}")
-    print(f"PR eval ({args.arm}): {len(items)} items {meta['by_kind']}; model "
+    print(f"PR eval ({args.arm}): {len(items)} items {meta['by_kind']}, benign by source "
+          f"{meta['benign_by_source']}; model "
           f"{config['model']}, verifier {config['verifier_model'] or 'same'}, sampling "
           f"{temp} {config['sampling']}, repeat {args.llm_repeat_index}; max "
           f"{args.llm_max_calls} real calls; cache "

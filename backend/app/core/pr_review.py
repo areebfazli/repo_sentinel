@@ -835,15 +835,16 @@ def parse_verdict(data) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# "Worth a look": a removed security control the verifier could not confirm
+# "Worth a look": deleted control-like code the verifier could not confirm
 # ---------------------------------------------------------------------------
 #
 # The verifier prompt answers "uncertain" when the change removes an existing
 # security control but the external attack path isn't visible (THREAT MODEL
 # rule 2). Only confirmed >= min_confidence is a finding; such a candidate is
-# instead a non-blocking "review suggestion" when deterministic evidence shows
-# the change really removed a control at that spot. Never counted as a finding,
-# never in is_vulnerable or any gate.
+# instead a non-blocking "review suggestion" when deterministic checks show the
+# change deleted code that looks like a control at that spot (deleted lines,
+# recognised as a control, not found elsewhere in the new code). Never counted
+# as a finding, never in is_vulnerable or any gate.
 
 REMOVED_CONTROL_WINDOW = QUOTE_WINDOW  # old-file lines around the candidate
 MAX_REMOVED_CONTROL_LINES = 6
@@ -1022,8 +1023,9 @@ def validate_removed_control(bundle: PRBundle, cand: dict, quote: str | None) ->
 
 def removed_control_evidence(bundle: PRBundle, guard: dict, cand: dict,
                              verdict: dict) -> list[dict]:
-    """Deterministic evidence that the change removed a security control at
-    the candidate's spot: the verifier's validated quote, then guard_diff."""
+    """Deterministic evidence that the change deleted code that looks like a
+    security control at the candidate's spot: the verifier's validated quote,
+    then guard_diff."""
     out = []
     quoted = validate_removed_control(bundle, cand, verdict.get("removed_control_quote"))
     if quoted:
@@ -1405,8 +1407,8 @@ def pr_notes(outcome: dict) -> list[str]:
         f"finding(s): {s['confirmed']} reported (confirmed by an independent verifier with "
         f"confidence >= {cfg.min_confidence}), {s['rejected']} rejected by the verifier, "
         f"{s['uncertain'] + s['below_min_confidence']} uncertain or confirmed below the "
-        f"confidence cutoff, {s.get('review_suggested', 0)} worth a look (not blocking: a "
-        f"removed security control the verifier could not confirm), "
+        f"confidence cutoff, {s.get('review_suggested', 0)} worth a look (not blocking: "
+        f"deleted control-like code the verifier could not confirm), "
         f"{s['hard_excluded']} excluded by rule, "
         f"{s['below_audit_confidence']} below the audit's own confidence floor, "
         f"{s['unverified']} not verified._"

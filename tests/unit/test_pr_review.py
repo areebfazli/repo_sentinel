@@ -295,6 +295,8 @@ def test_uncertain_removed_control_is_a_non_blocking_review_suggestion():
     assert md.startswith("## ✅") and result["review_status"] == "complete"
     assert "### 👀 Worth a look (not blocking)" in md and "`    p = validate_path(p)`" not in md
     assert "Removed control (line 7 before the change): `p = validate_path(p)`" in md
+    assert "deleted code that looks like a security control" in md
+    assert "removed an existing" not in md  # no stronger claim than the checks support
     assert "1 worth a look (not blocking" in md
 
 

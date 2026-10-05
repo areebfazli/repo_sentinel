@@ -419,12 +419,25 @@ reviewer reads one, not function by function:
    regressions were never reported. A candidate becomes a `review_suggestions` item (status
    `review_suggested`) only when the verdict is `uncertain` or `confirmed` below the cutoff,
    the verifier's confidence is ≥ `PR_REVIEW_SUGGEST_MIN_CONFIDENCE` (4), and deterministic
-   evidence shows the change removed a control at that spot: guard_diff reports
-   `guard_removed` with a removed / weakened change in the candidate's unit, or the verifier's
-   optional `removed_control_quote` is found (whitespace-insensitive, diff markers tolerated)
-   in the OLD file within 40 lines of the candidate, on lines the patch deletes, and in no
-   file's NEW content (a moved control fails). A claim that doesn't check out never
-   qualifies; `rejected` / unverified never do. At most `PR_REVIEW_MAX_SUGGESTIONS` (5).
+   checks show the change deleted code that looks like a security control at that spot
+   (deleted lines, recognised as a control, not found elsewhere in the new code). Either:
+   - **guard_diff**: a removed / weakened change of a `guard_removed` unit containing the
+     candidate, within `GUARD_EVIDENCE_WINDOW` (10) new-file lines of the candidate's quoted
+     lines (a swap's new-side line, else the deletion point of the deleted old line holding
+     the guard), whose old code is in no file's NEW content (moved, not removed), and that no
+     guard_diff alert finding already reports (the change is itself an alert change, or an
+     alert finding is on the same file and line: the alert is in the report already; the
+     candidate then keeps its verifier status, `uncertain` / below the cutoff); or
+   - **the verifier's quote**: its optional `removed_control_quote` is found
+     (whitespace-insensitive, diff markers tolerated) in the OLD file within 40 lines of the
+     candidate, every non-blank line it matches is a line the patch deletes (not kept or
+     context), none of them is comment-only (`#`, `//`, `/* */`, `*`, docstring lines), the
+     lines are a control by guard_diff's own classifier (guard calls such as sanitisers,
+     auth / permission checks or `compare_digest`, guard blocks, bounds checks, safe API /
+     flag / SQL forms; Python / JavaScript only), and the quote is in no file's NEW content.
+
+   A claim that doesn't check out never qualifies; `rejected` / unverified never do. At most
+   `PR_REVIEW_MAX_SUGGESTIONS` (5); candidates past the cap keep their verifier status.
    They get their own "👀 Worth a look (not blocking)" report section (escaped like
    findings; an otherwise clean report keeps its ✅ heading) and are never in
    `report_findings`, `is_vulnerable` or any gate.
@@ -447,9 +460,12 @@ the scan's `result_json`.
 JSON object in the reply that passes it (`extract_json`: a trailing example / note object
 or an unclosed brace / quote in reasoning prose no longer hides the answer; nothing nested in
 a cut-off object is ever returned); a reply with none is a bad-output failure of that client
-and the next model / provider in the chain answers instead. If every client fails that way
-the `LLMError` has `bad_output` set and the units are `not_reviewed` (reason `bad_output`) or
-the candidate `unverified`, never "reviewed, no findings". The checks also run after the call
+and the next model / provider in the chain answers instead, as are output cut at
+`max_tokens`, null content and a malformed HTTP 200. If every client that was called fails
+that way (no 429 / 5xx / timeout / HTTP error among them; clients skipped because the prompt
+doesn't fit their tokens/min limit don't count) the `LLMError` has `bad_output` set and the
+units are `not_reviewed` (reason `bad_output`) or the candidate `unverified`, never
+"reviewed, no findings"; any other failure mix is `llm_error`. The checks also run after the call
 (defence in depth). `review_pr(files, router, ...)` runs the whole stage
 on plain `{path, old_content, new_content, patch}` dicts without the API or DB (the eval's
 entry point).
@@ -487,9 +503,9 @@ fixes and 80 bystander benign PRs). Retrieval is off in every arm; no embedder o
   the cached verdicts with **guard_diff evidence only** (recomputed from the dataset; the old
   verifier prompt had no `removed_control_quote`) at the run's own cutoff, and labels it so;
   without the dataset the view is reported n/a. Rescore of `pr_eval_pr_dev200.json` (old
-  prompt, cutoff 8, guard_diff evidence only): introducing strict 15/55 (verified 12/55),
-  function-level 20/55 (16/55); fix PRs flagged 3/57 (2/57); benign 0/48 (0/48; only 48 of
-  80 benign PRs scored).
+  prompt, cutoff 8, guard_diff evidence only, with the guard_diff evidence limited to the
+  candidate's spot): introducing strict 15/55 (verified 12/55), function-level 19/55
+  (16/55); fix PRs flagged 3/57 (2/57); benign 0/48 (0/48; only 48 of 80 benign PRs scored).
 - `--arm units`: the per-unit review (`REVIEW_MODE=units`), run in-process exactly as
   `scan_runner` runs files mode, on the same PRs.
 - `--arm pr_misleading`: the `pr` arm on the `_misleading` variants of the selected
@@ -512,7 +528,11 @@ pipeline's per-call format check is not part of the key, so older entries replay
 answer it rejects is a miss, re-asked within the call budget, and replaced); pacing
 (`--llm-sleep`, `--llm-tpm`); `--llm-max-calls` / `--llm-token-budget`; a clean stop on a
 daily limit or repeated rate limits. Items with an unfinished or failed call are `not_run` /
-`error` and excluded (re-run to resume). The wall-clock budget is disabled in the eval.
+`error` and excluded (re-run to resume). That includes a call whose answer fails the format
+check on every model, or is cut off / empty (`error_kind` `bad_output`): the item stays
+`error` and is retried on the next run (a failed call is never cached), rather than being
+recorded as a scored item with a `partial` review; any partial result it has only enters the
+sensitivity view and the bounds. The wall-clock budget is disabled in the eval.
 `--llm-model` / `--llm-upstream` / `--verifier-model` pin models; `--llm-temperature T`
 forces a temperature (default: each model's `LLM_SAMPLING`, as production sends; the cache
 key carries the sampling sent, so `--llm-temperature 0` replays temperature-0 entries); `--split dev|test` (test needs `--i-know-this-is-the-test-set`);

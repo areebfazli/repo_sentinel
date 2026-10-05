@@ -147,7 +147,7 @@ def coverage_line(result: dict) -> str:
 
 def suggestions_line(result: dict) -> str | None:
     """One Markdown line on the PR review's non-blocking "worth a look" items
-    (``review_suggestions``: removed security controls the verifier could not
+    (``review_suggestions``: deleted control-like code the verifier could not
     confirm), or None. Trusted numbers only: the items themselves are in the
     server-rendered report. They are never inline comments and never gate."""
     n = len(result.get("review_suggestions") or [])

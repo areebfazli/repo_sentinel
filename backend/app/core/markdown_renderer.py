@@ -546,9 +546,9 @@ def _render_suggestions(suggestions: list[dict]) -> list[str]:
     if not suggestions:
         return []
     out = ["### 👀 Worth a look (not blocking)",
-           "_Not confirmed by the verifier, but the change removed an existing security "
-           "control at this spot (checked deterministically against the code before the "
-           "change). Not counted as findings; never fails a check._"]
+           "_Not confirmed by the verifier, but the change deleted code that looks like a "
+           "security control at this spot (deleted lines, recognised as a control, not found "
+           "elsewhere in the new code). Not counted as findings; never fails a check._"]
     for s in suggestions:
         refs = []
         loc = _location(s)

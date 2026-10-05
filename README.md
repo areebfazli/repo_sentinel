@@ -27,7 +27,8 @@ How a review works:
    option exists, but the model never used it in the 160-PR eval run).
 4. **Double-check every finding.** Each candidate goes to a separate verifier call. Only
    findings confirmed with high confidence are reported. A candidate the verifier can't
-   confirm, at a spot where the change provably removed a security check, is listed
+   confirm, at a spot where the change deleted code that looks like a security check
+   (deleted lines, recognised as a control, not found elsewhere in the new code), is listed
    separately as "worth a look"; it never fails the check.
 5. **Report.** It posts inline comments on the PR and can fail the check when a finding is
    severe enough.

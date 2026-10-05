@@ -8,6 +8,7 @@ import pytest
 from backend.app.core.analysis_planner import plan_units
 from backend.app.core.code_parser import CodeParser
 from backend.app.core.guard_diff import (
+    ALERT_MIN_CONFIDENCE,
     PatchMismatch,
     comment_only_lines,
     control_kinds_on_lines,
@@ -97,6 +98,31 @@ PY_CASES = [
      "def show(v):\n    return format_html('{}', v)\n",
      "def show(v):\n    return mark_safe(v)\n",
      "sanitiser", "weakened"),
+    ("torch_weights_only_dropped",
+     "def load(p):\n    return torch.load(p, weights_only=True)\n",
+     "def load(p):\n    return torch.load(p)\n",
+     "safe_api", "weakened"),
+    ("torch_weights_only_false",
+     "def load(p):\n    return torch.load(p, weights_only=True)\n",
+     "def load(p):\n    return torch.load(p, weights_only=False)\n",
+     "safe_api", "weakened"),
+    ("numpy_allow_pickle_true",
+     "def load(p):\n    return np.load(p)\n",
+     "def load(p):\n    return np.load(p, allow_pickle=True)\n",
+     "safe_api", "weakened"),
+    ("yaml_safeloader_dropped",
+     "def load(s):\n    return yaml.load(s, Loader=yaml.SafeLoader)\n",
+     "def load(s):\n    return yaml.load(s)\n",
+     "safe_api", "weakened"),
+    ("lxml_resolve_entities_dropped",
+     "def parse(s):\n    p = etree.XMLParser(resolve_entities=False)\n"
+     "    return etree.fromstring(s, p)\n",
+     "def parse(s):\n    p = etree.XMLParser()\n    return etree.fromstring(s, p)\n",
+     "xxe", "weakened"),
+    ("defusedxml_swap",
+     "def parse(s):\n    return defusedxml.ElementTree.fromstring(s)\n",
+     "def parse(s):\n    return xml.etree.ElementTree.fromstring(s)\n",
+     "safe_api", "weakened"),
 ]
 
 JS_CASES = [
@@ -183,6 +209,37 @@ def test_dropped_explicit_safe_flag_reports_old_side():
     (c2,) = guard_diff("def env():\n    return Environment()\n",
                        "def env():\n    return Environment(autoescape=True)\n", "python").changes
     assert c2.direction == "strengthened" and "autoescape=True" in c2.new_text
+
+
+TORCH_MULTILINE_OLD = (
+    "def load(path):\n"
+    "    return torch.load(\n"
+    "        path,\n"
+    "        map_location='cpu',\n"
+    "        weights_only=True,\n"
+    "    )\n"
+)
+
+
+def test_weights_only_deleted_from_a_multi_line_call():
+    new = TORCH_MULTILINE_OLD.replace("        weights_only=True,\n", "")
+    r = guard_diff(TORCH_MULTILINE_OLD, new, "python")
+    assert r.risk == "guard_removed"
+    (c,) = r.changes
+    assert (c.direction, c.kind, c.line) == ("weakened", "safe_api", 5)
+    assert c.old_text == "weights_only=True" and c.new_text == ""
+    # A safe-load keyword flag is guard_removed evidence, not the alert tier
+    # (dropping the kwarg is harmless on torch >= 2.6).
+    assert not r.alert and c.confidence < ALERT_MIN_CONFIDENCE
+
+
+def test_dropping_a_flag_whose_default_is_safe_is_no_change():
+    # numpy.load defaults to allow_pickle=False; subprocess to shell=False.
+    for old, new in (("np.load(p, allow_pickle=False)", "np.load(p)"),
+                     ("subprocess.run(c, shell=False)", "subprocess.run(c)")):
+        r = guard_diff(f"def f(p, c):\n    return {old}\n", f"def f(p, c):\n    return {new}\n",
+                       "python")
+        assert r.risk == "none" and r.changes == (), (old, r)
 
 
 def test_unescape_is_not_a_sanitiser():
@@ -527,4 +584,7 @@ def test_control_kinds_on_lines_safe_forms_and_unsupported_languages():
     assert control_kinds_on_lines(code, "python", [3]) == {"sql_param"}
     assert control_kinds_on_lines(code, "python", [4]) == set()
     assert control_kinds_on_lines("if (!ok) { throw err; }", "go", [1]) == set()
+    # A safe-load keyword on its own line of a multi-line call.
+    assert control_kinds_on_lines(TORCH_MULTILINE_OLD, "python", [5]) == {"safe_api"}
+    assert control_kinds_on_lines(TORCH_MULTILINE_OLD, "python", [4]) == set()
     assert control_kinds_on_lines(code, "python", []) == set()

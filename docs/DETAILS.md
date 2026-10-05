@@ -354,7 +354,11 @@ engine costs ~7 s fixed per run (Python rules; ~13 s with JS as well), then ~0.0
 `backend/app/core/guard_diff.py` compares a unit's old and new code (tree-sitter, Python + JS,
 no model, ~15 ms per unit). It reports `GuardChange`s: removed/added sanitisers, auth checks,
 path-containment and bounds checks, `raise`/`return`/`throw` guard blocks, unsafe-API swaps
-(`yaml.safe_load` to `yaml.load`), flag flips (`shell=True`, `verify=False`) and parameterised
+(`yaml.safe_load` to `yaml.load`), flag flips (`shell=True`, `verify=False`), dropped safe-load
+keywords (`Loader=SafeLoader`, `resolve_entities=False`, `weights_only=True` on `torch.load`:
+dropping the explicit `True` or writing `False` is weakened, at 0.6, i.e. `guard_removed` but not
+the alert tier, as dropping it is harmless from torch 2.6, where it is the default; numpy's
+`allow_pickle` only counts as an explicit `True`, its default being safe) and parameterised
 SQL turned into interpolated SQL. It nets them into `risk` (`guard_removed` / `guard_added` /
 `none`) plus a high-precision `alert` tier (swap/flag/SQL evidence only). Features are counted
 per kind with identifier-anonymised keys, so renames, reformatting and moved statements don't
@@ -375,6 +379,13 @@ one fails the Action's severity gate by default. Every unit with a signal is lis
 reversal as vulnerability-introducing PRs. On 506 held-out pairs: TPR 0.227 and fix-direction
 FPR 0.030. The `alert` tier has TPR 0.032 and FPR 0/506. Synthetic benign edits of 994 ordinary
 functions produce 0 flags. Results are written to `ml/evaluation/results/guard_diff_eval.json`.
+Adding `weights_only` (re-run on the current 502 held-out / 2865 corpus pairs): `guard_removed`
+TPR 114 → 115 / 502 held-out and 686 → 692 / 2865 corpus (all torch.load deserialisation
+CVEs), fix-direction FPR unchanged (14 / 502, 72 / 2865), the alert tier unchanged (16 / 502 at
+0 / 502; 69 / 2865 at 6 / 2865), broad-commit bystanders 49 → 50 / 2364 (`_load_pyfunc`
+gaining a `weights_only=False` parameter default); on the 476 PR-eval items (dev200 +
+misleading) only InspireMusic's CVE-2025-5148 changes (intro → `guard_removed`, fix →
+`guard_added`), no alert changes.
 
 ## PR-level review (files mode)
 

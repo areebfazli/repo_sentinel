@@ -22,7 +22,9 @@ Design (deterministic, cheap, no model):
    - ``hazard`` — unsafe APIs (``HAZARDS``, e.g. ``yaml.load``, ``pickle.loads``,
      ``eval``, ``innerHTML =``) with their safe twins (``yaml.safe_load`` ...);
    - ``flag``   — security-relevant flag values (``FLAGS``: ``shell=True``,
-     ``verify=False``, ``rejectUnauthorized: false``, ``autoescape`` ...);
+     ``verify=False``, ``rejectUnauthorized: false``, ``autoescape``, safe-load
+     keywords such as ``Loader=SafeLoader``, ``weights_only=True``,
+     ``resolve_entities=False`` ...);
    - ``sql``    — SQL string literals that are interpolated (f-string, ``%``,
      ``+``, ``.format``, template literal) vs parameterised (placeholders).
 
@@ -356,7 +358,14 @@ FLAGS: list[tuple[str, str, str | None, bool, str, float]] = [
     ("sanitize", r"false", None, True, "sanitiser", 0.5),
     ("resolve_entities|noent", r"True|true", r"False|false", False, "xxe", 0.6),
     ("load_dtd|huge_tree|dtd_validation|no_network", r"True|true", None, True, "xxe", 0.4),
+    # numpy.load: allow_pickle defaults to False (numpy >= 1.16.3), so only an
+    # explicit True counts; dropping an explicit False changes nothing.
     ("allow_pickle", r"True", None, True, "safe_api", 0.6),
+    # torch.load (and torch.hub / Lightning loaders) unpickle arbitrary objects
+    # unless weights_only=True, the default only from torch 2.6: dropping an
+    # explicit True, or writing False, weakens it. 0.6 keeps it out of the
+    # alert tier: on torch >= 2.6 dropping the (redundant) kwarg is harmless.
+    ("weights_only", r"False|false", r"True|true", False, "safe_api", 0.6),
     ("Loader", r"(yaml\.)?(Loader|UnsafeLoader|FullLoader)\b", r"(yaml\.)?C?SafeLoader",
      False, "safe_api", 0.7),
     ("allowProtoPropertiesByDefault|allowProtoMethodsByDefault|allowPrototypes",

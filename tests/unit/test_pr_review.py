@@ -447,6 +447,39 @@ def test_a_control_moved_to_another_file_still_fails():
     assert c["status"] == "uncertain" and c["review_evidence"] == []
 
 
+TORCH_OLD = (
+    "def load_model(path):\n"
+    "    state = torch.load(\n"
+    "        path,\n"
+    "        map_location='cpu',\n"
+    "        weights_only=True,\n"
+    "    )\n"
+    "    return state\n"
+)
+
+
+@pytest.mark.parametrize("new, quote", [
+    # The kwarg deleted from a multi-line call, quoted as the kwarg.
+    (TORCH_OLD.replace("        weights_only=True,\n", ""), "weights_only=True,"),
+    # A modified one-line call, the verifier quoting the old line.
+    ("def load_model(path):\n    state = torch.load(path, map_location='cpu')\n"
+     "    return state\n", None),
+])
+def test_a_dropped_weights_only_is_removed_control_evidence(new, quote):
+    old = TORCH_OLD if quote else (
+        "def load_model(path):\n"
+        "    state = torch.load(path, map_location='cpu', weights_only=True)\n"
+        "    return state\n")
+    quote = quote or "state = torch.load(path, map_location='cpu', weights_only=True)"
+    result = _quote_review(_files(("app/model.py", old, new)), quote, "return state",
+                           path="app/model.py")
+    [sug] = result["review_suggestions"]
+    # Both routes: the verifier's quote, and guard_diff's weakened safe_api flag.
+    assert sug["evidence"] == ["verifier_quote", "guard_diff"]
+    assert "weights_only=True" in sug["removed_control"]
+    assert result["report_findings"] == []  # not the alert tier
+
+
 def test_rejected_never_qualifies_and_confirmed_below_cutoff_does():
     rejected = {**UNCERTAIN_REMOVED, "verdict": "rejected", "confidence": 6}
     result = _review(_files(("app/files.py", RM_OLD, RM_NEW)), PRRouter(

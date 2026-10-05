@@ -495,6 +495,29 @@ def test_control_kinds_on_lines_uses_the_guard_vocabulary(lines, kinds):
     assert control_kinds_on_lines(LINES_PY, "python", lines) == kinds
 
 
+GUARD_SPANS_PY = (
+    "def view(request, user, p):\n"                   # 1
+    "    if not user.is_admin:\n"                       # 2
+    "        log.warning('denied %s', p)\n"             # 3
+    "        raise PermissionDenied\n"                  # 4
+    "    if user.is_staff:\n"                           # 5
+    "        total = compute(p)\n"                      # 6
+    "        return total\n"                            # 7
+    "    else:\n"                                       # 8
+    "        raise PermissionDenied\n"                  # 9
+)
+
+
+@pytest.mark.parametrize("lines, kinds", [
+    ([2], {"auth_check"}), ([4], {"auth_check"}),   # header and exit
+    ([3], set()),                                    # logging inside the guard
+    ([5], {"auth_check"}), ([9], {"auth_check"}),
+    ([6], set()), ([7], set()),                      # if-body of a guard whose else exits
+])
+def test_control_kinds_on_lines_guard_block_is_its_header_and_exit(lines, kinds):
+    assert control_kinds_on_lines(GUARD_SPANS_PY, "python", lines) == kinds
+
+
 def test_control_kinds_on_lines_safe_forms_and_unsupported_languages():
     code = ("def load(s, db, name):\n"
             "    data = yaml.safe_load(s)\n"

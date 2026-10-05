@@ -61,7 +61,7 @@ from __future__ import annotations
 import re
 import textwrap
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Literal
 
@@ -463,9 +463,12 @@ class _Feature:
     line: int
     text: str
     idents: frozenset[str] = frozenset()  # identifiers the guard tests / the call takes
-    # Last line the feature spans (a guard block: through its exit statement; a
-    # call: its closing paren); 0 = ``line`` only. Not part of the diffing.
-    end_line: int = 0
+    # (first, last) line spans the feature occupies, for the line-level check
+    # ``control_kinds_on_lines``: a guard block's header (``if`` / ``elif``
+    # through its condition) and its exit statement, not the lines between them
+    # (logging before the exit, an if-body whose ``else`` exits); a call: its
+    # whole span. Empty = ``line`` only. Not part of the diffing.
+    spans: tuple[tuple[int, int], ...] = field(default=(), compare=False)
 
 
 def _mask(root: Node, src: bytes) -> str:
@@ -710,7 +713,9 @@ def _guard_block_features(root: Node, src: bytes, lang: str, params: set[str],
         feats.append(_Feature("block", kind, kind, f"{exit_name}|{_shape(cond, src)}", 1,
                               weight, weight, line, _first_line(_text(n, src)),
                               frozenset(_identifiers(cond, src)),
-                              end_line=stmt.end_point[0] + 1 - line_off))
+                              spans=((line, cond.end_point[0] + 1 - line_off),
+                                     (stmt.start_point[0] + 1 - line_off,
+                                      stmt.end_point[0] + 1 - line_off))))
     return feats, guard_conds
 
 
@@ -779,7 +784,8 @@ def _call_features(root: Node, src: bytes, lang: str, line_off: int) -> list[_Fe
         idents = frozenset(_identifiers(args, src)) if args is not None else frozenset()
         feats.append(_Feature("call", kind, kind, last.lower(), 1, weight, weight,
                               n.start_point[0] + 1 - line_off, _first_line(_text(n, src)),
-                              idents, end_line=n.end_point[0] + 1 - line_off))
+                              idents, spans=((n.start_point[0] + 1 - line_off,
+                                              n.end_point[0] + 1 - line_off),)))
     return feats
 
 
@@ -1178,11 +1184,13 @@ _PROTECTIVE_FAMILIES = frozenset({"call", "block", "cond", "safe", "flag_safe", 
 def control_kinds_on_lines(code: str, language: str | None, lines) -> set[str]:
     """This module's control classifier applied to some lines of ``code``
     (pass the whole file, so the lines are parsed in context): the kinds of the
-    protective features ``extract_features`` finds (guard calls, guard blocks
-    from their ``if`` / ``assert`` through the exit, bounds comparisons, the
-    safe forms of hazards / flags / SQL) that start on or span one of
-    ``lines`` (1-based). Unclassified guard blocks and features that count for
-    nothing, not even in a swap, are left out. Empty for an unsupported
+    protective features ``extract_features`` finds (guard calls, guard blocks,
+    bounds comparisons, the safe forms of hazards / flags / SQL) that start on
+    or span one of ``lines`` (1-based). A guard block counts on its header
+    (``if`` / ``assert`` through the condition) and its exit statement only:
+    a log line before the exit, or the body of an ``if`` whose ``else``
+    exits, is not the control. Unclassified guard blocks and features that
+    count for nothing, not even in a swap, are left out. Empty for an unsupported
     language or a failed analysis; never raises."""
     lang = normalize_language(language)
     wanted = {int(n) for n in lines}
@@ -1196,7 +1204,7 @@ def control_kinds_on_lines(code: str, language: str | None, lines) -> set[str]:
         f.kind for f in feats
         if f.family in _PROTECTIVE_FAMILIES and f.polarity > 0
         and max(f.weight, f.swap_weight) > 0
-        and any(f.line <= n <= max(f.end_line, f.line) for n in wanted)
+        and any(a <= n <= b for a, b in (f.spans or ((f.line, f.line),)) for n in wanted)
     }
 
 

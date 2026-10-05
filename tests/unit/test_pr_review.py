@@ -373,6 +373,19 @@ def test_removed_control_quote_must_be_deleted_control_code(quote):
     assert result["review_suggestions"] == []
 
 
+def test_a_log_line_deleted_inside_a_kept_guard_is_not_a_control():
+    old = ("def delete(user, obj):\n"
+           "    if not user.is_admin:\n"
+           "        log.warning('denied %s', user)\n"
+           "        raise PermissionDenied\n"
+           "    obj.delete()\n")
+    new = old.replace("        log.warning('denied %s', user)\n", "")
+    result = _quote_review(_files(("app/views.py", old, new)),
+                           "log.warning('denied %s', user)", "obj.delete()")
+    assert result["review_suggestions"] == []
+    assert result["candidates"][0]["review_evidence"] == []
+
+
 def test_a_deleted_docstring_or_js_comment_is_not_a_control():
     old = 'def read(p):\n    """Validate the path first."""\n    return open(p).read()\n'
     new = "def read(p):\n    return open(p).read()\n"

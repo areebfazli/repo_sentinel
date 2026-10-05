@@ -44,8 +44,9 @@ per-function in isolation. Stages:
    (status ``review_suggested``) only when deterministic checks show the
    change deleted code that looks like a security control there: a removed /
    weakened guard_diff change of its ``guard_removed`` unit inside the
-   candidate's innermost function (``GUARD_EVIDENCE_FALLBACK_WINDOW`` lines
-   for module-level code), whose old code is in no new file
+   candidate's outermost enclosing function (a closure's or callback's
+   top-level function; a method; ``GUARD_EVIDENCE_FALLBACK_WINDOW`` lines for
+   module-level code), whose old code is in no new file
    (``guard_removal_checks``), or the verifier's ``removed_control_quote``
    found in the OLD file near it only on deleted, non-comment lines that
    guard_diff classifies as a control, and in no new file; either kind only
@@ -864,10 +865,11 @@ def _strip_removed_markers(quote: str) -> str:
     return "\n".join(out)
 
 
-# A removed / weakened guard counts for a candidate only inside the innermost
-# function containing the candidate's line (``guard_removal_checks``). A sweep
-# of fixed new-file windows on the dev200 run removed no false alarm at any
-# width and lost genuine catches (a cross-channel check 29 lines above the
+# A removed / weakened guard counts for a candidate only inside the outermost
+# function containing the candidate's line (``guard_removal_checks``: a
+# handler's admin check protects the callback / closure doing the work). A
+# sweep of fixed new-file windows on the dev200 run removed no false alarm at
+# any width and lost genuine catches (a cross-channel check 29 lines above the
 # candidate, a validate_git_ref() call 12 lines away, both in the same
 # function). A candidate outside every function (module-level code) falls
 # back to this many new-file lines around its quoted lines.
@@ -956,9 +958,12 @@ def guard_removal_checks(bundle: PRBundle, guard: dict, cand: dict) -> list[dict
     (``evidence.guard_to_dict``: the new-side line of a swap), else the
     deletion point (``pr_context.new_line_for``) of the deleted old line
     holding its old code, the one nearest the candidate. Its scope is the
-    candidate's function: the innermost CodeParser function of the new file
-    containing the candidate's line (``PRBundle.function_at``), its
-    decorators included (``_decorated_start``). Reasons:
+    candidate's function: the outermost CodeParser function of the new file
+    containing the candidate's line (``PRBundle.outermost_function_at``: a
+    removed admin check in an Express handler or a view counts for the
+    sink in its ``ids.map(async id => ...)`` callback or local ``_do()``
+    helper; a method stays the method), its decorators included
+    (``_decorated_start``). Reasons:
 
     - "no_old_code": nothing of the old side to show;
     - "not_located": no new-side anchor, and the old code is on no deleted line;
@@ -986,7 +991,7 @@ def guard_removal_checks(bundle: PRBundle, guard: dict, cand: dict) -> list[dict
     target_old = old_line_for(f.patch, line)
     deleted = deleted_old_lines(f.patch)
     alert_lines, _alert_old = guard_alert_spots(bundle, guard, f.path)
-    fn = bundle.function_at(f.path, line)
+    fn = bundle.outermost_function_at(f.path, line)
     if fn is not None:
         # The function's decorators are part of it (a removed @login_required).
         new_scope = (_decorated_start(f.new_content, int(fn["start_line"])), int(fn["end_line"]))
@@ -1042,7 +1047,7 @@ def guard_removal_evidence(bundle: PRBundle, guard: dict, cand: dict) -> dict | 
     check in the candidate's function: a removed / weakened change of a
     ``guard_removed`` unit (the alert tier included) containing the
     candidate's line that ``guard_removal_checks`` accepts - inside the
-    candidate's innermost function (else within GUARD_EVIDENCE_FALLBACK_WINDOW
+    candidate's outermost function (else within GUARD_EVIDENCE_FALLBACK_WINDOW
     lines), not moved, not already reported by a guard alert. The control
     shown is that change's old code (the most confident change)."""
     ok = [r for r in guard_removal_checks(bundle, guard, cand) if r["reason"] is None]

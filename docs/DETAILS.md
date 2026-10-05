@@ -434,10 +434,14 @@ reviewer reads one, not function by function:
    checks show the change deleted code that looks like a security control at that spot
    (deleted lines, recognised as a control, not found elsewhere in the new code). Either:
    - **guard_diff**: a removed / weakened change of a `guard_removed` unit containing the
-     candidate, located inside the candidate's function (the innermost function of the new
-     file containing the candidate's line; a swap by its new-side line, a deleted guard by
-     its old line within the old version of that function, or by its deletion point when
-     the function is new), whose old code is in no file's NEW content (moved, not removed).
+     candidate, located inside the candidate's function (the *outermost* function of the new
+     file containing the candidate's line, `PRBundle.outermost_function_at`, decorators
+     included: a removed admin check in an Express handler counts for the sink in its
+     `ids.map(async id => ...)` callback, a view's check for its local `_do()` helper; a
+     method stays the method, as its class is not a function; a swap by its new-side line,
+     a deleted guard by its old line within the old version of that function, or by its
+     deletion point when the function is new), whose old code is in no file's NEW content
+     (moved, not removed). The innermost function missed those callbacks and closures.
      A candidate in no function (module-level code) falls back to
      `GUARD_EVIDENCE_FALLBACK_WINDOW` (30) new-file lines around it. An earlier fixed
      10-line window around the candidate removed no false alarm at any width on the dev200

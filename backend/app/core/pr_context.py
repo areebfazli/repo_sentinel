@@ -580,6 +580,29 @@ class PRBundle:
                 best = f
         return best
 
+    def outermost_function_at(self, path: str, line: int) -> dict | None:
+        """Outermost CodeParser function of ``path`` containing ``line``: a
+        closure's or callback's enclosing top-level function, or a method (its
+        class is not a function). Climbing from the innermost function stops
+        where the next enclosing function would cross a class (a method of a
+        class defined inside a function stays the method; ``SymbolIndex``
+        classes: Python ``class``, JS ``class`` declarations)."""
+        chain = sorted((f for f in self.spans.get(path, [])
+                        if f["start_line"] <= line <= f["end_line"]),
+                       key=lambda f: f["end_line"] - f["start_line"])
+        if not chain:
+            return None
+        classes = [(d.start_line, d.end_line) for d in self.index.defs
+                   if d.path == path and d.kind == "class"]
+        best = chain[0]
+        for outer in chain[1:]:
+            if any(outer["start_line"] <= a and b <= outer["end_line"]
+                   and a <= best["start_line"] and best["end_line"] <= b
+                   for a, b in classes):
+                break
+            best = outer
+        return best
+
     def units_of(self, path: str) -> list[dict]:
         return [u for u in self.units if u.get("file_path") == path]
 

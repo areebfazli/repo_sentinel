@@ -551,13 +551,88 @@ NESTED_OLD = (
 )
 
 
-def test_guard_diff_removal_outside_the_candidates_innermost_function_is_not():
-    # The guard left outer(); the candidate is in inner(), its innermost function.
+def test_guard_diff_removal_in_the_enclosing_function_of_a_closure_is_evidence():
+    # The guard left outer(); the candidate is in inner(), a closure outer()
+    # returns: outer()'s check protected it, so its removal counts.
     new = NESTED_OLD.replace(GUARD, "")
     result = _guard_review(_files(("app/views.py", NESTED_OLD, new)), "obj.delete()")
     [c] = result["candidates"]
+    assert c["status"] == "review_suggested" and c["review_evidence"] == ["guard_diff"]
+    [sug] = result["review_suggestions"]
+    assert sug["removed_control"] == "if not user.is_admin:" and sug["removed_control_line"] == 2
+
+
+def test_guard_diff_removal_in_another_top_level_function_is_not():
+    old = ("def check(request, user, obj):\n" + GUARD + "    return obj\n"
+           "\n"
+           "def delete(request, user, obj):\n"
+           "    obj.delete()\n")
+    new = old.replace(GUARD, "")
+    result = _guard_review(_files(("app/views.py", old, new)), "obj.delete()")
+    [c] = result["candidates"]
     assert result["review_suggestions"] == []
     assert c["status"] == "uncertain" and c["review_evidence"] == []
+
+
+EXPRESS_OLD = (
+    "const router = require('express').Router();\n"
+    "\n"
+    "router.post('/bulk-delete', async (req, res) => {\n"
+    "  if (!req.user.isAdmin) {\n"
+    "    return res.status(403).send('forbidden');\n"
+    "  }\n"
+    "  const ids = req.body.ids;\n"
+    "  await Promise.all(ids.map(async id => {\n"
+    "    await db.remove(id);\n"
+    "  }));\n"
+    "  res.send('ok');\n"
+    "});\n"
+)
+EXPRESS_GUARD = ("  if (!req.user.isAdmin) {\n"
+                 "    return res.status(403).send('forbidden');\n"
+                 "  }\n")
+
+
+def test_an_express_handlers_admin_check_counts_for_the_sink_in_its_callback():
+    # The sink is in the ids.map(async id => ...) callback; the removed admin
+    # check is the handler's, the callback's outermost enclosing function.
+    files = _files(("routes/items.js", EXPRESS_OLD, EXPRESS_OLD.replace(EXPRESS_GUARD, "")))
+    result = _guard_review(files, "await db.remove(id);", path="routes/items.js")
+    _schema_ok(result)
+    [c] = result["candidates"]
+    assert c["status"] == "review_suggested" and c["review_evidence"] == ["guard_diff"]
+    [sug] = result["review_suggestions"]
+    assert sug["line"] == 6 and sug["removed_control"] == "if (!req.user.isAdmin) {"
+    assert sug["removed_control_line"] == 4
+    assert result["report_findings"] == []
+
+
+def test_a_python_local_helpers_enclosing_guard_counts():
+    old = ("def purge(request, ids):\n"
+           "    if not request.user.is_admin:\n"
+           "        raise PermissionDenied\n"
+           "    def _do():\n"
+           "        for i in ids:\n"
+           "            Item.objects.filter(id=i).delete()\n"
+           "    return run_in_tx(_do)\n")
+    new = old.replace("    if not request.user.is_admin:\n        raise PermissionDenied\n", "")
+    files = _files(("app/views.py", old, new))
+    # The candidate (new line 4) is in _do(), whose innermost function is _do.
+    assert _guard_rows(files, "app/views.py", 4) == [(2, 2, None)]
+    result = _guard_review(files, "Item.objects.filter(id=i).delete()")
+    [c] = result["candidates"]
+    assert c["status"] == "review_suggested" and c["review_evidence"] == ["guard_diff"]
+
+
+def test_a_method_of_a_class_defined_in_a_function_keeps_its_own_scope():
+    # The class is not a function: the scope stops at the method.
+    old = ("def make_views(user):\n" + GUARD +
+           "    class V:\n"
+           "        def post(self, obj):\n"
+           "            obj.delete()\n"
+           "    return V\n")
+    files = _files(("app/views.py", old, old.replace(GUARD, "")))
+    assert _guard_rows(files, "app/views.py", 4) == [(2, 2, "other_function")]
 
 
 def _bundle_and_guard(files):
@@ -589,11 +664,11 @@ def test_guard_removal_checks_explain_each_change():
     # The deleted guard (old line 2) sits at the deletion point, new line 2;
     # obj.delete() is new line 32, same function: it counts.
     assert _guard_rows(files, "app/views.py", 32) == [(2, 2, None)]
-    # In inner() the guard removed from outer() is another function's.
+    # In inner() the guard removed from outer() counts: outer() is inner()'s
+    # outermost enclosing function. (Its deletion point, new line 2, is
+    # inner()'s def line; the old version of outer(), old lines 1-6, places it.)
     files = _files(("app/views.py", NESTED_OLD, NESTED_OLD.replace(GUARD, "")))
-    # (Its deletion point, new line 2, is inner()'s def line: the old version
-    # of inner(), old lines 4-5, places it.)
-    assert _guard_rows(files, "app/views.py", 3) == [(2, 2, "other_function")]
+    assert _guard_rows(files, "app/views.py", 3) == [(2, 2, None)]
     assert _guard_rows(files, "app/views.py", 4) == [(2, 2, None)]  # outer's own line
 
 

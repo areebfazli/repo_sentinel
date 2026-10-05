@@ -188,6 +188,33 @@ def test_extract_json_validator_never_takes_an_inner_object_of_truncated_output(
         extract_json(content, validate=lambda o: None)
 
 
+@pytest.mark.parametrize("cut", ["tru", "fals", "nul", "-", "1e", "1.", '"x\\u12', "12  "])
+def test_extract_json_output_cut_mid_token_never_yields_an_inner_object(cut):
+    # Cut off inside a literal / number / escape: the decode error is not at the
+    # very end of the text, but the rest of the text is one partial token.
+    content = '{"findings": [{"title": "XSS", "line": 3}, {"line": ' + cut
+    with pytest.raises(json.JSONDecodeError):
+        extract_json(content)
+    with pytest.raises(json.JSONDecodeError):
+        extract_json(content, validate=lambda o: None)
+
+
+def test_extract_json_many_unclosed_starts_stay_bounded():
+    # A long reply full of unclosed '{"' starts: each one is scanned to the end
+    # of the text, so the scan gives up after _MAX_UNCLOSED_STARTS of them
+    # rather than going quadratic (this took ~80 s at 100 KB without the cap).
+    import time
+
+    content = '{"a" x ' * 14_000 + '{"findings": []}'
+    t0 = time.perf_counter()
+    with pytest.raises(json.JSONDecodeError):
+        extract_json(content)
+    assert time.perf_counter() - t0 < 5
+    # A few unclosed starts in prose still don't hide the answer.
+    few = '{"a" x ' * llm_client._MAX_UNCLOSED_STARTS + '{"findings": []}'
+    assert extract_json(few) == {"findings": []}
+
+
 @pytest.mark.parametrize("content", [
     '{"title": "a bare finding"}',                      # plain JSON
     'Answer: {"title": "a"} and {"note": "b"}',         # objects, none passes

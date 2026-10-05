@@ -225,13 +225,22 @@ def _object_end(text: str, start: int) -> int | None:
 # "{set}" are not candidates).
 _OBJECT_START_RE = re.compile(r'\{\s*["}]')
 _DECODER = json.JSONDecoder()
+# What is left of a value cut off mid-token: "tru", "-", "1e", "1.", "\u12".
+_PARTIAL_TOKEN_RE = re.compile(r"[A-Za-z0-9+\-.\\]*")
+# Unclosed object starts (each one scanned to the end of the text) tried
+# before the scan gives up, so a pathological reply full of unclosed '{"'
+# costs at most this many linear scans instead of one per start (O(n^2): ~80 s
+# for 100 KB, blocking the event loop).
+_MAX_UNCLOSED_STARTS = 32
 
 
 def _truncated(text: str, exc: json.JSONDecodeError) -> bool:
     """The decode failed because the text ENDED inside the value (output cut
-    off), not because of a syntax error part-way (prose that only looks like
-    the start of an object)."""
-    return exc.msg.startswith("Unterminated string") or exc.pos >= len(text.rstrip())
+    off, also mid-token such as ``tru`` or ``1e``), not because of a syntax
+    error part-way (prose that only looks like the start of an object)."""
+    if exc.msg.startswith("Unterminated string") or exc.pos >= len(text.rstrip()):
+        return True
+    return _PARTIAL_TOKEN_RE.fullmatch(text[exc.pos:].rstrip()) is not None
 
 
 def _top_level_objects(text: str) -> list[dict]:
@@ -243,9 +252,11 @@ def _top_level_objects(text: str) -> list[dict]:
     ends the scan, so nothing nested in it is returned. A start that is not
     valid JSON is skipped: a closed span (``{"a": 1, ...}``) as a whole, an
     unclosed one (prose such as ``He said "hi {"``, whose quote never closes)
-    by one character, so it can't hide an answer that follows it."""
+    by one character, so it can't hide an answer that follows it (after
+    _MAX_UNCLOSED_STARTS such starts the scan ends, as for truncated output)."""
     out: list[dict] = []
     pos = 0
+    unclosed = 0
     while (m := _OBJECT_START_RE.search(text, pos)) is not None:
         try:
             obj, end = _DECODER.raw_decode(text, m.start())
@@ -253,6 +264,10 @@ def _top_level_objects(text: str) -> list[dict]:
             if _truncated(text, exc):
                 break
             end = _object_end(text, m.start())
+            if end is None:
+                unclosed += 1
+                if unclosed > _MAX_UNCLOSED_STARTS:
+                    break
             pos = end if end is not None else m.start() + 1
             continue
         if isinstance(obj, dict):

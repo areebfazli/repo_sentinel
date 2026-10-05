@@ -456,12 +456,15 @@ reviewer reads one, not function by function:
      flag / SQL forms; Python / JavaScript only), and the quote is in no file's NEW content.
 
    Neither kind counts where a guard_diff alert finding already reports the removal: the
-   change is itself an alert change, an alert finding is on the same file and line (for the
-   quote: a matched line's deletion point), or a quoted line holds an alert change's old code.
-   The alert is in the report already; the candidate keeps its verifier status (`uncertain` /
-   below the cutoff). Both routes rely on guard_diff's grammar (Python / JavaScript /
-   TypeScript): for **Go, Java** and other languages the verifier's quote can never qualify
-   (no control classifier) and guard_diff gives no evidence, so the tier never fires there.
+   change is itself an alert change, its old line (a quoted line) holds an alert change's
+   old code, or (guard_diff only) its own new-side line, a swap's anchor, is the alert's
+   line. A deletion point on the alert's line is not enough: a separate removed guard in the
+   same contiguous -/+ block as an alerting SQL swap has its deletion point there and used to
+   be hidden; it now counts (the swap itself still does not). The alert is in the report
+   already; the candidate keeps its verifier status (`uncertain` / below the cutoff). Both
+   routes rely on guard_diff's grammar (Python / JavaScript / TypeScript): for **Go, Java**
+   and other languages the verifier's quote can never qualify (no control classifier) and
+   guard_diff gives no evidence, so the tier never fires there.
 
    A claim that doesn't check out never qualifies; `rejected` / unverified never do. At most
    `PR_REVIEW_MAX_SUGGESTIONS` (5); candidates past the cap keep their verifier status.

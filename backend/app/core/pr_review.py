@@ -931,7 +931,10 @@ def _is_alert_change(g: dict, c: dict) -> bool:
 def guard_alert_spots(bundle: PRBundle, guard: dict, path: str) -> tuple[set[int], set[int]]:
     """Where guard_diff's deterministic alert findings sit in ``path``: (their
     new-file lines, the deleted old-file lines holding an alert change's old
-    code). Evidence there is already in the report as the alert."""
+    code). A change on those new-side lines, or deleted code on those old
+    lines, is already in the report as the alert. A deletion point landing on
+    an alert line is not: a separate guard deleted in the same -/+ block as an
+    alerting swap has its deletion point on the swap's new line."""
     f = bundle.by_path.get(path)
     if f is None or not guard:
         return set(), set()
@@ -980,9 +983,12 @@ def guard_removal_checks(bundle: PRBundle, guard: dict, cand: dict) -> list[dict
       insensitive, as the verifier-quote check): moved, not removed;
     - "alert_reported": guard_diff's deterministic alert finding
       (``evidence.guard_alert_findings``) already reports it - the change is
-      itself an alert change, or an alert finding sits on the same file and
-      line. The alert is in the report; the candidate keeps its verifier
-      status (uncertain / below_min_confidence), not review_suggested."""
+      itself an alert change, its old line holds an alert change's old code,
+      or its own new-side anchor (a swap's line, not a deletion point) is an
+      alert finding's line. The alert is in the report; the candidate keeps
+      its verifier status (uncertain / below_min_confidence), not
+      review_suggested. A guard deleted next to an alerting swap (same -/+
+      block, so its deletion point is the alert's line) still counts."""
     f = bundle.by_path.get(cand["file_path"])
     if f is None:
         return []
@@ -990,7 +996,7 @@ def guard_removal_checks(bundle: PRBundle, guard: dict, cand: dict) -> list[dict
     end = int(cand.get("end_line") or line)
     target_old = old_line_for(f.patch, line)
     deleted = deleted_old_lines(f.patch)
-    alert_lines, _alert_old = guard_alert_spots(bundle, guard, f.path)
+    alert_lines, alert_old = guard_alert_spots(bundle, guard, f.path)
     fn = bundle.outermost_function_at(f.path, line)
     if fn is not None:
         # The function's decorators are part of it (a removed @login_required).
@@ -1037,7 +1043,8 @@ def guard_removal_checks(bundle: PRBundle, guard: dict, cand: dict) -> list[dict
                 row["reason"] = out_reason
             elif _in_new_code(bundle, old_text):
                 row["reason"] = "moved"
-            elif _is_alert_change(g, c) or int(at) in alert_lines:
+            elif (_is_alert_change(g, c) or row["old_line"] in alert_old
+                  or (c.get("line") is not None and int(c["line"]) in alert_lines)):
                 row["reason"] = "alert_reported"
     return out
 
@@ -1087,12 +1094,13 @@ def validate_removed_control(bundle: PRBundle, cand: dict, quote: str | None,
       never qualify this way);
 
     and the quote must be in NO file's new content (moved or kept). With
-    ``guard`` (the scan's guard_diff evidence), lines a guard_diff alert
-    finding already reports don't count either (``guard_alert_spots``: a
-    matched line's deletion point is an alert's new-file line, or a matched
-    line holds an alert change's old code), as for guard_diff's own
-    evidence: the alert is in the report. The control shown is the old
-    file's own lines, not the model's text."""
+    ``guard`` (the scan's guard_diff evidence), a quote of code a guard_diff
+    alert finding already reports doesn't count either (``guard_alert_spots``:
+    a matched line holds an alert change's old code), as for guard_diff's own
+    evidence: the alert is in the report. A guard deleted in the same -/+
+    block as an alerting swap (its deletion point is the alert's line) is a
+    separate removal and still counts. The control shown is the old file's
+    own lines, not the model's text."""
     f = bundle.by_path.get(cand["file_path"])
     if not quote or f is None or not f.old_content or not f.patch:
         return None
@@ -1124,11 +1132,8 @@ def validate_removed_control(bundle: PRBundle, cand: dict, quote: str | None,
             continue
         if _in_new_code(bundle, q):
             return None  # still in the PR's code: moved or kept, not removed
-        if guard:
-            alert_lines, alert_old = guard_alert_spots(bundle, guard, f.path)
-            if set(matched) & alert_old or {
-                    new_line_for(f.patch, n) for n in matched} & alert_lines:
-                return None  # the guard alert already reports this removal
+        if guard and set(matched) & guard_alert_spots(bundle, guard, f.path)[1]:
+            return None  # the guard alert already reports this removal
         return {"evidence": "verifier_quote",
                 "removed_control": "\n".join(lines[first - 1:last])[:REMOVED_CONTROL_MAX_CHARS],
                 "removed_control_line": first}

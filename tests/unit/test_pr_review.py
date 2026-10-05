@@ -790,6 +790,51 @@ def test_a_verifier_quote_of_an_alert_change_is_not_also_a_suggestion():
     assert validate_removed_control(bundle, cand, quote, guard) is None
 
 
+CONTIGUOUS_OLD = (
+    "def find(db, user, name):\n"
+    "    if not user.is_admin:\n"
+    "        raise PermissionDenied\n"
+    "    return db.execute('SELECT * FROM users WHERE name = ?', (name,))\n"
+)
+CONTIGUOUS_NEW = (
+    "def find(db, user, name):\n"
+    "    return db.execute(f\"SELECT * FROM users WHERE name = '{name}'\")\n"
+)
+
+
+def test_a_guard_removed_in_the_same_block_as_an_alerting_swap_still_counts():
+    # One -/+ block deletes the admin check and swaps the parameterised query
+    # for an f-string: the deleted guard's deletion point is the alert's line,
+    # but it is a separate removal the alert doesn't report.
+    from backend.app.core.evidence import guard_alert_findings
+    from backend.app.core.pr_review import guard_removal_checks, validate_removed_control
+
+    files = _files(("app/db.py", CONTIGUOUS_OLD, CONTIGUOUS_NEW))
+    bundle, guard = _bundle_and_guard(files)
+    assert [a["line"] for a in guard_alert_findings(guard)] == [2]
+    cand = {"file_path": "app/db.py", "line": 2, "end_line": 2}
+    rows = {(r["change"]["kind"], r["old_line"], r["new_line"], r["reason"])
+            for r in guard_removal_checks(bundle, guard, cand)}
+    assert ("sql_param", 4, 2, "alert_reported") in rows  # the swap is the alert
+    assert ("auth_check", 2, 2, None) in rows             # the guard is not
+    # (Before: its deletion point, new line 2, was the alert's line, so it was
+    # judged alert_reported and the removed admin check was hidden.)
+    # The verifier's quote: the guard counts, the swapped query does not.
+    assert validate_removed_control(bundle, cand, "if not user.is_admin:", guard)[
+        "removed_control_line"] == 2
+    swapped = "return db.execute('SELECT * FROM users WHERE name = ?', (name,))"
+    assert validate_removed_control(bundle, cand, swapped) is not None
+    assert validate_removed_control(bundle, cand, swapped, guard) is None
+    # End to end: the alert is reported once, the guard removal is worth a look.
+    result = _review(files, PRRouter(audits=[{"findings": [SQL_FINDING]}],
+                                     verdict=UNCERTAIN_NO_QUOTE))
+    _schema_ok(result)
+    assert [f["source"] for f in result["report_findings"]] == ["guard_diff"]
+    [sug] = result["review_suggestions"]
+    assert sug["evidence"] == ["guard_diff"]
+    assert sug["removed_control"] == "if not user.is_admin:" and sug["removed_control_line"] == 2
+
+
 def test_a_verifier_quote_next_to_an_alert_on_another_line_still_counts():
     from backend.app.core.pr_review import validate_removed_control
 

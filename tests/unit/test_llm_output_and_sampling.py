@@ -596,7 +596,8 @@ def test_sampling_table_default_for_qwen():
     ("openrouter", QWEN, True),
     ("groq", QWEN, True),
     ("groq", "openai/gpt-oss-120b", False),
-    ("openrouter", "google/gemma-4-31b-it:free", False),
+    ("openrouter", "google/gemma-4-31b-it:free", True),
+    ("openrouter", "thinkingmachines/inkling:free", False),
 ])
 def test_model_sampling_matches_with_and_without_free_suffix(provider, model, found):
     assert bool(model_sampling(provider, model)) is found

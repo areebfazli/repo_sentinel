@@ -68,8 +68,11 @@ class Settings(BaseSettings):
     # thinking mode (repetition loops). OpenRouter's ":free" endpoint for this
     # model serves an fp4-quantised build. top_k is only sent to providers that
     # accept it (llm_client.PROVIDERS "supports_top_k": OpenRouter).
+    # google/gemma-4-*: the model card's recommendation for all use cases.
     LLM_SAMPLING: dict[str, dict[str, float | int]] = {
         "qwen/qwen3.8-27b": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+        "google/gemma-4-31b-it": {"temperature": 1.0, "top_p": 0.95, "top_k": 64},
+        "google/gemma-4-26b-a4b-it": {"temperature": 1.0, "top_p": 0.95, "top_k": 64},
     }
     # Cap on completion tokens per call, sent as max_tokens (None = not sent).
     # Reasoning models count their thinking against it: the JSON answer is a few

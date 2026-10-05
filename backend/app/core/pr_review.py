@@ -43,13 +43,13 @@ per-function in isolation. Stages:
    ``PR_REVIEW_SUGGEST_MIN_CONFIDENCE`` becomes a ``review_suggestions`` item
    (status ``review_suggested``) only when deterministic checks show the
    change deleted code that looks like a security control there: a removed /
-   weakened guard_diff change of its ``guard_removed`` unit within
-   ``GUARD_EVIDENCE_WINDOW`` lines,
-   whose old code is in no new file and that no guard alert finding already
-   reports (``guard_removal_checks``), or the verifier's
-   ``removed_control_quote`` found in the OLD file near it only on deleted,
-   non-comment lines that guard_diff classifies as a control, and in no new
-   file. At most
+   weakened guard_diff change of its ``guard_removed`` unit inside the
+   candidate's innermost function (``GUARD_EVIDENCE_FALLBACK_WINDOW`` lines
+   for module-level code), whose old code is in no new file
+   (``guard_removal_checks``), or the verifier's ``removed_control_quote``
+   found in the OLD file near it only on deleted, non-comment lines that
+   guard_diff classifies as a control, and in no new file; the guard_diff
+   kind only where no guard alert finding already reports it. At most
    ``PR_REVIEW_MAX_SUGGESTIONS``; never a finding, never gating.
 
 ``review_pr`` runs all of it on a PR given as plain file dicts, without the
@@ -862,10 +862,14 @@ def _strip_removed_markers(quote: str) -> str:
     return "\n".join(out)
 
 
-# A removed / weakened guard counts for a candidate only within this many
-# new-file lines of the candidate's quoted lines (a guard removed elsewhere in
-# a long function is not evidence about this spot).
-GUARD_EVIDENCE_WINDOW = 10
+# A removed / weakened guard counts for a candidate only inside the innermost
+# function containing the candidate's line (``guard_removal_checks``). A sweep
+# of fixed new-file windows on the dev200 run removed no false alarm at any
+# width and lost genuine catches (a cross-channel check 29 lines above the
+# candidate, a validate_git_ref() call 12 lines away, both in the same
+# function). A candidate outside every function (module-level code) falls
+# back to this many new-file lines around its quoted lines.
+GUARD_EVIDENCE_FALLBACK_WINDOW = 30
 
 
 def _deleted_lines_with(pr_file: PRFile, text: str, deleted: set[int]) -> list[int]:
@@ -873,6 +877,45 @@ def _deleted_lines_with(pr_file: PRFile, text: str, deleted: set[int]) -> list[i
     lines = (pr_file.old_content or "").splitlines()
     return [n for n in sorted(deleted)
             if n <= len(lines) and locate_quote(text, lines[n - 1]) is not None]
+
+
+def _old_function_range(bundle: PRBundle, path: str, fn: dict) -> tuple[int, int] | None:
+    """Old-file line range of the changed function ``fn`` (a ``function_at``
+    span of the NEW file), when the bundle matched it to an old function."""
+    for cf in bundle.functions_of(path):
+        u = cf.unit
+        if (cf.status == "modified" and cf.old_start is not None and cf.old_code is not None
+                and u.get("function_name") == fn.get("name")
+                and int(u.get("start_line") or 0) == int(fn["start_line"])):
+            return cf.old_start, cf.old_start + max(len(cf.old_code.splitlines()), 1) - 1
+    return None
+
+
+def _is_alert_change(g: dict, c: dict) -> bool:
+    """``c`` is one of guard_diff's alert-tier changes (``evidence.guard_alert_findings``)."""
+    return bool(g.get("alert")) and c.get("direction") == "weakened" and float(
+        c.get("confidence") or 0) >= ALERT_MIN_CONFIDENCE
+
+
+def guard_alert_spots(bundle: PRBundle, guard: dict, path: str) -> tuple[set[int], set[int]]:
+    """Where guard_diff's deterministic alert findings sit in ``path``: (their
+    new-file lines, the deleted old-file lines holding an alert change's old
+    code). Evidence there is already in the report as the alert."""
+    f = bundle.by_path.get(path)
+    if f is None or not guard:
+        return set(), set()
+    lines = {a["line"] for a in guard_alert_findings(guard)
+             if a["file_path"] == path and a.get("line") is not None}
+    deleted = deleted_old_lines(f.patch)
+    old: set[int] = set()
+    for g in guard.values():
+        if g.get("file_path") != path:
+            continue
+        for c in g.get("changes") or []:
+            text = (c.get("old_text") or "").strip()
+            if text and _is_alert_change(g, c):
+                old.update(_deleted_lines_with(f, text, deleted))
+    return lines, old
 
 
 def guard_removal_checks(bundle: PRBundle, guard: dict, cand: dict) -> list[dict]:
@@ -883,12 +926,21 @@ def guard_removal_checks(bundle: PRBundle, guard: dict, cand: dict) -> list[dict
     The change's spot in the NEW file is guard_diff's own anchor
     (``evidence.guard_to_dict``: the new-side line of a swap), else the
     deletion point (``pr_context.new_line_for``) of the deleted old line
-    holding its old code, the one nearest the candidate. Reasons:
+    holding its old code, the one nearest the candidate. Its scope is the
+    candidate's function: the innermost CodeParser function of the new file
+    containing the candidate's line (``PRBundle.function_at``). Reasons:
 
     - "no_old_code": nothing of the old side to show;
     - "not_located": no new-side anchor, and the old code is on no deleted line;
-    - "too_far": more than GUARD_EVIDENCE_WINDOW new-file lines from the
-      candidate's quoted lines;
+    - "other_function": the spot is outside the candidate's function: a
+      new-side anchor outside its new-file lines; a deleted line outside the
+      old version of that function when the bundle has it (a deletion point
+      is the line AFTER the deleted lines, which can be the next function's
+      first line, or past the end of a function whose last lines were
+      deleted), else a deletion point outside its new-file lines;
+    - "too_far": the candidate is in no function (module-level code) and the
+      spot is more than GUARD_EVIDENCE_FALLBACK_WINDOW new-file lines from
+      the candidate's quoted lines;
     - "moved": the old code is in some file's new content (whitespace-
       insensitive, as the verifier-quote check): moved, not removed;
     - "alert_reported": guard_diff's deterministic alert finding
@@ -903,8 +955,16 @@ def guard_removal_checks(bundle: PRBundle, guard: dict, cand: dict) -> list[dict
     end = int(cand.get("end_line") or line)
     target_old = old_line_for(f.patch, line)
     deleted = deleted_old_lines(f.patch)
-    alert_lines = {a["line"] for a in guard_alert_findings(guard)
-                   if a["file_path"] == f.path and a.get("line") is not None}
+    alert_lines, _alert_old = guard_alert_spots(bundle, guard, f.path)
+    fn = bundle.function_at(f.path, line)
+    if fn is not None:
+        new_scope = (int(fn["start_line"]), int(fn["end_line"]))
+        old_scope = _old_function_range(bundle, f.path, fn)
+        out_reason = "other_function"
+    else:
+        new_scope = (line - GUARD_EVIDENCE_FALLBACK_WINDOW, end + GUARD_EVIDENCE_FALLBACK_WINDOW)
+        old_scope = None
+        out_reason = "too_far"
     out = []
     for u in bundle.units_of(f.path):
         if not (int(u.get("start_line") or 0) <= line <= int(u.get("end_line") or 0)):
@@ -927,27 +987,31 @@ def guard_removal_checks(bundle: PRBundle, guard: dict, cand: dict) -> list[dict
             if row["new_line"] is None and row["old_line"] is not None:
                 row["new_line"] = new_line_for(f.patch, row["old_line"])
             at = row["new_line"]
+            if c.get("line") is None and row["old_line"] is not None and old_scope:
+                # A deleted line: judged in the old version of the function (a
+                # deletion point can be the next function's first line).
+                in_scope = old_scope[0] <= row["old_line"] <= old_scope[1]
+            else:
+                in_scope = at is not None and new_scope[0] <= int(at) <= new_scope[1]
             if at is None:
                 row["reason"] = "not_located"
-            elif not (line - GUARD_EVIDENCE_WINDOW <= int(at) <= end + GUARD_EVIDENCE_WINDOW):
-                row["reason"] = "too_far"
+            elif not in_scope:
+                row["reason"] = out_reason
             elif _in_new_code(bundle, old_text):
                 row["reason"] = "moved"
-            elif (g.get("alert") and c["direction"] == "weakened"
-                  and float(c.get("confidence") or 0) >= ALERT_MIN_CONFIDENCE) \
-                    or int(at) in alert_lines:
+            elif _is_alert_change(g, c) or int(at) in alert_lines:
                 row["reason"] = "alert_reported"
     return out
 
 
 def guard_removal_evidence(bundle: PRBundle, guard: dict, cand: dict) -> dict | None:
     """guard_diff evidence that the change removed or weakened a security
-    check AT the candidate's spot: a removed / weakened change of a
+    check in the candidate's function: a removed / weakened change of a
     ``guard_removed`` unit (the alert tier included) containing the
-    candidate's line that ``guard_removal_checks`` accepts - within
-    GUARD_EVIDENCE_WINDOW new-file lines, not moved, not already reported by
-    a guard alert. The control shown is that change's old code (the most
-    confident change)."""
+    candidate's line that ``guard_removal_checks`` accepts - inside the
+    candidate's innermost function (else within GUARD_EVIDENCE_FALLBACK_WINDOW
+    lines), not moved, not already reported by a guard alert. The control
+    shown is that change's old code (the most confident change)."""
     ok = [r for r in guard_removal_checks(bundle, guard, cand) if r["reason"] is None]
     if not ok:
         return None

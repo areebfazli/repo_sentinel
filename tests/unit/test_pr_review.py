@@ -491,27 +491,40 @@ def test_guard_diff_removal_next_to_the_candidate_is_evidence_without_a_quote():
 GUARD = "    if not user.is_admin:\n        raise PermissionDenied\n"
 
 
-def _far_or_near(far: bool) -> tuple[str, str]:
-    """delete() losing its admin guard; obj.delete() right after it or past
-    GUARD_EVIDENCE_WINDOW lines of filler."""
-    from backend.app.core.pr_review import GUARD_EVIDENCE_WINDOW
-
-    filler = "".join(f"    step{i} = obj.step({i})\n" for i in range(GUARD_EVIDENCE_WINDOW + 2))
-    body = filler + "    obj.delete()\n" if far else "    obj.delete()\n" + filler
-    old = "def delete(request, user, obj):\n" + GUARD + body
+def _far_in_function() -> tuple[str, str]:
+    """delete() losing its admin guard, obj.delete() 32 lines further down the
+    same function (past the old 10-line window and the 30-line fallback)."""
+    filler = "".join(f"    step{i} = obj.step({i})\n" for i in range(30))
+    old = "def delete(request, user, obj):\n" + GUARD + filler + "    obj.delete()\n"
     return old, old.replace(GUARD, "")
 
 
-@pytest.mark.parametrize("far", [True, False])
-def test_guard_diff_removal_must_be_near_the_candidate(far):
-    old, new = _far_or_near(far)
+def test_guard_diff_removal_anywhere_in_the_candidates_function_is_evidence():
+    old, new = _far_in_function()
     result = _guard_review(_files(("app/views.py", old, new)), "obj.delete()")
     [c] = result["candidates"]
-    if far:
-        assert result["review_suggestions"] == []
-        assert c["status"] == "uncertain" and c["review_evidence"] == []
-    else:
-        assert c["status"] == "review_suggested" and c["review_evidence"] == ["guard_diff"]
+    assert c["status"] == "review_suggested" and c["review_evidence"] == ["guard_diff"]
+    [sug] = result["review_suggestions"]
+    assert sug["line"] == 32 and sug["removed_control_line"] == 2
+
+
+NESTED_OLD = (
+    "def outer(request, user, obj):\n"
+    "    if not user.is_admin:\n"
+    "        raise PermissionDenied\n"
+    "    def inner():\n"
+    "        obj.delete()\n"
+    "    return inner\n"
+)
+
+
+def test_guard_diff_removal_outside_the_candidates_innermost_function_is_not():
+    # The guard left outer(); the candidate is in inner(), its innermost function.
+    new = NESTED_OLD.replace(GUARD, "")
+    result = _guard_review(_files(("app/views.py", NESTED_OLD, new)), "obj.delete()")
+    [c] = result["candidates"]
+    assert result["review_suggestions"] == []
+    assert c["status"] == "uncertain" and c["review_evidence"] == []
 
 
 def _bundle_and_guard(files):
@@ -525,22 +538,58 @@ def _bundle_and_guard(files):
                                   parser)
 
 
+def _guard_rows(files, path, line):
+    from backend.app.core.pr_review import guard_removal_checks
+
+    bundle, guard = _bundle_and_guard(files)
+    rows = guard_removal_checks(bundle, guard, {"file_path": path, "line": line,
+                                                "end_line": line})
+    # The guard block (the is_admin read is a second, auth_check call change);
+    # a unit nested in another (or in a whole-file unit) repeats its rows.
+    return sorted({(r["old_line"], r["new_line"], r["reason"]) for r in rows
+                   if r["change"]["old_text"].startswith("if not")})
+
+
 def test_guard_removal_checks_explain_each_change():
-    from backend.app.core.pr_review import GUARD_EVIDENCE_WINDOW, guard_removal_checks
+    old, new = _far_in_function()
+    files = _files(("app/views.py", old, new))
+    # The deleted guard (old line 2) sits at the deletion point, new line 2;
+    # obj.delete() is new line 32, same function: it counts.
+    assert _guard_rows(files, "app/views.py", 32) == [(2, 2, None)]
+    # In inner() the guard removed from outer() is another function's.
+    files = _files(("app/views.py", NESTED_OLD, NESTED_OLD.replace(GUARD, "")))
+    # (Its deletion point, new line 2, is inner()'s def line: the old version
+    # of inner(), old lines 4-5, places it.)
+    assert _guard_rows(files, "app/views.py", 3) == [(2, 2, "other_function")]
+    assert _guard_rows(files, "app/views.py", 4) == [(2, 2, None)]  # outer's own line
 
-    old, new = _far_or_near(far=True)
-    bundle, guard = _bundle_and_guard(_files(("app/views.py", old, new)))
-    cand_line = 2 + GUARD_EVIDENCE_WINDOW + 2  # obj.delete() in the new file
 
-    def guard_rows(line):
-        rows = guard_removal_checks(bundle, guard, {"file_path": "app/views.py", "line": line,
-                                                    "end_line": line})
-        return [(r["old_line"], r["new_line"], r["reason"]) for r in rows
-                if r["change"]["old_text"].startswith("if not")]
+def test_a_guard_deleted_from_the_end_of_the_function_still_counts():
+    # The deletion point of a function's deleted last line is the line after
+    # the function: the old version of the function places it.
+    old = ("def save(user, obj):\n"
+           "    obj.save()\n"
+           "    if not user.is_admin:\n"
+           "        raise PermissionDenied\n"
+           "\n"
+           "def other():\n"
+           "    return 1\n")
+    new = old.replace(GUARD, "")
+    assert _guard_rows(_files(("app/views.py", old, new)), "app/views.py", 2) == [
+        (3, 3, None)]
 
-    # The deleted guard (old line 2) sits at the deletion point, new line 2.
-    assert guard_rows(cand_line) == [(2, 2, "too_far")]
-    assert guard_rows(2 + GUARD_EVIDENCE_WINDOW) == [(2, 2, None)]
+
+def test_module_level_candidates_fall_back_to_a_line_window():
+    from backend.app.core.pr_review import GUARD_EVIDENCE_FALLBACK_WINDOW
+
+    guard = "if not settings.is_admin:\n    raise PermissionDenied\n"
+    filler = "".join(f"x{i} = {i}\n" for i in range(GUARD_EVIDENCE_FALLBACK_WINDOW + 4))
+    old = "import os\n" + guard + filler + "os.remove(path)\n"
+    files = _files(("app/boot.py", old, old.replace(guard, "")))
+    cand = 2 + GUARD_EVIDENCE_FALLBACK_WINDOW + 4  # os.remove(path) in the new file
+    assert _guard_rows(files, "app/boot.py", cand) == [(2, 2, "too_far")]
+    assert _guard_rows(files, "app/boot.py", 2 + GUARD_EVIDENCE_FALLBACK_WINDOW) == [
+        (2, 2, None)]
 
 
 def test_guard_alert_change_is_not_also_a_suggestion():

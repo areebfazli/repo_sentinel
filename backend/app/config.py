@@ -149,11 +149,12 @@ class Settings(BaseSettings):
     # with at least PR_REVIEW_SUGGEST_MIN_CONFIDENCE, AND deterministic evidence
     # that the change deleted code that looks like a security control at that
     # spot: a guard_diff removed / weakened change of a guard_removed unit
-    # within 10 lines of it, whose old code is in no new file and that no guard
-    # alert finding already reports; or the verifier's removed_control_quote
-    # found in the old file only on deleted, non-comment lines that guard_diff
-    # classifies as a control, and in no new file. At most
-    # PR_REVIEW_MAX_SUGGESTIONS per scan; 0 turns the tier off.
+    # inside the candidate's function (30 lines around it in module-level
+    # code), whose old code is in no new file and that no guard alert finding
+    # already reports; or the verifier's removed_control_quote found in the
+    # old file only on deleted, non-comment lines that guard_diff classifies as
+    # a control, and in no new file. At most PR_REVIEW_MAX_SUGGESTIONS per
+    # scan; 0 turns the tier off.
     PR_REVIEW_MAX_SUGGESTIONS: int = 5
     PR_REVIEW_SUGGEST_MIN_CONFIDENCE: int = 4
     # Semgrep hits at/above this severity are shown to the audit as LEADS

@@ -134,7 +134,7 @@ class ReviewSuggestion(BaseModel):
     "verifier_quote" (the verifier's quote of the control, found in the old
     file only on deleted, non-comment lines that guard_diff classifies as a
     control, and in no new file) and / or "guard_diff" (a removed / weakened
-    change of a guard_removed unit within GUARD_EVIDENCE_WINDOW lines, not
+    change of a guard_removed unit inside the candidate's function, not
     found in new code, not already a guard alert finding). Never a finding:
     not in ``report_findings``, ``is_vulnerable`` or any gate. Text fields are plain
     text (LLM-written or PR code): escape them when rendering."""

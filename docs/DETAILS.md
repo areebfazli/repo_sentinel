@@ -422,12 +422,18 @@ reviewer reads one, not function by function:
    checks show the change deleted code that looks like a security control at that spot
    (deleted lines, recognised as a control, not found elsewhere in the new code). Either:
    - **guard_diff**: a removed / weakened change of a `guard_removed` unit containing the
-     candidate, within `GUARD_EVIDENCE_WINDOW` (10) new-file lines of the candidate's quoted
-     lines (a swap's new-side line, else the deletion point of the deleted old line holding
-     the guard), whose old code is in no file's NEW content (moved, not removed), and that no
-     guard_diff alert finding already reports (the change is itself an alert change, or an
-     alert finding is on the same file and line: the alert is in the report already; the
-     candidate then keeps its verifier status, `uncertain` / below the cutoff); or
+     candidate, located inside the candidate's function (the innermost function of the new
+     file containing the candidate's line; a swap by its new-side line, a deleted guard by
+     its old line within the old version of that function, or by its deletion point when
+     the function is new), whose old code is in no file's NEW content (moved, not removed).
+     A candidate in no function (module-level code) falls back to
+     `GUARD_EVIDENCE_FALLBACK_WINDOW` (30) new-file lines around it. An earlier fixed
+     10-line window around the candidate removed no false alarm at any width on the dev200
+     rescore and lost genuine catches (a removed cross-channel check 29 lines above the
+     candidate, a removed `validate_git_ref` 12 lines away, both in the same function). It
+     must also be no change a guard_diff alert finding already reports (the change is itself
+     an alert change, or an alert finding is on the same file and line: the alert is in the
+     report already; the candidate then keeps its verifier status); or
    - **the verifier's quote**: its optional `removed_control_quote` is found
      (whitespace-insensitive, diff markers tolerated) in the OLD file within 40 lines of the
      candidate, every non-blank line it matches is a line the patch deletes (not kept or
@@ -503,9 +509,9 @@ fixes and 80 bystander benign PRs). Retrieval is off in every arm; no embedder o
   the cached verdicts with **guard_diff evidence only** (recomputed from the dataset; the old
   verifier prompt had no `removed_control_quote`) at the run's own cutoff, and labels it so;
   without the dataset the view is reported n/a. Rescore of `pr_eval_pr_dev200.json` (old
-  prompt, cutoff 8, guard_diff evidence only, with the guard_diff evidence limited to the
-  candidate's spot): introducing strict 15/55 (verified 12/55), function-level 19/55
-  (16/55); fix PRs flagged 3/57 (2/57); benign 0/48 (0/48; only 48 of 80 benign PRs scored).
+  prompt, cutoff 8, guard_diff evidence only, limited to the candidate's function):
+  introducing strict 15/55 (verified 12/55), function-level 20/55 (16/55); fix PRs flagged
+  3/57 (2/57); benign 0/48 (0/48; only 48 of 80 benign PRs scored).
 - `--arm units`: the per-unit review (`REVIEW_MODE=units`), run in-process exactly as
   `scan_runner` runs files mode, on the same PRs.
 - `--arm pr_misleading`: the `pr` arm on the `_misleading` variants of the selected

@@ -135,7 +135,8 @@ class ReviewSuggestion(BaseModel):
     file only on deleted, non-comment lines that guard_diff classifies as a
     control, and in no new file) and / or "guard_diff" (a removed / weakened
     change of a guard_removed unit inside the candidate's function, not
-    found in new code, not already a guard alert finding). Never a finding:
+    found in new code); neither kind where a guard alert finding already
+    reports it. Python / JavaScript only. Never a finding:
     not in ``report_findings``, ``is_vulnerable`` or any gate. Text fields are plain
     text (LLM-written or PR code): escape them when rendering."""
 

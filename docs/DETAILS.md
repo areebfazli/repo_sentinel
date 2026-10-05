@@ -430,10 +430,7 @@ reviewer reads one, not function by function:
      `GUARD_EVIDENCE_FALLBACK_WINDOW` (30) new-file lines around it. An earlier fixed
      10-line window around the candidate removed no false alarm at any width on the dev200
      rescore and lost genuine catches (a removed cross-channel check 29 lines above the
-     candidate, a removed `validate_git_ref` 12 lines away, both in the same function). It
-     must also be no change a guard_diff alert finding already reports (the change is itself
-     an alert change, or an alert finding is on the same file and line: the alert is in the
-     report already; the candidate then keeps its verifier status); or
+     candidate, a removed `validate_git_ref` 12 lines away, both in the same function); or
    - **the verifier's quote**: its optional `removed_control_quote` is found
      (whitespace-insensitive, diff markers tolerated) in the OLD file within 40 lines of the
      candidate, every non-blank line it matches is a line the patch deletes (not kept or
@@ -441,6 +438,14 @@ reviewer reads one, not function by function:
      lines are a control by guard_diff's own classifier (guard calls such as sanitisers,
      auth / permission checks or `compare_digest`, guard blocks, bounds checks, safe API /
      flag / SQL forms; Python / JavaScript only), and the quote is in no file's NEW content.
+
+   Neither kind counts where a guard_diff alert finding already reports the removal: the
+   change is itself an alert change, an alert finding is on the same file and line (for the
+   quote: a matched line's deletion point), or a quoted line holds an alert change's old code.
+   The alert is in the report already; the candidate keeps its verifier status (`uncertain` /
+   below the cutoff). Both routes rely on guard_diff's grammar (Python / JavaScript /
+   TypeScript): for **Go, Java** and other languages the verifier's quote can never qualify
+   (no control classifier) and guard_diff gives no evidence, so the tier never fires there.
 
    A claim that doesn't check out never qualifies; `rejected` / unverified never do. At most
    `PR_REVIEW_MAX_SUGGESTIONS` (5); candidates past the cap keep their verifier status.

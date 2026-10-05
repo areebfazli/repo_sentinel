@@ -623,6 +623,49 @@ def test_a_removal_on_an_alert_line_is_not_also_a_suggestion():
     assert by_kind == {"safe_api": "alert_reported", "sanitiser": "alert_reported"}
 
 
+def test_a_verifier_quote_of_an_alert_change_is_not_also_a_suggestion():
+    from backend.app.core.pr_review import validate_removed_control
+
+    quote = "return db.execute('SELECT * FROM users WHERE name = ?', (name,))"
+    verdict = {"verdict": "uncertain", "confidence": 5, "reason": "a control was removed",
+               "removed_control_quote": quote}
+    result = _review(_files(("app/db.py", SQL_OLD, SQL_NEW)),
+                     PRRouter(audits=[{"findings": [SQL_FINDING]}], verdict=verdict))
+    _schema_ok(result)
+    # The parameterised query the verifier quotes is the guard alert's own
+    # change (alert on line 2): no duplicate worth-a-look item.
+    assert [f["source"] for f in result["report_findings"]] == ["guard_diff"]
+    assert result["review_suggestions"] == []
+    [c] = result["candidates"]
+    assert c["status"] == "uncertain" and c["review_evidence"] == []
+    s = result["pr_review"]
+    parts = ("hard_excluded", "below_audit_confidence", "confirmed", "rejected", "uncertain",
+             "below_min_confidence", "review_suggested", "unverified")
+    assert sum(s[k] for k in parts) == s["candidates"] == 1
+    # Without the guard evidence the quote itself checks out.
+    bundle, guard = _bundle_and_guard(_files(("app/db.py", SQL_OLD, SQL_NEW)))
+    cand = {"file_path": "app/db.py", "line": 2, "end_line": 2}
+    assert validate_removed_control(bundle, cand, quote)["evidence"] == "verifier_quote"
+    assert validate_removed_control(bundle, cand, quote, guard) is None
+
+
+def test_a_verifier_quote_next_to_an_alert_on_another_line_still_counts():
+    from backend.app.core.pr_review import validate_removed_control
+
+    old = ("def find(db, user, name):\n"
+           "    if not user.is_admin:\n"
+           "        raise PermissionDenied\n"
+           "    x = 1\n"
+           "    return db.execute('SELECT * FROM users WHERE name = ?', (name,))\n")
+    new = ("def find(db, user, name):\n"
+           "    x = 1\n"
+           "    return db.execute(f\"SELECT * FROM users WHERE name = '{name}'\")\n")
+    bundle, guard = _bundle_and_guard(_files(("app/db.py", old, new)))
+    cand = {"file_path": "app/db.py", "line": 3, "end_line": 3}
+    ev = validate_removed_control(bundle, cand, "if not user.is_admin:", guard)
+    assert ev is not None and ev["removed_control_line"] == 2
+
+
 def test_suggestions_can_be_turned_off_and_are_capped():
     router = PRRouter(audits=[{"findings": [TRAVERSAL]}], verdict=UNCERTAIN_REMOVED)
     result = _review(_files(("app/files.py", RM_OLD, RM_NEW)), router, max_review_suggestions=0)

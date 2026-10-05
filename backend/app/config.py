@@ -150,11 +150,13 @@ class Settings(BaseSettings):
     # that the change deleted code that looks like a security control at that
     # spot: a guard_diff removed / weakened change of a guard_removed unit
     # inside the candidate's function (30 lines around it in module-level
-    # code), whose old code is in no new file and that no guard alert finding
-    # already reports; or the verifier's removed_control_quote found in the
-    # old file only on deleted, non-comment lines that guard_diff classifies as
-    # a control, and in no new file. At most PR_REVIEW_MAX_SUGGESTIONS per
-    # scan; 0 turns the tier off.
+    # code), whose old code is in no new file; or the verifier's
+    # removed_control_quote found in the old file only on deleted, non-comment
+    # lines that guard_diff classifies as a control, and in no new file; never
+    # where a guard alert finding already reports the removal. Python /
+    # JavaScript only (guard_diff has no Go / Java grammar: the tier never
+    # fires there). At most PR_REVIEW_MAX_SUGGESTIONS per scan; 0 turns the
+    # tier off.
     PR_REVIEW_MAX_SUGGESTIONS: int = 5
     PR_REVIEW_SUGGEST_MIN_CONFIDENCE: int = 4
     # Semgrep hits at/above this severity are shown to the audit as LEADS

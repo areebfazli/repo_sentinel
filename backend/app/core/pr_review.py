@@ -48,8 +48,10 @@ per-function in isolation. Stages:
    for module-level code), whose old code is in no new file
    (``guard_removal_checks``), or the verifier's ``removed_control_quote``
    found in the OLD file near it only on deleted, non-comment lines that
-   guard_diff classifies as a control, and in no new file; the guard_diff
-   kind only where no guard alert finding already reports it. At most
+   guard_diff classifies as a control, and in no new file; either kind only
+   where no guard alert finding already reports it. Both routes need
+   guard_diff's grammar (Python / JavaScript / TypeScript): for Go, Java and
+   other languages neither can qualify, so the tier never fires. At most
    ``PR_REVIEW_MAX_SUGGESTIONS``; never a finding, never gating.
 
 ``review_pr`` runs all of it on a PR given as plain file dicts, without the
@@ -1029,7 +1031,8 @@ def _in_new_code(bundle: PRBundle, text: str) -> bool:
                for p in bundle.files if p.new_content)
 
 
-def validate_removed_control(bundle: PRBundle, cand: dict, quote: str | None) -> dict | None:
+def validate_removed_control(bundle: PRBundle, cand: dict, quote: str | None,
+                             guard: dict | None = None) -> dict | None:
     """The verifier's ``removed_control_quote`` as evidence, or None. It must
     be (at most MAX_REMOVED_CONTROL_LINES lines, at least ``MIN_QUOTE_CHARS``)
     found in the file's OLD content (``locate_quote``: whitespace-insensitive;
@@ -1047,8 +1050,13 @@ def validate_removed_control(bundle: PRBundle, cand: dict, quote: str | None) ->
       ``log.debug(p)`` is not one (Python / JavaScript only: other languages
       never qualify this way);
 
-    and the quote must be in NO file's new content (moved or kept). The
-    control shown is the old file's own lines, not the model's text."""
+    and the quote must be in NO file's new content (moved or kept). With
+    ``guard`` (the scan's guard_diff evidence), lines a guard_diff alert
+    finding already reports don't count either (``guard_alert_spots``: a
+    matched line's deletion point is an alert's new-file line, or a matched
+    line holds an alert change's old code), as for guard_diff's own
+    evidence: the alert is in the report. The control shown is the old
+    file's own lines, not the model's text."""
     f = bundle.by_path.get(cand["file_path"])
     if not quote or f is None or not f.old_content or not f.patch:
         return None
@@ -1080,6 +1088,11 @@ def validate_removed_control(bundle: PRBundle, cand: dict, quote: str | None) ->
             continue
         if _in_new_code(bundle, q):
             return None  # still in the PR's code: moved or kept, not removed
+        if guard:
+            alert_lines, alert_old = guard_alert_spots(bundle, guard, f.path)
+            if set(matched) & alert_old or {
+                    new_line_for(f.patch, n) for n in matched} & alert_lines:
+                return None  # the guard alert already reports this removal
         return {"evidence": "verifier_quote",
                 "removed_control": "\n".join(lines[first - 1:last])[:REMOVED_CONTROL_MAX_CHARS],
                 "removed_control_line": first}
@@ -1092,7 +1105,8 @@ def removed_control_evidence(bundle: PRBundle, guard: dict, cand: dict,
     security control at the candidate's spot: the verifier's validated quote,
     then guard_diff."""
     out = []
-    quoted = validate_removed_control(bundle, cand, verdict.get("removed_control_quote"))
+    quoted = validate_removed_control(bundle, cand, verdict.get("removed_control_quote"),
+                                      guard)
     if quoted:
         out.append(quoted)
     by_guard = guard_removal_evidence(bundle, guard, cand)
@@ -1398,8 +1412,8 @@ async def run_pr_review(
         # findings only; a confirmation under the cutoff is below_min_confidence,
         # unless it (or an uncertain one) is a review suggestion. A candidate
         # whose only evidence a guard alert finding already reports has none
-        # (``guard_removal_checks``) and keeps its verifier status, as does one
-        # past the PR_REVIEW_MAX_SUGGESTIONS cap.
+        # (``guard_removal_checks``, ``validate_removed_control``) and keeps its
+        # verifier status, as does one past the PR_REVIEW_MAX_SUGGESTIONS cap.
         if verdict["verdict"] == "confirmed" and verdict["confidence"] >= config.min_confidence:
             c["status"] = "confirmed"
             stats["confirmed"] += 1

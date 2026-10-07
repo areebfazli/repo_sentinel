@@ -143,7 +143,7 @@ can still be overridden there. Highlights:
 | `SEMGREP_ENABLED` / `SEMGREP_MIN_SEVERITY` | `True` / `high` | Static-analysis evidence for the review (see below); a missing engine only logs a warning |
 | `REVIEW_MODE` | `pr` | Files mode: `pr` = PR-level audit + verification (below); `units` = the per-function review (kept for comparison). Snippet mode always uses the per-unit review |
 | `PR_REVIEW_MAX_PROMPT_TOKENS` / `PR_REVIEW_MAX_AUDIT_CALLS` / `PR_REVIEW_CONTEXT_ROUNDS` / `PR_REVIEW_CONTEXT_MAX_TOKENS` | `12000` / `4` / `2` / `1500` | Audit budget: prompt size (estimated tokens, incl. the context reserve; also the verifier prompt's size; a prompt too big for Groq's 8K tokens/min skips the Groq clients, so with Groq as the only provider set `6000`, see [the Groq limitation](#notes--gotchas)), audit calls per scan (context rounds included; a PR too big for one prompt is split by file), extra rounds answering the model's context requests, tokens of requested context per prompt |
-| `PR_REVIEW_MAX_VERIFIER_CALLS` / `PR_REVIEW_MIN_CONFIDENCE` / `PR_REVIEW_MIN_AUDIT_CONFIDENCE` | `8` / `7` / `5` | One verifier call per candidate, at most this many; a finding is reported only when confirmed with confidence ≥ 7/10; candidates the audit itself rates below 5 are not verified. An unverified candidate is not reported and makes the review `partial` |
+| `PR_REVIEW_MAX_VERIFIER_CALLS` / `PR_REVIEW_MIN_CONFIDENCE` / `PR_REVIEW_MIN_AUDIT_CONFIDENCE` | `8` / `7` / `5` | One verifier call per candidate, at most this many; a finding is reported only when confirmed with confidence ≥ 7/10; candidates the audit itself rates below 5 are not verified (one without a confidence counts as 5). An unverified candidate is not reported and makes the review `partial` |
 | `PR_REVIEW_MAX_SUGGESTIONS` / `PR_REVIEW_SUGGEST_MIN_CONFIDENCE` | `5` / `4` | The non-blocking "worth a look" tier (below): at most this many per scan (`0` = off), verifier confidence needed. Never findings, never gating |
 | `PR_REVIEW_SEMGREP_LEAD_MIN_SEVERITY` / `PR_REVIEW_SINK_LEADS` / `PR_REVIEW_HARD_EXCLUSIONS` | `low` / `True` / `True` | Semgrep hits shown as leads (marked "lead only" below `SEMGREP_MIN_SEVERITY`), sensitive-sink leads on added lines, regex hard exclusions before verification |
 | `PR_REVIEW_FIX_EXAMPLES` / `VERIFIER_MODEL` | `0` / (none) | Retrieved "how a similar bug was fixed" examples in the audit prompt (off); `<provider>:<model>` tried first for verifier calls (the normal chain stays the fallback; each finding records `verifier`) |
@@ -360,7 +360,9 @@ path-containment and bounds checks, `raise`/`return`/`throw` guard blocks, unsaf
 keywords (`Loader=SafeLoader`, `resolve_entities=False`, `weights_only=True` on `torch.load`:
 dropping the explicit `True` or writing `False` is weakened, at 0.6, i.e. `guard_removed` but not
 the alert tier, as dropping it is harmless from torch 2.6, where it is the default; numpy's
-`allow_pickle` only counts as an explicit `True`, its default being safe) and parameterised
+`allow_pickle` only counts as an explicit `True`, its default being safe; lxml's
+`no_network=True` is the safe setting, so writing `False` or dropping an explicit `True` is
+weakened, at 0.4) and parameterised
 SQL turned into interpolated SQL. It nets them into `risk` (`guard_removed` / `guard_added` /
 `none`) plus a high-precision `alert` tier (swap/flag/SQL evidence only). A flag written in a
 function's parameter list (a default such as `def check(sig, verify=False)`,
@@ -371,7 +373,10 @@ caller may override, not a setting the code applies: it weighs at most `SIGNATUR
 its full weight. Features are counted per kind with identifier-anonymised keys, so renames,
 reformatting and moved statements don't count. The vocabularies are module-level tables. Files
 mode already has what it needs: `old_code_for_units` reverse-applies the Action's `patch` to
-`content` to get the old file.
+`content` to get the old file. A new function, or a whole file the PR adds (empty old version,
+e.g. a patch from `/dev/null`), gives no signal (note `new_function` / `new_file`): there is no
+old version, and comparing with an empty one would read every `shell=True` of a new file as a
+weakening.
 
 **In scans** (files mode only; a snippet has no previous version): units are planned with
 `patch_touched_lines(patch)` (deletion points count as changes, so a function whose only
@@ -439,8 +444,14 @@ reviewer reads one, not function by function:
    `pr_review.context_unresolved`, a report note, the eval's funnel). Answers without
    either (or with the wrong types) stay bad output.
 5. **Validation + filters**: the quote must be in the NEW file (searched near the claimed line
-   first; diff markers tolerated), then regex hard exclusions (DoS, rate limiting, resource
-   leaks, memory safety outside C/C++, docs, tests) and the audit-confidence floor.
+   first; diff markers tolerated; failing that, a loose fallback that ignores quote / backtick
+   characters and their backslash escapes, only within 3 lines of the claimed line, never
+   file-wide), and must not be comments only (Python / JavaScript: every non-blank quoted line
+   a comment or docstring -> dropped as `quote_not_found`); then regex hard exclusions (DoS and
+   memory safety outside C/C++ judged on the finding's title and CWE only, not its explanation,
+   so an XXE that mentions "billion laughs ... denial of service" is not dropped; ReDoS left to
+   the verifier; rate limiting, resource leaks, docs, tests) and the audit-confidence floor (a
+   candidate without a confidence counts as exactly the floor and is verified).
 6. **Verification**: one fresh-context call per candidate with the file after the change
    (whole, or a window around the finding plus its function), its diff and the claim; it must
    establish source, control, sink, reachable path and counterevidence, with precedents for

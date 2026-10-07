@@ -358,8 +358,9 @@ def hard_exclusion_reason(finding: dict) -> str | None:
     """Why a candidate finding is excluded without verification, or None.
     Looks at the file path, and at the model's own words: the DoS and
     memory-safety rules at the title + CWE only (the claim itself; an
-    explanation often mentions such effects on the side), the rate-limiting
-    and resource-leak rules at the title + explanation."""
+    explanation often mentions such effects on the side; a regex mentioned
+    anywhere still exempts a DoS claim, left to the verifier), the
+    rate-limiting and resource-leak rules at the title + explanation."""
     path = finding.get("file_path") or finding.get("file") or ""
     ext = _ext(path)
     if ext in _DOC_EXTENSIONS:
@@ -369,7 +370,11 @@ def hard_exclusion_reason(finding: dict) -> str | None:
     title = str(finding.get("title") or "")
     cwe = _cwe_id(finding.get("cwe"))
     text = f"{title} {finding.get('explanation') or ''}".lower()
-    redos = bool(_REGEX_DOS.search(title)) or cwe == "CWE-1333"
+    # The ReDoS EXEMPTION reads the explanation too (a "Denial of service"
+    # title with CWE-400 whose explanation is about a regex is a ReDoS claim);
+    # erring towards the verifier is safe, so only the exclusion triggers are
+    # limited to the title + CWE.
+    redos = bool(_REGEX_DOS.search(text)) or cwe == "CWE-1333"
     if not redos and (cwe in _DOS_CWES or any(p.search(title) for p in _DOS_PATTERNS)):
         return "generic DoS / resource exhaustion finding"
     if any(p.search(text) for p in _RATE_LIMITING_PATTERNS):

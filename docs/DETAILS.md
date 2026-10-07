@@ -449,8 +449,9 @@ reviewer reads one, not function by function:
    file-wide), and must not be comments only (Python / JavaScript: every non-blank quoted line
    a comment or docstring -> dropped as `quote_not_found`); then regex hard exclusions (DoS and
    memory safety outside C/C++ judged on the finding's title and CWE only, not its explanation,
-   so an XXE that mentions "billion laughs ... denial of service" is not dropped; ReDoS left to
-   the verifier; rate limiting, resource leaks, docs, tests) and the audit-confidence floor (a
+   so an XXE that mentions "billion laughs ... denial of service" is not dropped; ReDoS (a
+   regex named in the title or explanation, or CWE-1333) left to the verifier; rate limiting,
+   resource leaks, docs, tests) and the audit-confidence floor (a
    candidate without a confidence counts as exactly the floor and is verified).
 6. **Verification**: one fresh-context call per candidate with the file after the change
    (whole, or a window around the finding plus its function), its diff and the claim; it must

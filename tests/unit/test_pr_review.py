@@ -1589,6 +1589,11 @@ XXE_FINDING = {
     ({**XXE_FINDING, "title": "ReDoS in the email validator", "cwe": "CWE-1333"}, False),
     ({**XXE_FINDING, "title": "Denial of service via a user-supplied pattern",
       "cwe": "CWE-1333"}, False),
+    # A DoS-titled CWE-400 finding whose explanation is about a regex is a ReDoS
+    # claim (many ReDoS advisories carry CWE-400): the verifier decides.
+    ({**XXE_FINDING, "title": "Denial of service in the email validator", "cwe": "CWE-400",
+      "explanation": "The regular expression backtracks catastrophically on long input."},
+     False),
 ])
 def test_dos_and_memory_safety_exclusions_judge_title_and_cwe(finding, excluded):
     assert bool(hard_exclusion_reason(finding)) is excluded

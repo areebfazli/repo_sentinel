@@ -363,10 +363,11 @@ FLAGS: list[tuple[str, str, str | None, bool, str, float]] = [
     ("sanitize", r"false", None, True, "sanitiser", 0.5),
     ("resolve_entities|noent", r"True|true", r"False|false", False, "xxe", 0.6),
     ("load_dtd|huge_tree|dtd_validation", r"True|true", None, True, "xxe", 0.4),
-    # lxml's no_network=True (its default) is the SAFE setting: it blocks
-    # network access while resolving entities / DTDs. Writing False, or
-    # dropping an explicit True, weakens it; adding True strengthens it.
-    ("no_network", r"False|false", r"True|true", False, "xxe", 0.4),
+    # lxml's no_network=True is the SAFE setting (it blocks network access
+    # while resolving entities / DTDs) and the default, so only an explicit
+    # False counts: writing it weakens, dropping it strengthens; adding or
+    # dropping an explicit True changes nothing.
+    ("no_network", r"False|false", None, True, "xxe", 0.4),
     # numpy.load: allow_pickle defaults to False (numpy >= 1.16.3), so only an
     # explicit True counts; dropping an explicit False changes nothing.
     ("allow_pickle", r"True", None, True, "safe_api", 0.6),

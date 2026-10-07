@@ -764,14 +764,18 @@ LXML = "def parse(data):\n    return etree.XMLParser({})\n"
 
 @pytest.mark.parametrize("old, new, direction", [
     ("no_network=True", "no_network=False", "weakened"),
-    ("no_network=True", "", "weakened"),
     ("", "no_network=False", "weakened"),
-    ("", "no_network=True", "strengthened"),
     ("no_network=False", "no_network=True", "strengthened"),
     ("no_network=False", "", "strengthened"),
+    # True is lxml's default: writing or dropping it explicitly changes nothing.
+    ("no_network=True", "", None),
+    ("", "no_network=True", None),
 ])
 def test_no_network_true_is_the_safe_lxml_setting(old, new, direction):
     r = guard_diff(LXML.format(old), LXML.format(new), "python")
+    if direction is None:
+        assert not r.changes and not r.alert
+        return
     (c,) = r.changes
     assert (c.direction, c.kind) == (direction, "xxe")
     assert c.confidence < ALERT_MIN_CONFIDENCE and not r.alert

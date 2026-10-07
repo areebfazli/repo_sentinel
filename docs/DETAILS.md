@@ -361,8 +361,8 @@ keywords (`Loader=SafeLoader`, `resolve_entities=False`, `weights_only=True` on 
 dropping the explicit `True` or writing `False` is weakened, at 0.6, i.e. `guard_removed` but not
 the alert tier, as dropping it is harmless from torch 2.6, where it is the default; numpy's
 `allow_pickle` only counts as an explicit `True`, its default being safe; lxml's
-`no_network=True` is the safe setting, so writing `False` or dropping an explicit `True` is
-weakened, at 0.4) and parameterised
+`no_network=True` is the safe setting and its default, so only an explicit `False` counts
+(weakened at 0.4; writing or dropping an explicit `True` changes nothing)) and parameterised
 SQL turned into interpolated SQL. It nets them into `risk` (`guard_removed` / `guard_added` /
 `none`) plus a high-precision `alert` tier (swap/flag/SQL evidence only). A flag written in a
 function's parameter list (a default such as `def check(sig, verify=False)`,

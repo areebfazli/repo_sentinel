@@ -54,8 +54,9 @@ patch covers every change in the file, so reverse-applying it to ``content``
 reconstructs the whole pre-change file (``reverse_apply_patch``), and the old
 version of each unit is the same-named function in it (``old_code_for_units``).
 No signal is possible when the patch is missing (GitHub omits it for very large
-diffs), does not apply, or the function is new; an optional ``base_content``
-attribute on the file (not yet in ``FileInput``) is used when present.
+diffs), does not apply, or the function (or the whole file) is new; an optional
+``base_content`` attribute on the file (not yet in ``FileInput``) is used when
+present.
 ``plan_units`` selects functions by *added* lines only, so a function whose only
 change is a deleted guard is never a unit: integration must plan with
 ``patch_touched_lines(patch)`` (deletion points included) as ``changed_lines``.
@@ -361,7 +362,11 @@ FLAGS: list[tuple[str, str, str | None, bool, str, float]] = [
     ("noEscape", r"true", None, True, "sanitiser", 0.6),
     ("sanitize", r"false", None, True, "sanitiser", 0.5),
     ("resolve_entities|noent", r"True|true", r"False|false", False, "xxe", 0.6),
-    ("load_dtd|huge_tree|dtd_validation|no_network", r"True|true", None, True, "xxe", 0.4),
+    ("load_dtd|huge_tree|dtd_validation", r"True|true", None, True, "xxe", 0.4),
+    # lxml's no_network=True (its default) is the SAFE setting: it blocks
+    # network access while resolving entities / DTDs. Writing False, or
+    # dropping an explicit True, weakens it; adding True strengthens it.
+    ("no_network", r"False|false", r"True|true", False, "xxe", 0.4),
     # numpy.load: allow_pickle defaults to False (numpy >= 1.16.3), so only an
     # explicit True counts; dropping an explicit False changes nothing.
     ("allow_pickle", r"True", None, True, "safe_api", 0.6),
@@ -1490,10 +1495,16 @@ def old_code_for_units(file, units: list[dict], parser) -> list[tuple[str | None
     """For each unit (``plan_units`` dicts of this file), its pre-change code and
     a note. Functions are matched by name; among same-named functions (e.g.
     ``<anonymous>`` arrows) the one nearest the patch-mapped start line wins. A
-    whole-file unit (``function_name`` None) maps to the whole old file."""
+    whole-file unit (``function_name`` None) maps to the whole old file. A file
+    the PR adds (empty old content, e.g. a ``@@ -0,0 +1,N @@`` patch from
+    /dev/null) gives no signal for any unit (note "new_file"): like a new
+    function, there is no old version to compare against, and comparing with
+    "" would read every flag / hazard of the new file as a weakening."""
     old_content, note = old_content_for_file(file)
     if old_content is None:
         return [(None, note) for _ in units]
+    if old_content == "" and (getattr(file, "content", None) or ""):
+        return [(None, "new_file") for _ in units]
     ext = "." + file.path.rsplit(".", 1)[-1].lower() if "." in file.path else ""
     try:
         old_funcs = parser.extract_functions(old_content, ext) if parser.supports(ext) else []

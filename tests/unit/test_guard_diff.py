@@ -698,3 +698,80 @@ def test_control_kinds_on_lines_safe_forms_and_unsupported_languages():
     assert control_kinds_on_lines(TORCH_MULTILINE_OLD, "python", [5]) == {"safe_api"}
     assert control_kinds_on_lines(TORCH_MULTILINE_OLD, "python", [4]) == set()
     assert control_kinds_on_lines(code, "python", []) == set()
+
+
+# ---------------------------------------------------------------------------
+# New files and lxml's no_network
+# ---------------------------------------------------------------------------
+
+NEW_RISKY_FILE = (
+    "import subprocess\n"
+    "import requests\n"
+    "\n"
+    "subprocess.run(CMD, shell=True)\n"
+    "\n"
+    "def fetch(url):\n"
+    "    return requests.get(url, verify=False)\n"
+)
+
+
+def _added_patch(new):
+    lines = new.split("\n")[:-1]
+    return f"@@ -0,0 +1,{len(lines)} @@\n" + "\n".join("+" + ln for ln in lines)
+
+
+@pytest.mark.parametrize("make_file", [
+    # GitHub's patch of an added file (from /dev/null), reverse-applied to "".
+    lambda: SimpleNamespace(path="app/new.py", content=NEW_RISKY_FILE,
+                            patch=_added_patch(NEW_RISKY_FILE)),
+    # An explicit empty base (pr_context's PRFile of an "added" file).
+    lambda: SimpleNamespace(path="app/new.py", content=NEW_RISKY_FILE, patch=None,
+                            base_content=""),
+])
+def test_a_file_added_by_the_pr_gives_no_signal(parser, make_file):
+    file = make_file()
+    units = [{"function_name": None, "start_line": 1, "end_line": 7,
+              "code": NEW_RISKY_FILE, "language": "python"},
+             {"function_name": "fetch", "start_line": 6, "end_line": 7,
+              "code": "def fetch(url):\n    return requests.get(url, verify=False)\n",
+              "language": "python"}]
+    assert old_code_for_units(file, units, parser) == [(None, "new_file")] * 2
+    results = guard_diff_for_file(file, units, parser)
+    assert [(r.risk, r.alert, r.note) for r in results] == [("none", False, "new_file")] * 2
+
+
+def test_a_new_file_in_a_pr_review_gives_no_guard_alert():
+    from backend.app.core.evidence import guard_evidence
+    from backend.app.core.pr_context import build_pr_bundle
+
+    bundle = build_pr_bundle([{"path": "app/new.py", "old_content": "",
+                               "new_content": NEW_RISKY_FILE}], CodeParser())
+    assert bundle.units and guard_evidence(bundle.files, bundle.units, CodeParser()) == {}
+
+
+def test_a_modified_file_still_compares_against_its_old_version(parser):
+    old = "import subprocess\n\nsubprocess.run(CMD)\n"
+    new = "import subprocess\n\nsubprocess.run(CMD, shell=True)\n"
+    file = SimpleNamespace(path="a.py", content=new, patch=None, base_content=old)
+    unit = {"function_name": None, "start_line": 1, "end_line": 3, "code": new,
+            "language": "python"}
+    (res,) = guard_diff_for_file(file, [unit], parser)
+    assert res.risk == "guard_removed" and res.alert
+
+
+LXML = "def parse(data):\n    return etree.XMLParser({})\n"
+
+
+@pytest.mark.parametrize("old, new, direction", [
+    ("no_network=True", "no_network=False", "weakened"),
+    ("no_network=True", "", "weakened"),
+    ("", "no_network=False", "weakened"),
+    ("", "no_network=True", "strengthened"),
+    ("no_network=False", "no_network=True", "strengthened"),
+    ("no_network=False", "", "strengthened"),
+])
+def test_no_network_true_is_the_safe_lxml_setting(old, new, direction):
+    r = guard_diff(LXML.format(old), LXML.format(new), "python")
+    (c,) = r.changes
+    assert (c.direction, c.kind) == (direction, "xxe")
+    assert c.confidence < ALERT_MIN_CONFIDENCE and not r.alert

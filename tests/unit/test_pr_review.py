@@ -1558,3 +1558,53 @@ def test_real_semgrep_gives_medium_leads_and_high_evidence():
     lead_sev = {h["severity"] for hits in leads.values() for h in hits}
     assert {"medium", "high"} <= lead_sev
     assert {h["severity"] for hits in evidence.values() for h in hits} == {"high"}
+
+
+# --- candidate filters: side-mentions, missing confidence, loose quotes, comments ---------
+
+
+XXE_FINDING = {
+    "title": "XML external entity (XXE) injection in parse_xml", "cwe": "CWE-611",
+    "file_path": "app/xml.py",
+    "explanation": "lxml resolves external entities, so an attacker reads local files; "
+                   "a billion laughs payload also causes a denial of service.",
+}
+
+
+@pytest.mark.parametrize("finding,excluded", [
+    # A DoS / memory-safety word in the explanation is a side-mention, not the claim.
+    (XXE_FINDING, False),
+    ({**XXE_FINDING, "explanation": "also an out-of-bounds read style buffer overflow"}, False),
+    ({**XXE_FINDING, "explanation": "attackers can exhaust memory and cpu resources"}, False),
+    # The title or the CWE decides.
+    ({**XXE_FINDING, "title": "Denial of service via billion laughs", "cwe": None}, True),
+    ({**XXE_FINDING, "title": "Unbounded XML expansion", "cwe": "CWE-776"}, False),
+    ({**XXE_FINDING, "title": "Uncontrolled allocation", "cwe": "CWE-770"}, True),
+    ({**XXE_FINDING, "title": "Parser hang", "cwe": "CWE-835"}, True),
+    ({**XXE_FINDING, "title": "Deep nesting", "cwe": "CWE 674"}, True),
+    ({**XXE_FINDING, "title": "Out-of-bounds read in decoder", "cwe": None}, True),
+    ({**XXE_FINDING, "title": "Decoder flaw", "cwe": "CWE-787"}, True),
+    ({**XXE_FINDING, "title": "Decoder flaw", "cwe": "CWE-787", "file_path": "x.c"}, False),
+    # ReDoS stays with the verifier (precedent 9), whatever its CWE.
+    ({**XXE_FINDING, "title": "ReDoS in the email validator", "cwe": "CWE-1333"}, False),
+    ({**XXE_FINDING, "title": "Denial of service via a user-supplied pattern",
+      "cwe": "CWE-1333"}, False),
+])
+def test_dos_and_memory_safety_exclusions_judge_title_and_cwe(finding, excluded):
+    assert bool(hard_exclusion_reason(finding)) is excluded
+
+
+def test_xxe_mentioning_denial_of_service_reaches_the_verifier():
+    xml_old = ("from lxml import etree\n\ndef parse(data):\n"
+               "    parser = etree.XMLParser(resolve_entities=False)\n"
+               "    return etree.fromstring(data, parser)\n")
+    xml_new = xml_old.replace("resolve_entities=False", "resolve_entities=True")
+    xxe = {"file": "app/xml.py", "line": 4, "severity": "high", "cwe": "CWE-611",
+           "title": "XXE: external entities resolved", "confidence": 9,
+           "quoted_code": "parser = etree.XMLParser(resolve_entities=True)",
+           "explanation": "Billion laughs also gives a denial of service."}
+    router = PRRouter(audits=[{"findings": [xxe]}])
+    result = _review(_files(("app/xml.py", xml_old, xml_new)), router)
+    assert len(router.verify_prompts) == 1
+    assert result["pr_review"]["hard_excluded"] == 0
+    assert [f["cwe"] for f in result["report_findings"]] == ["CWE-611"]

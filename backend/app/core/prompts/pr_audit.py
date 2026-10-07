@@ -13,9 +13,10 @@ THIRD-PARTY TEXT - see THIRD_PARTY_NOTICES.md in this directory.
   project's JSON schema (source / sink / missing_control / quoted_code /
   confidence 1-10), a context-request protocol instead of repository tools,
   nonce-tagged untrusted blocks, precedents narrowed to Python / JavaScript web
-  code, DoS / ReDoS / test / docs rules reworded; the timing-attack exclusion
-  narrowed to theoretical side channels (removing an existing constant-time
-  comparison of a secret is reportable).
+  code, DoS / ReDoS / test / docs rules reworded, the DoS and memory-safety
+  hard exclusions judged on the finding's title + CWE only; the timing-attack
+  exclusion narrowed to theoretical side channels (removing an existing
+  constant-time comparison of a secret is reportable).
 * The data-flow method of the audit prompt (candidates record source, broken
   control, sink and preconditions; trust code paths over commit messages; stay
   anchored to changed code; one candidate per independently reachable
@@ -280,8 +281,11 @@ VERIFIER_SYSTEM_PROMPT = (
 # claude-code-security-review's HardExclusionRules (MIT, see header).
 # Modified: regex-DoS findings are not caught by the DoS rule (the verifier's
 # precedent 9 decides them: only an attacker-controlled pattern counts), open
-# redirects are NOT excluded (redirects are one of our sink leads), and test /
-# documentation files are excluded by path.
+# redirects are NOT excluded (redirects are one of our sink leads), test /
+# documentation files are excluded by path, and the DoS and memory-safety rules
+# judge only the finding's title and CWE: a word in the explanation is often a
+# side-mention (an XXE explanation naming "billion laughs ... denial of
+# service") and must not drop a finding of another class.
 # ---------------------------------------------------------------------------
 
 _DOS_PATTERNS = [
@@ -317,6 +321,18 @@ _MEMORY_SAFETY_PATTERNS = [
 _SSRF_PATTERNS = [
     re.compile(r"\b(ssrf|server\s+.?side\s+.?request\s+.?forgery)\b", re.IGNORECASE),
 ]
+# CWEs whose finding IS a DoS / resource-exhaustion claim. CWE-1333 (ReDoS) is
+# deliberately absent: regex DoS is left to the verifier (precedent 9).
+_DOS_CWES = frozenset({
+    "CWE-400", "CWE-405", "CWE-407", "CWE-409", "CWE-674", "CWE-770", "CWE-789",
+    "CWE-834", "CWE-835", "CWE-920", "CWE-1050",
+})
+# CWEs whose finding IS a memory-safety claim (excluded outside C / C++).
+_MEMORY_SAFETY_CWES = frozenset({
+    "CWE-119", "CWE-120", "CWE-121", "CWE-122", "CWE-123", "CWE-124", "CWE-125",
+    "CWE-126", "CWE-127", "CWE-131", "CWE-190", "CWE-191", "CWE-415", "CWE-416",
+    "CWE-476", "CWE-680", "CWE-786", "CWE-787", "CWE-788", "CWE-805", "CWE-824",
+})
 _C_CPP_EXTENSIONS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}
 _DOC_EXTENSIONS = {".md", ".markdown", ".rst", ".txt", ".adoc"}
 _CLIENT_SIDE_EXTENSIONS = {".html", ".htm"}
@@ -333,24 +349,35 @@ def _ext(path: str) -> str:
     return f".{name.rsplit('.', 1)[-1]}" if "." in name else ""
 
 
+def _cwe_id(value) -> str | None:
+    m = re.search(r"CWE-?\s*(\d+)", str(value or ""), re.IGNORECASE)
+    return f"CWE-{m.group(1)}" if m else None
+
+
 def hard_exclusion_reason(finding: dict) -> str | None:
     """Why a candidate finding is excluded without verification, or None.
-    Looks at the file path and at the title + explanation (the model's own
-    words)."""
+    Looks at the file path, and at the model's own words: the DoS and
+    memory-safety rules at the title + CWE only (the claim itself; an
+    explanation often mentions such effects on the side), the rate-limiting
+    and resource-leak rules at the title + explanation."""
     path = finding.get("file_path") or finding.get("file") or ""
     ext = _ext(path)
     if ext in _DOC_EXTENSIONS:
         return "finding in a documentation file"
     if TEST_PATH_RE.search(path):
         return "finding in test code"
-    text = f"{finding.get('title') or ''} {finding.get('explanation') or ''}".lower()
-    if not _REGEX_DOS.search(text) and any(p.search(text) for p in _DOS_PATTERNS):
+    title = str(finding.get("title") or "")
+    cwe = _cwe_id(finding.get("cwe"))
+    text = f"{title} {finding.get('explanation') or ''}".lower()
+    redos = bool(_REGEX_DOS.search(title)) or cwe == "CWE-1333"
+    if not redos and (cwe in _DOS_CWES or any(p.search(title) for p in _DOS_PATTERNS)):
         return "generic DoS / resource exhaustion finding"
     if any(p.search(text) for p in _RATE_LIMITING_PATTERNS):
         return "generic rate-limiting recommendation"
     if any(p.search(text) for p in _RESOURCE_PATTERNS):
         return "resource management finding (not a security vulnerability)"
-    if ext not in _C_CPP_EXTENSIONS and any(p.search(text) for p in _MEMORY_SAFETY_PATTERNS):
+    if ext not in _C_CPP_EXTENSIONS and (
+            cwe in _MEMORY_SAFETY_CWES or any(p.search(title) for p in _MEMORY_SAFETY_PATTERNS)):
         return "memory-safety finding in non-C/C++ code"
     if ext in _CLIENT_SIDE_EXTENSIONS and any(p.search(text) for p in _SSRF_PATTERNS):
         return "SSRF finding in client-side HTML"

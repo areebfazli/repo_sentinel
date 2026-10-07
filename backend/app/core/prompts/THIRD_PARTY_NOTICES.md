@@ -24,10 +24,11 @@ hard exclusions, signal-quality criteria, precedents, confidence scale),
 Modifications: rewritten for RepoSentinel's JSON schema and nonce-tagged
 untrusted-data blocks; tool-based repository exploration replaced by a bounded
 context-request protocol; precedents narrowed to Python / JavaScript web code;
-the DoS rule no longer covers regex DoS, open redirects are not excluded, test
-and documentation files are excluded by path; the timing-attack exclusion is
-narrowed to theoretical side channels (removing an existing constant-time
-comparison of a secret is reportable).
+the DoS rule no longer covers regex DoS, the DoS and memory-safety rules judge
+only the finding's title and CWE (not its explanation), open redirects are not
+excluded, test and documentation files are excluded by path; the timing-attack
+exclusion is narrowed to theoretical side channels (removing an existing
+constant-time comparison of a secret is reportable).
 
 ```
 MIT License

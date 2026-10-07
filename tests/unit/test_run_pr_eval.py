@@ -298,6 +298,25 @@ def test_funnel_records_bad_output_and_counts_confirmed_as_reported():
     assert (funnel["confirmed"], funnel["below_min_confidence"]) == (1, 1)
 
 
+def test_final_need_context_is_a_scored_partial_item_with_context_unresolved():
+    # The stub always asks for context: after the rounds run out its final
+    # answer still does. Not an error (the item is scored), but partial.
+    asks = {"need_context": [{"symbol": "validate_path", "want": "definition"}]}
+    rec, gate = _run(benign_item(), "pr", StubLLM(audit=asks))
+    assert gate.item_error is None
+    assert rec["status"] == "ok" and rec["review_status"] == "partial"
+    assert rec["pr_review"]["context_unresolved"] == 1
+    assert rec["pr_review"]["bad_output"] == 0
+    assert rec["findings"]["verified"] == []
+    ops = R.operational_metrics([rec], "pr")
+    assert ops["funnel"]["context_unresolved"] == 1
+    assert ops["context"]["prompts_unresolved"] == 1
+    assert ops["review_status"] == {"partial": 1}
+    # A record from before the stat existed counts 0.
+    del rec["pr_review"]["context_unresolved"]
+    assert R.operational_metrics([rec], "pr")["funnel"]["context_unresolved"] == 0
+
+
 def test_confirmed_finding_is_a_localised_tp_in_both_views():
     rec, _ = _run(intro_item(), "pr", StubLLM(audit={"findings": [TRAVERSAL]}))
     R.attach_outcomes([rec], 2)

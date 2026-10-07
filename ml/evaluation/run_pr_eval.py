@@ -819,7 +819,8 @@ def view_findings(result: dict, arm: str) -> dict[str, list[dict]]:
 
 
 STAT_KEYS = ("audit_calls", "audit_prompts_planned", "verifier_calls", "context_rounds_used",
-             "context_requested", "context_resolved", "candidates", "quote_not_found",
+             "context_requested", "context_resolved", "context_unresolved", "candidates",
+             "quote_not_found",
              "hard_excluded", "below_audit_confidence", "verified", "confirmed", "rejected",
              "uncertain", "below_min_confidence", "review_suggested", "unverified",
              "bad_output", "files_total", "files_reviewed", "leads")
@@ -1461,8 +1462,8 @@ def operational_metrics(records: list[dict], arm: str) -> dict:
             for k in ("candidates", "quote_not_found", "hard_excluded", "below_audit_confidence",
                       "confirmed", "rejected", "uncertain", "below_min_confidence",
                       "review_suggested", "unverified", "bad_output", "context_rounds_used",
-                      "context_requested",
-                      "context_resolved", "audit_calls", "verifier_calls"):
+                      "context_requested", "context_resolved", "context_unresolved",
+                      "audit_calls", "verifier_calls"):
                 funnel[k] += stats.get(k) or 0
         out["funnel"] = dict(funnel)
         out["context"] = {
@@ -1471,6 +1472,9 @@ def operational_metrics(records: list[dict], arm: str) -> dict:
                 1 for r in recs if (r.get("pr_review") or {}).get("context_rounds_used")),
             "symbols_requested": funnel["context_requested"],
             "symbols_resolved": funnel["context_resolved"],
+            # Final answers still asking for context (0 in runs recorded before
+            # the stat existed): those PRs are review_status "partial".
+            "prompts_unresolved": funnel["context_unresolved"],
         }
         statuses = Counter()
         reasons = Counter()

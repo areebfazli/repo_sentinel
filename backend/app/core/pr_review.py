@@ -24,7 +24,10 @@ per-function in isolation. Stages:
    appended (at most ``PR_REVIEW_CONTEXT_MAX_TOKENS`` per prompt) and the audit
    re-asked, at most ``PR_REVIEW_CONTEXT_ROUNDS`` times per prompt; the loop
    stops early when nothing new resolves (one last call then asks for the
-   final answer). Our own implementation of the idea; nothing from vulnhuntr.
+   final answer). A final answer that still only asks for context gives no
+   findings for that prompt and makes the review partial
+   (``context_unresolved``), never a failed call. Our own implementation of
+   the idea; nothing from vulnhuntr.
 4. **Validation**: every finding must quote the NEW file (``locate_quote``,
    searched near the claimed line first), else it is dropped; then regex hard
    exclusions (DoS, rate limiting, resource leaks, memory safety outside
@@ -382,7 +385,9 @@ def audit_closing(rounds_left: int) -> str:
         ask = (f"If a decision depends on code not shown here, you may answer with "
                f"need_context instead (at most {rounds_left} more request round(s)).")
     else:
-        ask = "No more context can be provided: give your final answer now."
+        ask = ("No more context can be provided: give your final answer now, as the "
+               "findings JSON object (an empty findings list if nothing qualifies) judged "
+               "from the code shown; do not answer with need_context.")
     return f"\n{ask}\nReview the change and write the JSON now."
 
 
@@ -624,13 +629,17 @@ def _int(value) -> int | None:
         return None
 
 
-def audit_schema_problem(data, *, final: bool) -> str | None:
+def audit_schema_problem(data) -> str | None:
     """Why an audit response is not an answer the prompt's schema allows, or
-    None. An answer is an object with a ``findings`` list, or (only while more
-    context may still be requested, ``final`` False) a non-empty
-    ``need_context`` list. Anything else (a non-object, a bare finding dict
-    salvaged from cut-off output, ``need_context`` on the final call) is a
-    failed call, never "reviewed, no findings"."""
+    None. An answer is an object with a ``findings`` list (any
+    ``need_context`` beside it is ignored once no more context can be given),
+    or a non-empty ``need_context`` list. The latter is accepted on the final
+    call too (no more context rounds): ``run_pr_review`` then records it as
+    ``context_unresolved`` (no findings from that prompt, review partial)
+    instead of failing the call. Anything else (a non-object, a bare finding
+    dict salvaged from cut-off output, a non-list ``findings``, an empty or
+    non-list ``need_context`` without findings) is a failed call, never
+    "reviewed, no findings"."""
     if not isinstance(data, dict):
         return "response is not a JSON object"
     if isinstance(data.get("findings"), list):
@@ -638,8 +647,7 @@ def audit_schema_problem(data, *, final: bool) -> str | None:
     if "findings" in data:
         return "findings is not a list"
     if isinstance(data.get("need_context"), list) and data["need_context"]:
-        return "need_context on the final call (no more context can be given)" if final \
-            else None
+        return None
     return "no findings list"
 
 
@@ -1261,6 +1269,7 @@ def _empty_stats(config: PRReviewConfig) -> dict:
     return {
         "audit_calls": 0, "audit_prompts_planned": 0, "verifier_calls": 0,
         "context_rounds_used": 0, "context_requested": 0, "context_resolved": 0,
+        "context_unresolved": 0,
         "candidates": 0, "quote_not_found": 0, "hard_excluded": 0,
         "below_audit_confidence": 0, "verified": 0, "confirmed": 0, "rejected": 0,
         "uncertain": 0, "below_min_confidence": 0, "review_suggested": 0, "unverified": 0,
@@ -1316,6 +1325,7 @@ async def run_pr_review(
             continue
         ctx = ContextState()
         answered = False  # a findings answer (possibly empty) was received
+        unresolved = False  # the final answer still asked for context
         failure = None
         rounds_used = 0
         force_final = False
@@ -1336,7 +1346,7 @@ async def run_pr_review(
                 # unusable answer falls through to the next model.
                 data, provider = await router.generate(
                     AUDIT_SYSTEM_PROMPT, user, deadline=deadline,
-                    validate=lambda d, final=final: audit_schema_problem(d, final=final))
+                    validate=audit_schema_problem)
             except LLMError as exc:
                 logger.warning("PR audit call failed ({} file(s)): {}", len(chunk.paths), exc)
                 failure = _failure_reason(exc)
@@ -1346,7 +1356,7 @@ async def run_pr_review(
             if provider not in providers:
                 providers.append(provider)
             # Defence in depth (a router that ignores ``validate``).
-            problem = audit_schema_problem(data, final=final)
+            problem = audit_schema_problem(data)
             if problem:
                 logger.warning("PR audit response from {} unusable ({} file(s)): {}", provider,
                                len(chunk.paths), problem)
@@ -1358,6 +1368,16 @@ async def run_pr_review(
                 found, dropped = validate_audit_findings(data["findings"], bundle, chunk.paths)
                 stats["quote_not_found"] += dropped
                 candidates.extend(found)
+            elif final:
+                # Only need_context although no more context can be given (the
+                # prompt says so): no findings from this prompt, but not a clean
+                # review either - the model could not judge without more code.
+                logger.warning("PR audit final answer from {} still asks for context ({} "
+                               "file(s)): reviewed as partial (context_unresolved)",
+                               provider, len(chunk.paths))
+                answered = unresolved = True
+                stats["context_unresolved"] += 1
+                break
             requests = data.get("need_context")
             if not requests or rounds_left <= 0:
                 break
@@ -1379,7 +1399,8 @@ async def run_pr_review(
         if answered:
             reviewed_units.extend(
                 {**u, "partial": chunk.plans[u["file_path"]].partial,
-                 "truncated": chunk.plans[u["file_path"]].describe()}
+                 "truncated": chunk.plans[u["file_path"]].describe(),
+                 **({"context_unresolved": True} if unresolved else {})}
                 for u in chunk_units)
             stats["files_reviewed"] += len(chunk.paths)
         else:
@@ -1494,10 +1515,11 @@ async def run_pr_review(
 def pr_coverage(n_units: int, outcome: dict) -> dict:
     """``scan_runner.review_coverage`` for the PR review: "failed" when no
     audit call succeeded although there was code to review; "partial" when
-    some units weren't audited, a file's diff was clipped, or a candidate
-    could not be verified; else "complete"."""
+    some units weren't audited, a file's diff was clipped, the final audit
+    answer still asked for context (``context_unresolved``: counted as partly
+    reviewed), or a candidate could not be verified; else "complete"."""
     reviewed = outcome["reviewed_units"]
-    partial = sum(bool(u.get("partial")) for u in reviewed)
+    partial = sum(bool(u.get("partial") or u.get("context_unresolved")) for u in reviewed)
     unverified = outcome["stats"]["unverified"]
     if n_units == 0:
         status = "complete"
@@ -1543,6 +1565,12 @@ def pr_notes(outcome: dict) -> list[str]:
     if reduced:
         notes.append(f"_{len(reduced)} file(s) reviewed with reduced context (the whole diff was "
                      f"shown): {_labels(reduced)}._")
+    unresolved = [f"{u.get('file_path')}:{u.get('function_name') or u.get('start_line')}"
+                  for u in reviewed if u.get("context_unresolved")]
+    if unresolved:
+        notes.append(f"_⚠️ {len(unresolved)} unit(s) only partly reviewed (context_unresolved: "
+                     f"the LLM still asked for code it was not shown after the context rounds "
+                     f"ran out, so it reported nothing there): {_labels(unresolved)}._")
     for reason, why in (
         ("budget", f"PR review budget: {cfg.max_audit_calls} audit call(s) of "
                    f"~{cfg.max_prompt_tokens} tokens"),

@@ -1005,7 +1005,9 @@ def test_context_request_is_resolved_and_the_audit_re_asked():
     s = result["pr_review"]
     assert (s["audit_calls"], s["context_rounds_used"]) == (2, 1)
     assert (s["context_requested"], s["context_resolved"]) == (3, 1)
+    assert s["context_unresolved"] == 0
     assert len(result["report_findings"]) == 1
+    assert result["review_status"] == "complete"
 
 
 def test_context_rounds_are_capped():
@@ -1019,23 +1021,69 @@ def test_context_rounds_are_capped():
     assert result["review_status"] == "complete"
 
 
-def test_need_context_on_the_final_call_is_not_a_clean_review():
-    # Asked for its final answer, the model asks for more context again: no
-    # findings answer was ever given, so the file was NOT reviewed.
+def test_need_context_on_the_final_call_is_partial_context_unresolved():
+    # Asked for its final answer, the model asks for more context again: not a
+    # failed call (no bad_output, no error), but not a clean review either -
+    # no findings from that prompt and the review is partial.
     asks = {"need_context": [{"symbol": "clean"}]}
     router = PRRouter(audits=[asks, {"need_context": [{"symbol": "view"}]},
                               {"need_context": [{"symbol": "read"}]}])
     result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router, context_rounds=2)
     assert len(router.audit_prompts) == 3
-    assert result["review_status"] == "failed"
-    assert {u["reason"] for u in result["units_not_reviewed"]} == {"bad_output"}
-    assert result["pr_review"]["bad_output"] == 1
-    assert "answer was unusable" in result["report_markdown"]
+    assert result["review_status"] == "partial"
+    assert result["units_not_reviewed"] == []
+    assert result["units_reviewed"] == result["units_total"] > 0
+    assert result["units_partially_reviewed"] == result["units_total"]
+    s = result["pr_review"]
+    assert (s["context_unresolved"], s["bad_output"], s["context_rounds_used"]) == (1, 0, 2)
+    assert result["report_findings"] == [] and router.verify_prompts == []
+    assert "context_unresolved" in result["report_markdown"]
+    assert "Partial review" in result["report_markdown"]
+    assert "No security findings in the reviewed code" not in result["report_markdown"]
+    assert "answer was unusable" not in result["report_markdown"]
+    # The result validates against the API schema with the new stat.
+    from backend.app.models.schemas import PRReviewStats
+    assert PRReviewStats(**result["pr_review"]).context_unresolved == 1
+
+
+def test_findings_kept_from_a_context_round_when_the_final_call_is_unresolved():
+    # Round 1 gives a finding and asks for context; the final call only asks
+    # again: the round-1 finding stands, the review is partial.
+    router = PRRouter(audits=[{"findings": [TRAVERSAL], "need_context": [{"symbol": "clean"}]},
+                              {"need_context": [{"symbol": "view"}]}])
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router, context_rounds=1)
+    assert len(router.audit_prompts) == 2
+    assert len(result["report_findings"]) == 1
+    assert result["pr_review"]["context_unresolved"] == 1
+    assert result["review_status"] == "partial"
+
+
+def test_findings_with_need_context_on_the_final_call_uses_the_findings():
+    router = PRRouter(audits=[{"need_context": [{"symbol": "clean"}]},
+                              {"findings": [TRAVERSAL], "need_context": [{"symbol": "view"}]}])
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router, context_rounds=1)
+    assert len(router.audit_prompts) == 2  # no third call: no rounds left
+    assert len(result["report_findings"]) == 1
+    s = result["pr_review"]
+    assert (s["context_unresolved"], s["bad_output"], s["context_rounds_used"]) == (0, 0, 1)
+    assert result["review_status"] == "complete"
+
+
+def test_final_call_prompt_says_need_context_is_not_allowed():
+    router = PRRouter(audits=[{"need_context": [{"symbol": "clean"}]}, {"findings": []}])
+    _review(_files(("app/files.py", PY_OLD, PY_NEW)), router, context_rounds=1)
+    first, final = router.audit_prompts
+    assert "do not answer with need_context" not in first
+    assert "may answer with need_context" in first
+    assert "do not answer with need_context" in final
+    assert "empty findings list" in final
 
 
 @pytest.mark.parametrize("answer", [
     {"title": "Path traversal", "quoted_code": "return open(p).read()"},  # salvaged finding
     {"findings": "none"}, {}, {"need_context": []}, ["findings"], "no json",
+    {"need_context": "clean"}, {"need_context": {"symbol": "clean"}},
+    {"findings": "none", "need_context": [{"symbol": "clean"}]},
 ])
 def test_audit_answer_without_a_findings_list_fails_the_review(answer):
     router = PRRouter(audits=[answer])
@@ -1060,7 +1108,9 @@ def test_schema_checks_are_passed_to_the_router_as_validators():
     bare = {"title": "Path traversal", "quoted_code": "return open(p).read()"}
     asks = {"need_context": [{"symbol": "x"}]}
     assert audit_ctx(bare) and audit_final(bare)  # a salvaged finding never passes
-    assert audit_ctx(asks) is None and audit_final(asks)  # context only while rounds remain
+    # need_context passes on the final call too (recorded as context_unresolved).
+    assert audit_ctx(asks) is None and audit_final(asks) is None
+    assert audit_final({"need_context": []}) and audit_final({"need_context": "x"})
     assert audit_ctx({"findings": []}) is None and audit_final({"findings": []}) is None
     assert verify({"verdict": "rejected"}) is None and verify({"findings": []})
 
@@ -1131,9 +1181,11 @@ def test_context_token_cap_limits_what_is_appended():
 
 def test_zero_context_rounds_means_one_call():
     router = PRRouter(audits=[{"need_context": [{"symbol": "clean"}]}])
-    _review(_files(("app/files.py", PY_OLD, PY_NEW)), router, context_rounds=0)
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router, context_rounds=0)
     assert len(router.audit_prompts) == 1
     assert "No more context can be provided" in router.audit_prompts[0]
+    assert result["pr_review"]["context_unresolved"] == 1
+    assert result["review_status"] == "partial"
 
 
 # --- prompt content -----------------------------------------------------------------

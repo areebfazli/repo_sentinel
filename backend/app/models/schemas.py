@@ -224,6 +224,9 @@ class PRReviewStats(BaseModel):
     context_rounds_used: int = 0
     context_requested: int = 0
     context_resolved: int = 0
+    # Audit prompts whose final answer (no context rounds left) still only
+    # asked for context: no findings from them, their units partly reviewed.
+    context_unresolved: int = 0
     candidates: int = 0  # validated audit findings (quote found in the new file)
     quote_not_found: int = 0
     hard_excluded: int = 0
@@ -268,7 +271,8 @@ class AnalyzeResult(BaseModel):
     guard_diff: list[GuardDiffOut] = []
     # LLM review coverage: prompts sent, and units left out (never silently).
     # review_status: "complete" | "partial" (units not reviewed, or reviewed with
-    # changed code cut) | "failed" (no unit reviewed: every LLM call failed);
+    # changed code cut, or - PR review - the final audit answer still asked for
+    # context) | "failed" (no unit reviewed: every LLM call failed);
     # None on results stored before the field existed.
     llm_calls: int = 0
     review_status: str | None = None

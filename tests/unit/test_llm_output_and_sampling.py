@@ -238,7 +238,7 @@ def test_validator_failure_on_one_model_falls_through_to_the_next(monkeypatch):
     script.set(GEMINI, [_ok('{"findings": [{"title": "from gemini"}]}')])
     _patch_script(monkeypatch, script)
     data, label = asyncio.run(LLMRouter().generate(
-        "s", "u", validate=lambda d: audit_schema_problem(d, final=True)))
+        "s", "u", validate=audit_schema_problem))
     assert label == "gemini:gemini-2.0-flash" and data["findings"][0]["title"] == "from gemini"
     assert script.call_count(PRIMARY) == 1  # not retried on the same client
 

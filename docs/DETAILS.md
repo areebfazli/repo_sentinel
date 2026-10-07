@@ -430,7 +430,13 @@ reviewer reads one, not function by function:
    "file", "want": "definition|callers"}]}`; symbols are resolved from the PR's own files,
    appended and the audit re-asked (≤ `PR_REVIEW_CONTEXT_ROUNDS`, ≤
    `PR_REVIEW_CONTEXT_MAX_TOKENS`, stops early when nothing new resolves). In the 160 scored
-   PRs of the dev run the model never used it (0 context requests).
+   PRs of the dev run the model never used it (0 context requests). On the final call (no
+   rounds left) the prompt says need_context is no longer allowed; an answer with a
+   `findings` list is used as is (any `need_context` beside it ignored), while one that
+   still only asks for context is not a failed call: that prompt gives no findings and its
+   units count as partly reviewed, so the review is `partial` (`context_unresolved`: stat
+   `pr_review.context_unresolved`, a report note, the eval's funnel). Answers without
+   either (or with the wrong types) stay bad output.
 5. **Validation + filters**: the quote must be in the NEW file (searched near the claimed line
    first; diff markers tolerated), then regex hard exclusions (DoS, rate limiting, resource
    leaks, memory safety outside C/C++, docs, tests) and the audit-confidence floor.
@@ -488,7 +494,7 @@ reviewer reads one, not function by function:
 
 Deterministic guard_diff alerts, Semgrep evidence, `review_status` and `units_not_reviewed`
 work as in the per-unit review. The result adds `review_mode`, a `pr_review` block (audit /
-verifier calls, context rounds and requests, candidates → excluded / rejected / uncertain /
+verifier calls, context rounds and requests, `context_unresolved` final answers, candidates → excluded / rejected / uncertain /
 below the cutoff / `review_suggested` / confirmed, which partition the candidates; estimated
 prompt tokens), `review_suggestions` (file / line, title, the removed control's old code,
 `evidence`: `verifier_quote` and / or `guard_diff`, verdict, confidence, the verifier's reason)

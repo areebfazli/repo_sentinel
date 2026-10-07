@@ -348,7 +348,10 @@ def classify_llm_error(exc: BaseException, events: list[dict]) -> str:
        anything else doesn't count. An error without ``client_outcomes`` (not
        raised by ``LLMRouter.generate`` itself, e.g. a test stub) falls back
        to: any 429 among the events, or "HTTP 429" in its text.
-    4. 'other' otherwise."""
+    4. 'other' otherwise: 5xx, timeouts (a call past LLM_CALL_DEADLINE_S
+       included: ``llm_client.CallDeadlineExceeded`` is a timeout, it records
+       no HTTP event and its client ends "failed"), transport / HTTP errors.
+       Not a stop condition; the call is not cached."""
     text = str(exc)
     if any(e.get("daily_limit") for e in events) or any(m in text for m in DAILY_LIMIT_MARKERS):
         return "daily_limit"

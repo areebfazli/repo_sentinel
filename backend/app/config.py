@@ -53,7 +53,17 @@ class Settings(BaseSettings):
     # Set empty in .env to disable.
     OPENROUTER_FALLBACK_MODEL: str | None = "google/gemma-4-31b-it:free"
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    # httpx timeout: per read / connect / write, NOT for the whole request.
     LLM_TIMEOUT_SECONDS: int = 60
+    # Hard wall-clock deadline per HTTP attempt (one chat-completions request),
+    # which keep-alive bytes can't extend: OpenRouter keeps an idle connection
+    # open while a model is queued or thinking, so LLM_TIMEOUT_SECONDS alone let
+    # one call hang for 12+ minutes. Reasoning models legitimately take 1-4 min
+    # on ~12K-token prompts (observed p90 ~4.5 min for slow free models);
+    # anything longer is a stuck upstream. A hit is a transient failure like a
+    # timeout (same-client retry per LLM_RETRIES, then the next client).
+    # None / 0 = off.
+    LLM_CALL_DEADLINE_S: float | None = 300.0
     # Sampling temperature of review calls to a model WITHOUT an LLM_SAMPLING
     # entry. 0.2 is what production has always used; the eval
     # (ml/evaluation/run_eval --llm-temperature) overrides it per client (0.0).
@@ -84,7 +94,7 @@ class Settings(BaseSettings):
     # counts max_tokens against it. Output cut at the cap (finish_reason
     # "length") is a failed call that falls through, never an empty review.
     LLM_MAX_OUTPUT_TOKENS: int | None = 16000
-    LLM_RETRIES: int = 1                 # same-client retries on 429/5xx/timeout
+    LLM_RETRIES: int = 1                 # same-client retries on 429/5xx/timeout/deadline
     # Per-scan LLM budget. Units are ordered by evidence (guard_diff alert, Semgrep
     # hit, guard_removed, retrieval similarity) and packed into as few prompts as
     # fit; units beyond LLM_MAX_CALLS_PER_SCAN prompts are listed in the result as
@@ -108,7 +118,10 @@ class Settings(BaseSettings):
     LLM_MAX_WAIT_S: float = 60.0
     # Wall-time budget for a scan's LLM stage; units whose call can't start in
     # time are listed as not reviewed (reason "time_budget"). The Action polls
-    # for 15 minutes in total.
+    # for 15 minutes in total. It is checked before each call / retry (a call
+    # in flight is not cut), so LLM_CALL_DEADLINE_S bounds how far one call can
+    # overrun it; a retry after a deadline hit past the budget is skipped
+    # (reason "time_budget").
     LLM_SCAN_MAX_WALL_S: float = 480.0
 
     # Files-mode review (core/pr_review.py). "pr": one PR-level audit ("what

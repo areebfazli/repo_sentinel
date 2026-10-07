@@ -14,7 +14,11 @@ redundant one; OpenRouter's free models also share an upstream pool (429
 
 Calls are paced per model by estimated tokens per minute (``TokenPacer``,
 settings.LLM_TPM_LIMITS: Groq's free tier allows ~8K tokens/min per model).
-A transient failure (429 / 5xx / timeout) is retried on the SAME client up to
+Each HTTP attempt has a hard wall-clock deadline (settings.LLM_CALL_DEADLINE_S;
+httpx's LLM_TIMEOUT_SECONDS is only a per-read timeout, which an upstream's
+keep-alive bytes keep resetting): past it the request is cancelled and fails as
+a timeout (``CallDeadlineExceeded``).
+A transient failure (429 / 5xx / timeout / call deadline) is retried on the SAME client up to
 settings.LLM_RETRIES times after its Retry-After (else a short backoff); a wait
 over settings.LLM_MAX_WAIT_S, or past the caller's deadline, skips to the next
 client instead. Then it falls through to the next client; a
@@ -156,7 +160,7 @@ class LLMError(Exception):
         # for its rate budget), in chain order. Outcomes: "bad_output" (it
         # answered, unusably), "rate_limit" (its last attempt got a 429 -
         # HTTP or in an HTTP 200 body - or, after one, it was skipped for its
-        # rate budget), "failed" (anything else: 5xx, timeout, transport,
+        # rate budget), "failed" (anything else: 5xx, timeout or call deadline, transport,
         # non-retriable HTTP error, rate budget). Clients never called are
         # absent. None on an LLMError not raised by the router as a whole.
         self.client_outcomes = client_outcomes
@@ -179,6 +183,15 @@ class _Retriable(Exception):
         self.transient = transient
         self.retry_after = retry_after
         self.status = status
+
+
+class CallDeadlineExceeded(httpx.TimeoutException):
+    """One HTTP attempt ran past settings.LLM_CALL_DEADLINE_S (wall clock) and
+    was cancelled. A timeout to everything downstream: transient (same-client
+    retry per LLM_RETRIES, then the next client), the router's "failed" client
+    outcome (``llm_error``, never bad output), the eval's "other" error kind.
+    Distinct from a CancelledError (the caller cancelling, e.g. Ctrl-C), which
+    is never turned into this."""
 
 
 def _retry_after_seconds(resp: httpx.Response) -> float | None:
@@ -511,12 +524,35 @@ class LLMClient:
             body["max_tokens"] = int(max_tokens)
         if self.use_response_format:
             body["response_format"] = {"type": "json_object"}
+        # LLM_TIMEOUT_SECONDS is httpx's per-read timeout: keep-alive bytes from
+        # a queued / thinking upstream reset it indefinitely. The call deadline
+        # is a hard wall-clock bound on the whole request; on expiry the request
+        # is cancelled and leaving the ``async with`` closes its connection.
+        limit = settings.LLM_CALL_DEADLINE_S or None
         async with httpx.AsyncClient(timeout=settings.LLM_TIMEOUT_SECONDS) as http:
-            return await http.post(
-                self.url,
-                headers={"Authorization": f"Bearer {self.api_key}", **self.extra_headers},
-                json=body,
-            )
+            timer = asyncio.timeout(limit)
+            try:
+                async with timer:
+                    return await http.post(
+                        self.url,
+                        headers={"Authorization": f"Bearer {self.api_key}",
+                                 **self.extra_headers},
+                        json=body,
+                    )
+            except TimeoutError:
+                # Only our own deadline (an outside cancellation, e.g. Ctrl-C,
+                # stays a CancelledError and propagates untouched).
+                if not timer.expired():
+                    raise
+                logger.warning(
+                    "LLM model '{}' on provider '{}' did not answer within "
+                    "LLM_CALL_DEADLINE_S={:g}s; request cancelled (transient: retried "
+                    "per LLM_RETRIES, then the next client).",
+                    self.model, self.provider, limit,
+                )
+                raise CallDeadlineExceeded(
+                    f"{self.label} exceeded the call deadline "
+                    f"(LLM_CALL_DEADLINE_S={limit:g}s)") from None
 
     def _raise_http_error(self, status: int, what: str, detail: str, log_detail: str,
                           gone_text: str | None = None):
@@ -804,7 +840,7 @@ class LLMRouter:
         deadline_hit = False
         # How each client ENDED, (label, outcome): "bad_output" (it answered,
         # unusably), "rate_limit" (its last attempt got a 429, or it was skipped
-        # for its rate budget after one), "failed" (5xx / timeout / transport /
+        # for its rate budget after one), "failed" (5xx / timeout or call deadline / transport /
         # HTTP error / rate budget), or no entry for one never called (provider
         # dead after a 402, prompt too large for its tokens/min limit). Only
         # the final outcome counts: a retried 429 followed by bad output is

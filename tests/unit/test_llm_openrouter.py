@@ -127,8 +127,8 @@ def _generate(router):
 def test_openrouter_setting_defaults():
     fields = Settings.model_fields
     assert fields["OPENROUTER_API_KEY"].default is None
-    assert fields["OPENROUTER_MODEL"].default == "qwen/qwen3.8-27b:free"
-    assert fields["OPENROUTER_FALLBACK_MODEL"].default == "google/gemma-4-31b-it:free"
+    assert fields["OPENROUTER_MODEL"].default == "nvidia/nemotron-3-super-120b-a12b:free"
+    assert fields["OPENROUTER_FALLBACK_MODEL"].default is None
     assert fields["OPENROUTER_BASE_URL"].default == OR_BASE
 
 

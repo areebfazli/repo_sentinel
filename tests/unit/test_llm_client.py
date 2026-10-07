@@ -21,26 +21,39 @@ def test_default_models():
     assert Settings.model_fields["GROQ_FALLBACK_MODEL"].default == "qwen/qwen3.8-27b"
 
 
-def test_default_routing_is_openrouter_then_groq():
-    # Routing is a code default (.env only needs keys). OpenRouter's free models
-    # share an upstream pool (429 upstream_provider_shared_pool), so Groq backs it.
+def test_default_routing_is_openrouter_nemotron_without_fallback():
+    # Routing is a code default (.env only needs keys). Free qwen left
+    # OpenRouter (404) and free gemma is constantly rate-limited, so the default
+    # is one model, no same-provider fallback model, no fallback provider.
     fields = Settings.model_fields
     assert fields["LLM_PROVIDER"].default == "openrouter"
-    assert fields["LLM_FALLBACK_PROVIDER"].default == "groq"
-    assert fields["OPENROUTER_MODEL"].default == "qwen/qwen3.8-27b:free"
-    assert fields["OPENROUTER_FALLBACK_MODEL"].default == "google/gemma-4-31b-it:free"
+    assert fields["LLM_FALLBACK_PROVIDER"].default is None
+    assert fields["OPENROUTER_MODEL"].default == "nvidia/nemotron-3-super-120b-a12b:free"
+    assert fields["OPENROUTER_FALLBACK_MODEL"].default is None
+
+
+def test_default_model_has_no_sampling_entry(monkeypatch):
+    # The measured configuration ran Nemotron Super at LLM_TEMPERATURE (0.2).
+    _pin_default_chain(monkeypatch)
+    for name in ("LLM_SAMPLING", "LLM_TEMPERATURE"):
+        monkeypatch.setattr(settings, name, Settings.model_fields[name].default)
+    assert LLMClient("openrouter").sampling_params() == {"temperature": 0.2}
 
 
 def test_routing_defaults_apply_without_env(monkeypatch):
     # conftest forces LLM_PROVIDER=mock for the suite; drop it to see the defaults.
-    for var in ("LLM_PROVIDER", "LLM_FALLBACK_PROVIDER"):
+    for var in ("LLM_PROVIDER", "LLM_FALLBACK_PROVIDER", "OPENROUTER_FALLBACK_MODEL"):
         monkeypatch.delenv(var, raising=False)
     s = Settings(_env_file=None)
-    assert (s.LLM_PROVIDER, s.LLM_FALLBACK_PROVIDER) == ("openrouter", "groq")
+    assert (s.LLM_PROVIDER, s.LLM_FALLBACK_PROVIDER) == ("openrouter", None)
+    assert s.OPENROUTER_FALLBACK_MODEL is None
 
 
-DEFAULT_CHAIN = [
-    "openrouter:qwen/qwen3.8-27b:free",
+DEFAULT_CHAIN = ["openrouter:nvidia/nemotron-3-super-120b-a12b:free"]
+
+# An explicitly configured fallback chain (env opt-in), for the fall-through tests.
+OPT_IN_CHAIN = [
+    "openrouter:nvidia/nemotron-3-super-120b-a12b:free",
     "openrouter:google/gemma-4-31b-it:free",
     "groq:openai/gpt-oss-120b",
     "groq:qwen/qwen3.8-27b",
@@ -61,14 +74,52 @@ def _pin_default_chain(monkeypatch, groq_key="gk"):
     monkeypatch.setattr(settings, "LLM_RETRIES", 0)
 
 
-def test_default_chain_is_four_steps(monkeypatch):
+def _pin_opt_in_chain(monkeypatch):
+    """The defaults plus an env-configured OpenRouter fallback model and Groq."""
     _pin_default_chain(monkeypatch)
+    monkeypatch.setattr(settings, "OPENROUTER_FALLBACK_MODEL", "google/gemma-4-31b-it:free")
+    monkeypatch.setattr(settings, "LLM_FALLBACK_PROVIDER", "groq")
+    monkeypatch.setattr(settings, "GROQ_MODEL", "openai/gpt-oss-120b")
+    monkeypatch.setattr(settings, "GROQ_FALLBACK_MODEL", "qwen/qwen3.8-27b")
+
+
+def _warnings():
+    from loguru import logger
+    messages: list[str] = []
+    sink_id = logger.add(lambda m: messages.append(m.record["message"]), level="WARNING")
+    return messages, sink_id
+
+
+@pytest.mark.parametrize("groq_key", ["gk", None])
+def test_default_chain_is_one_client_and_never_mentions_groq(monkeypatch, groq_key):
+    from loguru import logger
+    _pin_default_chain(monkeypatch, groq_key=groq_key)
+    messages, sink_id = _warnings()
+    try:
+        clients = LLMRouter().clients
+    finally:
+        logger.remove(sink_id)
+    assert [c.label for c in clients] == DEFAULT_CHAIN
+    assert not any("groq" in m.lower() or "fallback" in m.lower() for m in messages)
+
+
+@pytest.mark.parametrize("disabled", [None, ""])
+def test_empty_fallback_settings_mean_disabled(monkeypatch, disabled):
+    _pin_default_chain(monkeypatch)
+    monkeypatch.setattr(settings, "LLM_FALLBACK_PROVIDER", disabled)
+    monkeypatch.setattr(settings, "OPENROUTER_FALLBACK_MODEL", disabled)
     assert [c.label for c in LLMRouter().clients] == DEFAULT_CHAIN
 
 
-def test_default_chain_without_groq_key_is_openrouter_only(monkeypatch):
-    _pin_default_chain(monkeypatch, groq_key=None)
-    assert [c.label for c in LLMRouter().clients] == DEFAULT_CHAIN[:2]
+def test_opt_in_chain_is_four_steps(monkeypatch):
+    _pin_opt_in_chain(monkeypatch)
+    assert [c.label for c in LLMRouter().clients] == OPT_IN_CHAIN
+
+
+def test_opt_in_chain_without_groq_key_is_openrouter_only(monkeypatch):
+    _pin_opt_in_chain(monkeypatch)
+    monkeypatch.setattr(settings, "GROQ_API_KEY", None)
+    assert [c.label for c in LLMRouter().clients] == OPT_IN_CHAIN[:2]
 
 
 def test_default_chain_missing_openrouter_key_fails_fast(monkeypatch):
@@ -78,9 +129,27 @@ def test_default_chain_missing_openrouter_key_fails_fast(monkeypatch):
         LLMRouter()
 
 
-def test_default_chain_falls_through_all_four_links(monkeypatch):
-    """Stubbed HTTP: every link but the last fails, in chain order."""
+def test_default_chain_429_fails_the_call(monkeypatch):
+    """No fallback: a 429 on the only model is an LLMError (not bad output)."""
     _pin_default_chain(monkeypatch)
+    monkeypatch.setattr(settings, "LLM_MAX_WAIT_S", 0.0)
+    router = LLMRouter()
+    calls: list[str] = []
+
+    def responder(url, **kwargs):
+        calls.append(kwargs["json"]["model"])
+        return _FakeResp(429, {"error": {"code": 429, "message": "rate limited"}})
+
+    _patch_async_client(monkeypatch, responder)
+    with pytest.raises(llm_client.LLMError) as exc:
+        asyncio.run(router.generate("sys", "user"))
+    assert not exc.value.bad_output
+    assert calls == ["nvidia/nemotron-3-super-120b-a12b:free"]
+
+
+def test_opt_in_chain_falls_through_all_four_links(monkeypatch):
+    """Stubbed HTTP: every link but the last fails, in chain order."""
+    _pin_opt_in_chain(monkeypatch)
     router = LLMRouter()
     calls: list[str] = []
     shared_pool_429 = _FakeResp(
@@ -92,9 +161,9 @@ def test_default_chain_falls_through_all_four_links(monkeypatch):
         provider = "openrouter" if "openrouter.ai" in url else "groq"
         label = f"{provider}:{model}"
         calls.append(label)
-        if label == DEFAULT_CHAIN[0] or label == DEFAULT_CHAIN[1]:
+        if label == OPT_IN_CHAIN[0] or label == OPT_IN_CHAIN[1]:
             return shared_pool_429
-        if label == DEFAULT_CHAIN[2]:
+        if label == OPT_IN_CHAIN[2]:
             return _FakeResp(503, {}, text="unavailable")
         return _FakeResp(200, {"choices": [{"message": {"content": '{"findings": []}'}}]})
 
@@ -102,7 +171,7 @@ def test_default_chain_falls_through_all_four_links(monkeypatch):
     payload, provider = asyncio.run(router.generate("sys", "user"))
     assert provider == "groq:qwen/qwen3.8-27b"
     assert payload == {"findings": []}
-    assert calls == DEFAULT_CHAIN
+    assert calls == OPT_IN_CHAIN
 
 
 def test_mock_mode_returns_canned_response(monkeypatch):

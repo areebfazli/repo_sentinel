@@ -62,8 +62,8 @@ What this means:
 - The PR-level numbers come from a partial run on a dev sample built from real CVE fix commits
   (each fix reversed gives a bug-introducing PR), using the free Qwen 3.8 27B model through
   OpenRouter, with temperature 0, the old verifier prompt and a confidence cutoff of 8. The
-  current defaults differ (Qwen's recommended sampling 1.0 / 0.95 / top_k 20, a rewritten
-  verifier prompt, cutoff 7, 12K-token prompts). **A rerun with the current defaults is
+  current defaults differ (the model is now Nemotron 3 Super 120B, free on OpenRouter, at
+  temperature 0.2; a rewritten verifier prompt, cutoff 7, 12K-token prompts). **A rerun with the current defaults is
   pending**, and so is the held-out test split.
 - The benign PRs are files that changed alongside security fixes in the same commits, not
   ordinary PRs. Only 48 of the 80 were scored: if all 32 unknown ones were flagged, the
@@ -89,8 +89,9 @@ Method, per-stage results and caveats: [docs/DETAILS.md](docs/DETAILS.md) and
 - Python 3.12 or newer (developed on 3.14; the Action runs on 3.12).
 - A few GB of free RAM. The embedding model loads into memory at start (CPU only, no GPU
   needed); the first run downloads it.
-- An [OpenRouter](https://openrouter.ai) API key; a [Groq](https://console.groq.com) key as
-  fallback is strongly recommended. Or run without any key in mock mode (no real review).
+- An [OpenRouter](https://openrouter.ai) API key (the default model is the free
+  `nvidia/nemotron-3-super-120b-a12b:free`, with no fallback). Or run without any key in mock
+  mode (no real review).
 - Semgrep is installed by `requirements.txt`. If the engine is missing, scans still run and
   only log a warning.
 
@@ -105,12 +106,15 @@ cp .env.example .env                 # fill in keys; defaults to ENVIRONMENT=dev
 ```
 
 `.env` only needs secrets. Provider and model choice are code defaults in
-`backend/app/config.py` (any setting can still be overridden in `.env`).
+`backend/app/config.py` (any setting can still be overridden in `.env`). There is no LLM
+fallback by default, so an OpenRouter outage or rate limit on the free model fails the review
+(`failed`; the Action's coverage gate turns red). To add one, set `OPENROUTER_FALLBACK_MODEL`
+and/or `LLM_FALLBACK_PROVIDER` (e.g. `groq` plus `GROQ_API_KEY`).
 
 | Key | Needed? | Used for |
 |---|---|---|
 | `OPENROUTER_API_KEY` | Yes (primary provider; startup fails without it) | The LLM review. Free models need "allow free endpoints that may train on inputs" in OpenRouter's privacy settings. |
-| `GROQ_API_KEY` | Recommended | Fallback when OpenRouter's free pool rate-limits (it often does). Groq's free tier only fits prompts up to ~7.5K tokens, so it backs up the smaller calls; for a Groq-only setup set `PR_REVIEW_MAX_PROMPT_TOKENS=6000`. Skipped with a warning if missing. |
+| `GROQ_API_KEY` | Optional (not used by default) | Only with `LLM_PROVIDER=groq` or `LLM_FALLBACK_PROVIDER=groq`. Groq's free tier only fits prompts up to ~7.5K tokens; for a Groq-only setup set `PR_REVIEW_MAX_PROMPT_TOKENS=6000`. |
 | `GITHUB_TOKEN` | Optional | Crawling a real repo's past review comments into Team Memory. |
 | `REPOSENTINEL_API_KEY` | Optional in development, required in production | Shared secret clients send as `X-RepoSentinel-Key`. |
 

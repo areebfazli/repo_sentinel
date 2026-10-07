@@ -5,12 +5,14 @@ endpoints, so one thin async client handles them. Each client is one
 (provider, model) pair. LLMRouter's chain is: primary provider/model -> the
 primary provider's same-provider fallback model (groq -> GROQ_FALLBACK_MODEL,
 openrouter -> OPENROUTER_FALLBACK_MODEL) -> LLM_FALLBACK_PROVIDER's model -> that
-provider's own same-provider fallback model. With the defaults:
-openrouter:qwen/qwen3.8-27b:free -> openrouter:google/gemma-4-31b-it:free ->
-groq:openai/gpt-oss-120b -> groq:qwen/qwen3.8-27b. Groq and OpenRouter's free
-models rate-limit per model, so the second model is a genuine fallback, not a
-redundant one; OpenRouter's free models also share an upstream pool (429
-"upstream_provider_shared_pool"), hence the cross-provider step.
+provider's own same-provider fallback model; an unset / empty fallback setting
+skips that step. The default is a single client,
+openrouter:nvidia/nemotron-3-super-120b-a12b:free, with no fallback model and no
+fallback provider, so a 429 / outage on it fails the call (LLMError). Opting in
+(env) to e.g. OPENROUTER_FALLBACK_MODEL + LLM_FALLBACK_PROVIDER=groq gives a
+longer chain: Groq and OpenRouter's free models rate-limit per model, and
+OpenRouter's free models also share an upstream pool (429
+"upstream_provider_shared_pool"), hence a cross-provider step when configured.
 
 Calls are paced per model by estimated tokens per minute (``TokenPacer``,
 settings.LLM_TPM_LIMITS: Groq's free tier allows ~8K tokens/min per model).

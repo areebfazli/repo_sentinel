@@ -30,28 +30,31 @@ class Settings(BaseSettings):
     # model choice are code defaults; .env only needs the API keys (env vars
     # still override). A primary provider with a missing key hard-errors at
     # startup — never a silent mock; a fallback provider without a key is skipped.
-    # Chain: openrouter:OPENROUTER_MODEL -> openrouter:OPENROUTER_FALLBACK_MODEL
-    #        -> groq:GROQ_MODEL -> groq:GROQ_FALLBACK_MODEL.
-    # OpenRouter's free models share an upstream pool and often 429 with
-    # "upstream_provider_shared_pool" (seen for both qwen and gemma), so a
-    # cross-provider fallback to our own Groq key is required, not optional.
+    # Default chain: openrouter:OPENROUTER_MODEL only (nvidia Nemotron 3 Super,
+    # free) - NO fallback model and NO fallback provider. Free qwen was removed
+    # from OpenRouter (404) and free gemma is constantly rate-limited, so they
+    # bought nothing. Consequence: an OpenRouter outage / 429 on this free model
+    # fails the review (review_status "failed"; the Action's coverage gate turns
+    # red). Opt into a fallback via env: OPENROUTER_FALLBACK_MODEL (a second
+    # OpenRouter model) and/or LLM_FALLBACK_PROVIDER=groq (+ GROQ_API_KEY; then
+    # GROQ_MODEL -> GROQ_FALLBACK_MODEL). Empty / unset = disabled.
     LLM_PROVIDER: str = "openrouter"    # groq | gemini | openrouter | mock
-    LLM_FALLBACK_PROVIDER: str | None = "groq"
+    LLM_FALLBACK_PROVIDER: str | None = None
     GROQ_API_KEY: str | None = None
     GEMINI_API_KEY: str | None = None
     GROQ_MODEL: str = "openai/gpt-oss-120b"
-    # Same-provider (Groq) fallback: a different model, so not hit by the same per-model rate limit.
+    # Same-provider (Groq) fallback: a different model, so not hit by the same
+    # per-model rate limit. Only used when Groq is the primary or the fallback provider.
     GROQ_FALLBACK_MODEL: str | None = "qwen/qwen3.8-27b"
     GEMINI_MODEL: str = "gemini-2.0-flash"
     # OpenRouter (aimed at its free ":free" models, which have daily request caps).
     OPENROUTER_API_KEY: str | None = None
-    # Supports structured outputs but rejects response_format json_object, so it
-    # is always sent without it (see _NO_RESPONSE_FORMAT_MODELS in llm_client).
-    OPENROUTER_MODEL: str = "qwen/qwen3.8-27b:free"
-    # Same-provider (OpenRouter) fallback model on a different upstream; free
-    # models rate-limit per model. Supports response_format, 262K context.
-    # Set empty in .env to disable.
-    OPENROUTER_FALLBACK_MODEL: str | None = "google/gemma-4-31b-it:free"
+    # The measured configuration (PR eval v2 dev240 + trial): no LLM_SAMPLING
+    # entry, so it runs at LLM_TEMPERATURE (0.2) - intentionally; don't add one
+    # without re-measuring.
+    OPENROUTER_MODEL: str = "nvidia/nemotron-3-super-120b-a12b:free"
+    # Same-provider (OpenRouter) fallback model; None / empty = disabled (the default).
+    OPENROUTER_FALLBACK_MODEL: str | None = None
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     # httpx timeout: per read / connect / write, NOT for the whole request.
     LLM_TIMEOUT_SECONDS: int = 60

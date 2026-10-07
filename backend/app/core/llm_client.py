@@ -346,16 +346,46 @@ class InvalidAnswer(ValueError):
         self.problem = problem
 
 
+class _FallbackAnswer:
+    """Type of ``FALLBACK_ANSWER``."""
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:  # ``if problem:`` treats it as acceptable
+        return False
+
+    def __repr__(self) -> str:
+        return "FALLBACK_ANSWER"
+
+
+# A ``validate`` result: an acceptable answer, but one that ``extract_json``
+# returns only when no other candidate object of the reply is accepted
+# outright (``validate`` returning None). Falsy, so a caller's ``if problem:``
+# accepts it; ``accepted(problem)`` is the explicit test.
+FALLBACK_ANSWER = _FallbackAnswer()
+
+
+def accepted(problem) -> bool:
+    """A ``validate`` result that accepts the answer (None or FALLBACK_ANSWER)."""
+    return problem is None or problem is FALLBACK_ANSWER
+
+
 def _first_valid(candidates, validate):
-    """(the first of ``candidates`` that ``validate`` accepts or None, the
-    problem of the first rejected one or None)."""
+    """(the first of ``candidates`` that ``validate`` accepts outright or
+    None, the first one it accepts as FALLBACK_ANSWER or None, the problem of
+    the first rejected one or None)."""
     first_problem = None
+    fallback = None
     for obj in candidates:
         problem = validate(obj)
         if problem is None:
-            return obj, None
+            return obj, None, None
+        if problem is FALLBACK_ANSWER:
+            if fallback is None:
+                fallback = obj
+            continue
         first_problem = first_problem or problem
-    return None, first_problem
+    return None, fallback, first_problem
 
 
 def extract_json(content: str, validate=None):
@@ -374,7 +404,9 @@ def extract_json(content: str, validate=None):
     returned, so a trailing example / note object after the answer, or a
     draft after it, doesn't replace it. Candidates are the whole reply (plain
     JSON), else the top-level objects, then the parsable fences, each group
-    from last to first. JSON was found but no candidate passes ->
+    from last to first. A candidate ``validate`` accepts only as
+    ``FALLBACK_ANSWER`` is returned only when none is accepted outright (the
+    last such one). JSON was found but no candidate passes ->
     ``InvalidAnswer``.
 
     Raises json.JSONDecodeError (from the plain parse) if nothing parses.
@@ -386,7 +418,7 @@ def extract_json(content: str, validate=None):
         original = exc
     else:
         problem = check(whole)
-        if problem is None:
+        if accepted(problem):
             return whole
         raise InvalidAnswer(problem)
     text = _THINK_RE.sub("", content)
@@ -396,11 +428,11 @@ def extract_json(content: str, validate=None):
         pass
     else:
         problem = check(whole)
-        if problem is None:
+        if accepted(problem):
             return whole
         raise InvalidAnswer(problem)
     objects = _top_level_objects(text)
-    found, problem = _first_valid(reversed(objects), check)
+    found, fallback, problem = _first_valid(reversed(objects), check)
     if found is not None:
         return found
     fenced = []
@@ -409,9 +441,11 @@ def extract_json(content: str, validate=None):
             fenced.append(json.loads(candidate.strip()))
         except json.JSONDecodeError:
             pass
-    found, fence_problem = _first_valid(fenced, check)
+    found, fence_fallback, fence_problem = _first_valid(fenced, check)
     if found is not None:
         return found
+    if fallback is not None or fence_fallback is not None:
+        return fallback if fallback is not None else fence_fallback
     if objects or fenced:
         raise InvalidAnswer(problem or fence_problem or "no acceptable JSON answer")
     raise original
@@ -528,7 +562,9 @@ class LLMClient:
         # a queued / thinking upstream reset it indefinitely. The call deadline
         # is a hard wall-clock bound on the whole request; on expiry the request
         # is cancelled and leaving the ``async with`` closes its connection.
-        limit = settings.LLM_CALL_DEADLINE_S or None
+        limit = settings.LLM_CALL_DEADLINE_S
+        if not limit or limit <= 0:  # 0 / None (or a negative value) = off
+            limit = None
         async with httpx.AsyncClient(timeout=settings.LLM_TIMEOUT_SECONDS) as http:
             timer = asyncio.timeout(limit)
             try:

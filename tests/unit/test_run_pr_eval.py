@@ -1091,3 +1091,17 @@ def test_benign_metrics_by_source_real_commits_vs_bystanders():
     clean = R.view_metrics([intro, *real[1:]], "verified")["benign_by_source"]["real_commit"]
     assert clean["fpr"]["k"] == 0 and clean["precision_at_base_rate"] is None
     R.print_view("v", m)  # prints the per-source rows without error
+
+
+def test_cached_final_need_context_answer_replays(tmp_path):
+    # The final audit call's validator accepts a need_context-only answer as a
+    # FALLBACK_ANSWER (falsy, not None): a cached one must replay, not be a miss.
+    path = tmp_path / "cache.jsonl"
+    asks = {"need_context": [{"symbol": "no_such_symbol"}]}
+    rec1, gate1 = _run(intro_item(), "pr", StubLLM(audit=asks), _gate(LLMCache(path)))
+    assert rec1["pr_review"]["context_unresolved"] == 1 and gate1.calls >= 2
+    llm2 = StubLLM()
+    rec2, gate2 = _run(intro_item(), "pr", llm2, _gate(LLMCache(path), max_calls=0))
+    assert rec2["status"] == "cached" and gate2.calls == 0 and llm2.prompts == []
+    assert not any("cached_invalid" in e for e in rec2["call_log"])
+    assert rec2["pr_review"]["context_unresolved"] == 1

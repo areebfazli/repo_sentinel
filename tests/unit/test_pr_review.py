@@ -9,9 +9,10 @@ from pathlib import Path
 import pytest
 
 from backend.app.config import settings
-from backend.app.core.llm_client import LLMError
+from backend.app.core.llm_client import FALLBACK_ANSWER, LLMError, extract_json
 from backend.app.core.pr_review import (
     PRReviewConfig,
+    audit_schema_problem,
     build_audit_prompt,
     collect_leads,
     plan_audit_chunks,
@@ -1108,11 +1109,36 @@ def test_schema_checks_are_passed_to_the_router_as_validators():
     bare = {"title": "Path traversal", "quoted_code": "return open(p).read()"}
     asks = {"need_context": [{"symbol": "x"}]}
     assert audit_ctx(bare) and audit_final(bare)  # a salvaged finding never passes
-    # need_context passes on the final call too (recorded as context_unresolved).
-    assert audit_ctx(asks) is None and audit_final(asks) is None
+    # need_context passes on the final call too (recorded as context_unresolved),
+    # but only as a fallback: an object with a findings list is preferred.
+    assert audit_ctx(asks) is None and audit_final(asks) is FALLBACK_ANSWER
+    assert not audit_final(asks)  # falsy: ``if problem:`` accepts it
     assert audit_final({"need_context": []}) and audit_final({"need_context": "x"})
     assert audit_ctx({"findings": []}) is None and audit_final({"findings": []}) is None
     assert verify({"verdict": "rejected"}) is None and verify({"findings": []})
+
+
+@pytest.mark.parametrize("reply", [
+    # The findings answer, then a trailing need_context object: last-object-wins
+    # alone would drop the findings and record context_unresolved.
+    '{"findings": [{"title": "t"}]}\nOr, with more code: {"need_context": [{"symbol": "x"}]}',
+    '{"need_context": [{"symbol": "x"}]} Final: {"findings": [{"title": "t"}]}',
+    '```json\n{"findings": [{"title": "t"}]}\n```\n```json\n{"need_context": ["x"]}\n```',
+])
+def test_final_audit_call_prefers_a_findings_object_over_need_context(reply):
+    data = extract_json(reply, validate=lambda d: audit_schema_problem(d, final=True))
+    assert data == {"findings": [{"title": "t"}]}
+    # While context rounds remain, the last object still wins (context is fetched).
+    if reply.startswith('{"findings"'):
+        assert "need_context" in extract_json(reply, validate=audit_schema_problem)
+
+
+def test_final_audit_call_need_context_alone_is_still_accepted():
+    reply = 'I need more: {"need_context": [{"symbol": "x"}]} {"note": 1}'
+    data = extract_json(reply, validate=lambda d: audit_schema_problem(d, final=True))
+    assert data == {"need_context": [{"symbol": "x"}]}
+    plain = '{"need_context": [{"symbol": "x"}]}'
+    assert extract_json(plain, validate=lambda d: audit_schema_problem(d, final=True))
 
 
 class UnusableRouter(PRRouter):

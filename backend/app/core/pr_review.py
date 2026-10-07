@@ -92,7 +92,7 @@ from backend.app.core.guard_diff import (
     comment_only_lines,
     control_kinds_on_lines,
 )
-from backend.app.core.llm_client import LLMError
+from backend.app.core.llm_client import FALLBACK_ANSWER, LLMError
 from backend.app.core.markdown_renderer import (
     MAX_QUOTE_CHARS,
     MAX_SNIPPET_CHARS,
@@ -629,14 +629,17 @@ def _int(value) -> int | None:
         return None
 
 
-def audit_schema_problem(data) -> str | None:
+def audit_schema_problem(data, *, final: bool = False):
     """Why an audit response is not an answer the prompt's schema allows, or
     None. An answer is an object with a ``findings`` list (any
     ``need_context`` beside it is ignored once no more context can be given),
     or a non-empty ``need_context`` list. The latter is accepted on the final
     call too (no more context rounds): ``run_pr_review`` then records it as
     ``context_unresolved`` (no findings from that prompt, review partial)
-    instead of failing the call. Anything else (a non-object, a bare finding
+    instead of failing the call. On the final call it is only a
+    ``FALLBACK_ANSWER`` (falsy): ``extract_json`` prefers any object of the
+    reply with a findings list, so a findings answer followed by a trailing
+    need_context object keeps its findings. Anything else (a non-object, a bare finding
     dict salvaged from cut-off output, a non-list ``findings``, an empty or
     non-list ``need_context`` without findings) is a failed call, never
     "reviewed, no findings"."""
@@ -647,7 +650,7 @@ def audit_schema_problem(data) -> str | None:
     if "findings" in data:
         return "findings is not a list"
     if isinstance(data.get("need_context"), list) and data["need_context"]:
-        return None
+        return FALLBACK_ANSWER if final else None
     return "no findings list"
 
 
@@ -1346,7 +1349,7 @@ async def run_pr_review(
                 # unusable answer falls through to the next model.
                 data, provider = await router.generate(
                     AUDIT_SYSTEM_PROMPT, user, deadline=deadline,
-                    validate=audit_schema_problem)
+                    validate=lambda d, final=final: audit_schema_problem(d, final=final))
             except LLMError as exc:
                 logger.warning("PR audit call failed ({} file(s)): {}", len(chunk.paths), exc)
                 failure = _failure_reason(exc)

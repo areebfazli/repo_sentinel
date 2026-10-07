@@ -150,7 +150,7 @@ if str(_ROOT) not in sys.path:
     sys.path.append(str(_ROOT))
 
 from backend.app.config import BASE_DIR, settings  # noqa: E402
-from backend.app.core.llm_client import MIN_OUTPUT_TOKENS, LLMError  # noqa: E402
+from backend.app.core.llm_client import MIN_OUTPUT_TOKENS, LLMError, accepted  # noqa: E402
 from backend.app.core.markdown_renderer import SEVERITY_ORDER  # noqa: E402
 from backend.app.core.markdown_renderer import SYSTEM_PROMPT as UNITS_SYSTEM_PROMPT  # noqa: E402
 from backend.app.core.pr_context import diff_lines  # noqa: E402
@@ -626,7 +626,7 @@ class EvalGate:
                   if self.cache is not None else None)
         if cached is not None and "llm_json" in cached:
             problem = validate(cached["llm_json"]) if validate is not None else None
-            if problem is None:
+            if accepted(problem):
                 entry.update(cached=True, provider=cached.get("provider_used"),
                              latency_s=cached.get("latency_s"), usage=cached.get("usage"))
                 return cached["llm_json"], cached.get("provider_used")

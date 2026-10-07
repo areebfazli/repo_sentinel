@@ -258,3 +258,10 @@ def test_eval_gate_ctrl_c_still_stops_the_eval(monkeypatch, tmp_path):
     assert gate.stopped == "interrupted" and gate.item_not_run
     assert up.calls == [GROQ_MODEL] and up.cancelled == [GROQ_MODEL]
     assert len(cache) == 0
+
+
+def test_negative_deadline_is_off_not_an_instant_timeout(monkeypatch):
+    up = SlowUpstream(slow={GROQ_MODEL}, hang_s=0.05).install(monkeypatch)
+    router = _router(monkeypatch, deadline_s=-1, retries=0)
+    data, label = asyncio.run(router.generate("s", "u"))
+    assert (data, label) == (ANSWER, f"groq:{GROQ_MODEL}") and up.cancelled == []

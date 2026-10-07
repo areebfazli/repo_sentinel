@@ -330,6 +330,15 @@ _TRAILING_COMMENT = re.compile(r"\s+(?:#|//).*$")
 _GAP = "\x00"
 _CLOSERS = (")", "]", "}")
 _TRAILING_COMMA = re.compile(r",(?=[)\]}])")
+# Loose matching (``locate_quote(..., loose=True)``): quote / backtick
+# characters, with any backslashes escaping them, are ignored on both sides. A
+# model quoting code inside JSON often leaves \" / \' escapes in, or drops or
+# swaps quote characters (a template literal's backticks).
+_QUOTE_CHARS = re.compile(r"\\*[\"'`]")
+
+
+def _loose_form(text: str) -> str:
+    return _QUOTE_CHARS.sub("", text)
 
 
 def _quote_fragments(quote: str, lenient: bool) -> list[str]:
@@ -350,7 +359,8 @@ def _quote_fragments(quote: str, lenient: bool) -> list[str]:
     return frags
 
 
-def locate_quote(quote, code: str, skip_lines=frozenset()) -> tuple[int, int] | None:
+def locate_quote(quote, code: str, skip_lines=frozenset(),
+                 loose: bool = False) -> tuple[int, int] | None:
     """0-based (first, last) line index of ``code`` that ``quote`` was copied
     from, or None.
 
@@ -367,7 +377,10 @@ def locate_quote(quote, code: str, skip_lines=frozenset()) -> tuple[int, int] | 
     each quoted line. ``quote`` may be a list of lines. ``skip_lines`` are code
     line indexes that are not code (elision markers): nothing matches in or
     across them. The span runs from the first fragment's first line to the
-    last fragment's last line.
+    last fragment's last line. ``loose``: quote / backtick characters (and
+    backslashes escaping them) are ignored on both sides - a much weaker
+    match, so callers use it only as a fallback in a few lines around a
+    claimed line (``pr_review.locate_in_file``), never over a whole file.
     """
     if isinstance(quote, (list, tuple)):
         quote = "\n".join(str(q) for q in quote if q is not None)
@@ -377,6 +390,8 @@ def locate_quote(quote, code: str, skip_lines=frozenset()) -> tuple[int, int] | 
     owner: list[int] = []
     for i, line in enumerate(code.splitlines()):
         norm = _GAP if i in skip_lines else match_form(line)
+        if loose:
+            norm = _loose_form(norm)
         pieces.append(norm)
         owner.extend([i] * len(norm))
     flat = "".join(pieces)
@@ -386,6 +401,8 @@ def locate_quote(quote, code: str, skip_lines=frozenset()) -> tuple[int, int] | 
     flat, owner = "".join(flat[i] for i in keep), [owner[i] for i in keep]
     for lenient in (False, True):
         frags = [_TRAILING_COMMA.sub("", f) for f in _quote_fragments(quote, lenient)]
+        if loose:
+            frags = [f for f in (_loose_form(f) for f in frags) if f]
         if sum(len(f) for f in frags) < MIN_QUOTE_CHARS:
             continue
         pos, first, last = 0, None, None

@@ -1608,3 +1608,137 @@ def test_xxe_mentioning_denial_of_service_reaches_the_verifier():
     assert len(router.verify_prompts) == 1
     assert result["pr_review"]["hard_excluded"] == 0
     assert [f["cwe"] for f in result["report_findings"]] == ["CWE-611"]
+
+
+@pytest.mark.parametrize("confidence", [None, "high", "n/a"])
+def test_missing_audit_confidence_counts_as_the_floor(confidence):
+    finding = {k: v for k, v in TRAVERSAL.items() if k != "confidence"}
+    if confidence is not None:
+        finding["confidence"] = confidence
+    router = PRRouter(audits=[{"findings": [finding]}])
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router)
+    assert len(router.verify_prompts) == 1
+    assert result["pr_review"]["below_audit_confidence"] == 0
+    [c] = result["candidates"]
+    assert c["audit_confidence"] is None and c["status"] == "confirmed"
+
+
+def test_explicit_low_audit_confidence_is_still_below_the_floor():
+    router = PRRouter(audits=[{"findings": [{**TRAVERSAL, "confidence": 4}]}])
+    result = _review(_files(("app/files.py", PY_OLD, PY_NEW)), router, min_audit_confidence=5)
+    assert router.verify_prompts == []
+    assert result["candidates"][0]["status"] == "below_audit_confidence"
+
+
+def test_missing_confidence_sorts_at_the_floor_for_the_verifier_budget():
+    from backend.app.core.pr_review import audit_confidence_or_floor
+
+    assert audit_confidence_or_floor({"audit_confidence": None}, 5) == 5
+    assert audit_confidence_or_floor({}, 5) == 5
+    assert audit_confidence_or_floor({"audit_confidence": 2}, 5) == 2
+
+
+JS_FILE = (
+    "function render(user) {\n"                                   # 1
+    "  const greeting = 'hello';\n"                                # 2
+    "  el.innerHTML = `<b>${user.name}</b>`;\n"                    # 3
+    "  log(\"done\");\n"                                           # 4
+    "}\n"                                                          # 5
+    + "".join(f"// pad {i}\n" for i in range(20))                  # 6-25
+    + "function other(user) {\n"                                   # 26
+    "  el2.innerHTML = `<i>${user.name}</i>`;\n"                   # 27
+    "}\n"
+)
+
+
+@pytest.mark.parametrize("quote", [
+    'el.innerHTML = <b>${user.name}</b>;',          # template-literal backticks dropped
+    "el.innerHTML = '<b>${user.name}</b>';",         # backticks swapped for quotes
+    'el.innerHTML = \\"<b>${user.name}</b>\\";',     # JSON-escaped quotes left in
+])
+def test_loose_quote_match_near_the_claimed_line(quote):
+    from backend.app.core.pr_review import locate_in_file
+
+    assert locate_in_file(quote, JS_FILE, 3) is None  # the strict match fails
+    span = locate_in_file(quote, JS_FILE, 3, loose=True)
+    assert span is not None and span[:2] == (3, 3)
+    assert locate_in_file(quote, JS_FILE, 6, loose=True)[:2] == (3, 3)  # within 3 lines
+
+
+def test_loose_quote_match_never_reaches_far_or_wrong_lines():
+    from backend.app.core.pr_review import locate_in_file
+
+    quote = "el.innerHTML = <b>${user.name}</b>;"
+    assert locate_in_file(quote, JS_FILE, 7, loose=True) is None    # 4 lines away
+    assert locate_in_file(quote, JS_FILE, 27, loose=True) is None   # other function
+    assert locate_in_file(quote, JS_FILE, None, loose=True) is None  # never global
+    # The other function's line only matches its own quote.
+    other = "el2.innerHTML = <i>${user.name}</i>;"
+    assert locate_in_file(other, JS_FILE, 26, loose=True)[:2] == (27, 27)
+    assert locate_in_file(other, JS_FILE, 3, loose=True) is None
+
+
+def test_loose_quote_is_a_fallback_after_the_exact_match():
+    js_old = JS_FILE.replace("el.innerHTML = `<b>${user.name}</b>`", "el.textContent = user.name")
+    finding = {"file": "app/r.js", "line": 3, "severity": "high", "cwe": "CWE-79",
+               "title": "XSS via innerHTML", "confidence": 8,
+               "quoted_code": "el.innerHTML = <b>${user.name}</b>;"}
+    router = PRRouter(audits=[{"findings": [finding]}])
+    result = _review(_files(("app/r.js", js_old, JS_FILE)), router)
+    assert result["pr_review"]["quote_not_found"] == 0
+    [c] = result["candidates"]
+    assert (c["file_path"], c["line"]) == ("app/r.js", 3)
+    # A quote that matches nothing near the claimed line is still dropped.
+    far = {**finding, "line": 15}
+    router = PRRouter(audits=[{"findings": [far]}])
+    result = _review(_files(("app/r.js", js_old, JS_FILE)), router)
+    assert result["pr_review"]["quote_not_found"] == 1 and result["candidates"] == []
+
+
+def test_loose_quote_needs_enough_characters():
+    from backend.app.core.pr_review import locate_in_file
+
+    assert locate_in_file("'`'", "x = '`'\n", 1, loose=True) is None
+
+
+@pytest.mark.parametrize("path,old,new,quote", [
+    ("app/a.js", "function f(q) {\n  return db.query(q);\n}\n",
+     "function f(q) {\n  // build the query from user input, no escaping\n"
+     "  return db.query(q);\n}\n",
+     "// build the query from user input, no escaping"),
+    ("app/a.py", "def f(q):\n    return db.query(q)\n",
+     "def f(q):\n    # the query comes straight from the request\n    return db.query(q)\n",
+     "# the query comes straight from the request"),
+    ("app/a.py", "def f(q):\n    return db.query(q)\n",
+     'def f(q):\n    """Run the user query unescaped."""\n    return db.query(q)\n',
+     '"""Run the user query unescaped."""'),
+])
+def test_a_comment_only_quote_is_dropped(path, old, new, quote):
+    finding = {"file": path, "line": 2, "severity": "high", "cwe": "CWE-89",
+               "title": "SQL injection", "confidence": 9, "quoted_code": quote}
+    router = PRRouter(audits=[{"findings": [finding]}])
+    result = _review(_files((path, old, new)), router)
+    assert result["pr_review"]["quote_not_found"] == 1
+    assert result["candidates"] == [] and router.verify_prompts == []
+
+
+def test_a_quote_with_code_and_a_comment_is_kept():
+    new = "function f(q) {\n  // unsafe\n  return db.query(q);\n}\n"
+    finding = {"file": "app/a.js", "line": 2, "severity": "high", "cwe": "CWE-89",
+               "title": "SQL injection", "confidence": 9,
+               "quoted_code": "// unsafe\n  return db.query(q);"}
+    router = PRRouter(audits=[{"findings": [finding]}])
+    result = _review(_files(("app/a.js", "function f(q) {\n  return 1;\n}\n", new)), router)
+    assert result["pr_review"]["quote_not_found"] == 0
+    assert [(c["line"], c["end_line"]) for c in result["candidates"]] == [(2, 3)]
+
+
+def test_comment_only_quote_rule_ignores_other_languages():
+    old = "package a\n\nfunc F(q string) {\n\tdb.Query(q)\n}\n"
+    new = "package a\n\nfunc F(q string) {\n\t// query built from user input\n\tdb.Query(q)\n}\n"
+    finding = {"file": "a.go", "line": 4, "severity": "high", "cwe": "CWE-89",
+               "title": "SQL injection", "confidence": 9,
+               "quoted_code": "// query built from user input"}
+    router = PRRouter(audits=[{"findings": [finding]}])
+    result = _review(_files(("a.go", old, new)), router)
+    assert result["pr_review"]["quote_not_found"] == 0 and len(result["candidates"]) == 1

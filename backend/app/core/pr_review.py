@@ -29,10 +29,15 @@ per-function in isolation. Stages:
    (``context_unresolved``), never a failed call. Our own implementation of
    the idea; nothing from vulnhuntr.
 4. **Validation**: every finding must quote the NEW file (``locate_quote``,
-   searched near the claimed line first), else it is dropped; then regex hard
-   exclusions (DoS, rate limiting, resource leaks, memory safety outside
-   C/C++, docs / tests; ``prompts.pr_audit.hard_exclusion_reason``) and a
-   floor on the audit's own confidence.
+   searched near the claimed line first; failing that anywhere, a loose
+   fallback ignoring quote / backtick characters and their escapes, within
+   ``LOOSE_QUOTE_RADIUS`` lines of the claimed line only), else it is
+   dropped; a quote of nothing but comments (Python / JavaScript,
+   ``guard_diff.comment_only_lines``) is dropped too. Then regex hard
+   exclusions (DoS and memory safety outside C/C++ judged on title + CWE,
+   rate limiting, resource leaks, docs / tests;
+   ``prompts.pr_audit.hard_exclusion_reason``) and a floor on the audit's
+   own confidence (a missing confidence counts as the floor).
 5. **Verification**: one fresh-context call per surviving candidate
    (``VERIFIER_SYSTEM_PROMPT``) with the file after the change (whole, or a
    window around the finding plus its function), the file's diff and the
@@ -91,6 +96,7 @@ from backend.app.core.guard_diff import (
     ALERT_MIN_CONFIDENCE,
     comment_only_lines,
     control_kinds_on_lines,
+    normalize_language,
 )
 from backend.app.core.llm_client import FALLBACK_ANSWER, LLMError
 from backend.app.core.markdown_renderer import (
@@ -568,6 +574,9 @@ def resolve_context(bundle: PRBundle, requests, state: ContextState, cap: int) -
 
 _NUMBER_PREFIX = re.compile(r"^\s*\d*\s*\|\s?")
 QUOTE_WINDOW = 40
+# Loose fallback (quote / backtick characters and their escapes ignored): the
+# quote's first line must be within this many lines of the claimed line.
+LOOSE_QUOTE_RADIUS = 3
 
 
 def _strip_diff_markers(quote: str) -> str:
@@ -578,12 +587,19 @@ def _strip_diff_markers(quote: str) -> str:
     return "\n".join(out)
 
 
-def locate_in_file(quote: str, content: str,
-                   claimed: int | None) -> tuple[int, int, str] | None:
+def locate_in_file(quote: str, content: str, claimed: int | None,
+                   loose: bool = False) -> tuple[int, int, str] | None:
     """1-based (first, last) line of ``content`` that ``quote`` was copied
     from, preferring a match within QUOTE_WINDOW lines of ``claimed``, plus
     the quote as matched (diff markers / line-number columns stripped when
-    that is what made it match)."""
+    that is what made it match).
+
+    ``loose``: ONLY the fallback match, for a quote the strict match missed:
+    quote / backtick characters and the backslashes escaping them are ignored
+    (``locate_quote(loose=True)``: ``\"`` / ``\'`` left in from JSON, dropped or
+    swapped quotes, a template literal's backticks), and the quote's first
+    line must be within LOOSE_QUOTE_RADIUS lines of ``claimed``. None without
+    a claimed line: never a whole-file search."""
     if not quote or not content:
         return None
     lines = content.splitlines()
@@ -591,6 +607,19 @@ def locate_in_file(quote: str, content: str,
     stripped = _strip_diff_markers(quote)
     if stripped != quote:
         variants.append(stripped)
+    if loose:
+        if not claimed:
+            return None
+        at = claimed - 1
+        for q in variants:
+            n_quoted = max(len([ln for ln in q.splitlines() if ln.strip()]), 1)
+            lo = max(at - LOOSE_QUOTE_RADIUS, 0)
+            hi = min(at + LOOSE_QUOTE_RADIUS + n_quoted, len(lines))
+            span = (locate_quote(q, "\n".join(lines[lo:hi]), loose=True)
+                    if lo < hi else None)
+            if span is not None and abs(lo + span[0] - at) <= LOOSE_QUOTE_RADIUS:
+                return lo + span[0] + 1, lo + span[1] + 1, q
+        return None
     for q in variants:
         if claimed:
             lo = max(claimed - 1 - QUOTE_WINDOW, 0)
@@ -667,6 +696,31 @@ def verifier_schema_problem(data) -> str | None:
     return "no verdict"
 
 
+def _comment_only_span(f, span) -> bool:
+    """Every non-blank line of the located quote (1-based ``span``) in the
+    NEW file is comment-only (``guard_diff.comment_only_lines``: comments,
+    docstrings / bare string statements). Python / JavaScript only (parsed
+    with tree-sitter); other languages are never judged."""
+    if normalize_language(f.language) not in ("python", "javascript"):
+        return False
+    lines = (f.new_content or "").splitlines()
+    wanted = [n for n in range(span[0], span[1] + 1)
+              if n <= len(lines) and lines[n - 1].strip()]
+    if not wanted:
+        return False
+    comments = comment_only_lines(f.new_content, f.language)
+    return all(n in comments for n in wanted)
+
+
+def audit_confidence_or_floor(c: dict, floor: int) -> int:
+    """The candidate's audit confidence for the floor check and verifier
+    order; a missing one (the model gave none, or no 1-10 number) counts as
+    exactly ``floor``, so the candidate still reaches the verifier: the
+    absence of a number is not evidence of low confidence."""
+    conf = c.get("audit_confidence")
+    return floor if conf is None else conf
+
+
 def validate_audit_findings(raw, bundle: PRBundle, paths: list[str]) -> tuple[list[dict], int]:
     """Audit findings that quote the NEW version of a PR file, as candidates.
     Returns (candidates, dropped for an unlocatable quote)."""
@@ -694,6 +748,14 @@ def validate_audit_findings(raw, bundle: PRBundle, paths: list[str]) -> tuple[li
             if span is not None:
                 path = p
                 break
+        if path is None and named and claimed and bundle.by_path[named].new_content:
+            # Fallback after the strict match failed everywhere: quote characters
+            # ignored, near the claimed line of the named file only.
+            span = locate_in_file(quote, bundle.by_path[named].new_content, claimed,
+                                  loose=True)
+            path = named if span is not None else None
+        if path is not None and _comment_only_span(bundle.by_path[path], span):
+            path = None  # quotes nothing but comments: no code to point at
         if path is None:
             dropped += 1
             continue
@@ -1419,13 +1481,14 @@ async def run_pr_review(
         if reason:
             c.update(status="excluded", status_reason=reason)
             stats["hard_excluded"] += 1
-        elif (c.get("audit_confidence") or 0) < config.min_audit_confidence:
+        elif audit_confidence_or_floor(c, config.min_audit_confidence) < (
+                config.min_audit_confidence):
             c.update(status="below_audit_confidence")
             stats["below_audit_confidence"] += 1
         else:
             to_verify.append(c)
     to_verify.sort(key=lambda c: (SEVERITY_ORDER.get(c.get("severity"), 4),
-                                  -(c.get("audit_confidence") or 0)))
+                                  -audit_confidence_or_floor(c, config.min_audit_confidence)))
     findings: list[dict] = []
     suggestions: list[dict] = []
     verifier_models: list[str] = []

@@ -17,6 +17,7 @@ root. Plans and dated results live in [ROADMAP.md](../ROADMAP.md).
 - [Diff-direction evidence (did the PR remove a guard?)](#diff-direction-evidence-did-the-pr-remove-a-guard)
 - [PR-level review (files mode)](#pr-level-review-files-mode)
   - [PR-level eval](#pr-level-eval)
+  - [Held-out test results (v2)](#held-out-test-results-v2)
 - [Project layout](#project-layout)
 - [Notes & gotchas](#notes--gotchas)
 - [Growing the corpus from real CVE fixes](#growing-the-corpus-from-real-cve-fixes)
@@ -107,9 +108,8 @@ GET /api/v1/analyze/{job_id}  ◀── clients poll for the result
 - **PR-level review in files mode.** The model is asked what the *change* newly introduces,
   over the unified diff and each changed function before and after, with leads (guard_diff,
   permissive Semgrep, sensitive sinks on added lines) to focus attention; it may ask for code
-  defined elsewhere in the PR (the option exists, but the model made no such request in the
-  160 scored PRs of the dev run), and every candidate is re-judged by a separate verifier call
-  before it is reported. See [PR-level review](#pr-level-review-files-mode).
+  defined elsewhere in the PR (on the held-out test it did in 25 of 214 PRs), and every
+  candidate is re-judged by a separate verifier call before it is reported. See [PR-level review](#pr-level-review-files-mode).
 
 ---
 
@@ -130,7 +130,7 @@ can still be overridden there. Highlights:
 | `TWIN_MARGIN_MIN` | (off) | Drop CVE matches that look at least as much like the stored fix as like the bug; calibrate with `run_eval --margin-sweep` |
 | `LLM_PROVIDER` / `LLM_FALLBACK_PROVIDER` | `openrouter` / (none) | `groq` \| `gemini` \| `openrouter` \| `mock`; OpenAI-compatible endpoints. Default chain: **one model, no fallback**: `openrouter:nvidia/nemotron-3-super-120b-a12b:free` (free qwen was removed from OpenRouter, 404; free gemma is constantly rate-limited). An OpenRouter outage or 429 on it therefore fails the review (`review_status` `failed`, which the Action's coverage gate turns red). Opt into a fallback via env: `OPENROUTER_FALLBACK_MODEL` and/or `LLM_FALLBACK_PROVIDER` (e.g. `groq` + `GROQ_API_KEY`); each provider, primary or fallback, then tries its own fallback model after its default one. Empty = disabled |
 | `GROQ_MODEL` / `GROQ_FALLBACK_MODEL` | `openai/gpt-oss-120b` / `qwen/qwen3.8-27b` | Only used when Groq is `LLM_PROVIDER` or `LLM_FALLBACK_PROVIDER`. Groq default model → Groq fallback model (Groq rate-limits per model); set `GROQ_FALLBACK_MODEL=` to disable the second. The job result's `llm_provider_used` names the model that answered, e.g. `groq:qwen/qwen3.8-27b` |
-| `OPENROUTER_MODEL` / `OPENROUTER_FALLBACK_MODEL` | `nvidia/nemotron-3-super-120b-a12b:free` / (none) | OpenRouter free models (20 req/min, 1,000 req/day with ≥ $10 credits, fewer without; they need "allow free endpoints that may train on inputs" in OpenRouter's privacy settings or return 404; see [openrouter.ai/docs](https://openrouter.ai/docs)). The default model has no `LLM_SAMPLING` entry, so it runs at `LLM_TEMPERATURE` 0.2: the measured configuration (PR eval v2 dev240), intentionally. `OPENROUTER_FALLBACK_MODEL` is off by default (e.g. `google/gemma-4-31b-it:free` to enable). OpenRouter default model → OpenRouter fallback model (if set) → `LLM_FALLBACK_PROVIDER` (if set). Models listed in `_NO_RESPONSE_FORMAT_MODELS` (`qwen/qwen3.8-27b:free`) are always sent without `response_format`. 429 is retried; 402 (insufficient credits) is not, and skips OpenRouter's other models; a model that rejects `response_format` is retried once without it |
+| `OPENROUTER_MODEL` / `OPENROUTER_FALLBACK_MODEL` | `nvidia/nemotron-3-super-120b-a12b:free` / (none) | OpenRouter free models (20 req/min, 1,000 req/day with ≥ $10 credits, fewer without; they need "allow free endpoints that may train on inputs" in OpenRouter's privacy settings or return 404; see [openrouter.ai/docs](https://openrouter.ai/docs)). The default model has no `LLM_SAMPLING` entry, so it runs at `LLM_TEMPERATURE` 0.2: the measured configuration (PR eval v2 dev240 and the held-out test217), intentionally. `OPENROUTER_FALLBACK_MODEL` is off by default (e.g. `google/gemma-4-31b-it:free` to enable). OpenRouter default model → OpenRouter fallback model (if set) → `LLM_FALLBACK_PROVIDER` (if set). Models listed in `_NO_RESPONSE_FORMAT_MODELS` (`qwen/qwen3.8-27b:free`) are always sent without `response_format`. 429 is retried; 402 (insufficient credits) is not, and skips OpenRouter's other models; a model that rejects `response_format` is retried once without it |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | `/chat/completions` is appended |
 | `OPENROUTER_API_KEY` / `GROQ_API_KEY` / `GEMINI_API_KEY` | (none) | The only LLM settings `.env` needs; by default only `OPENROUTER_API_KEY` is used. A missing key for `LLM_PROVIDER` **hard-fails at startup**; a missing key for `LLM_FALLBACK_PROVIDER` just logs a warning and that provider is skipped |
 | `LLM_MAX_PROMPT_TOKENS` / `LLM_MAX_UNITS_PER_PROMPT` / `LLM_MAX_CALLS_PER_SCAN` | `6000` / `6` / `6` | Per-scan LLM budget. Units are ordered by evidence (guard_diff alert, Semgrep hit, `guard_removed`, then retrieval similarity) and packed into as few prompts as fit (one call when everything fits). Tokens are estimated as chars / 4 × 1.25; 6000 keeps a prompt plus a reasoning model's answer under Groq's free-tier 8K tokens/min. An oversized unit loses its references, then its code is elided around its changed lines (head and tail without a diff) with explicit `[... N line(s) omitted ...]` markers and real line numbers; units beyond the call cap are listed in `units_not_reviewed` and in the report, never dropped silently |
@@ -304,8 +304,9 @@ Offline tools (they read saved results; no model load and no LLM call):
   vulnerable localised TP and fixed-twin FP, with the discordant counts, plus exact
   (Clopper-Pearson) CIs on ordinary FPR.
 
-Measured 2026-09-24 on one model (`groq:qwen/qwen3.8-27b`, 8 vuln/fixed pairs + 13 ordinary
-functions): the new prompt found 2/8 vulnerable functions vs 1/8 for the legacy prompt, flagged
+Historical (the per-function design, superseded by the PR-level review; current numbers:
+[Held-out test results (v2)](#held-out-test-results-v2)). Measured 2026-09-24 on one model
+(`groq:qwen/qwen3.8-27b`, 8 vuln/fixed pairs + 13 ordinary functions): the new prompt found 2/8 vulnerable functions vs 1/8 for the legacy prompt, flagged
 1/8 fixed twins (legacy 2/8) and 1/13 ordinary functions (legacy 0/13); the `no_retrieval` arm
 flagged exactly the same items as `current` with 44% fewer tokens. Rescored offline with
 localised scoring, the new prompt found **1/8**: the other "detection" flagged the SSRF host
@@ -434,8 +435,10 @@ reviewer reads one, not function by function:
 4. **Context loop**: instead of answering, the model may send `{"need_context": [{"symbol",
    "file", "want": "definition|callers"}]}`; symbols are resolved from the PR's own files,
    appended and the audit re-asked (≤ `PR_REVIEW_CONTEXT_ROUNDS`, ≤
-   `PR_REVIEW_CONTEXT_MAX_TOKENS`, stops early when nothing new resolves). In the 160 scored
-   PRs of the dev run the model never used it (0 context requests). On the final call (no
+   `PR_REVIEW_CONTEXT_MAX_TOKENS`, stops early when nothing new resolves). The old
+   Qwen dev run never used it; on the held-out test the default model did in 25 of 214 PRs
+   (28 rounds, 34 symbols requested, 13 resolved from the PR's files, 7 final answers
+   `context_unresolved`), mostly asking for code outside the PR. On the final call (no
    rounds left) the prompt says need_context is no longer allowed; an answer with a
    `findings` list is used as is (any `need_context` beside it ignored; a reply holding a
    findings object and a separate need_context object uses the findings), while one that
@@ -556,7 +559,9 @@ budget, so a 6-call review needs a few minutes; `LLM_SCAN_MAX_WALL_S` (480 s) bo
 anything cut is reported (`time_budget`). Groq only serves prompts up to ~7.5K estimated
 tokens (see the Groq limitation under [Notes & gotchas](#notes--gotchas)): with the 12K default
 the larger audit / verifier prompts run on OpenRouter only. The per-unit review makes at most
-`LLM_MAX_CALLS_PER_SCAN` = 6 calls.
+`LLM_MAX_CALLS_PER_SCAN` = 6 calls. Measured on the held-out test with the default model:
+1.6 calls, ~17K tokens and ~69 s of model time per PR on average (p90 3 calls, ~39K tokens,
+~190 s); see [Held-out test results (v2)](#held-out-test-results-v2).
 
 Adapted text: the audit prompt, the verifier's exclusions / precedents and the hard-exclusion
 regexes come from [anthropics/claude-code-security-review](https://github.com/anthropics/claude-code-security-review)
@@ -579,7 +584,8 @@ fixes and 80 bystander benign PRs). Retrieval is off in every arm; no embedder o
   a look". `--rescore` of a run recorded before the tier replays `verified_plus_review` from
   the cached verdicts with **guard_diff evidence only** (recomputed from the dataset; the old
   verifier prompt had no `removed_control_quote`) at the run's own cutoff, and labels it so;
-  without the dataset the view is reported n/a. Rescore of `pr_eval_pr_dev200.json` (old
+  without the dataset the view is reported n/a. Historical (the dev200 Qwen run, superseded by
+  the [v2 results](#held-out-test-results-v2)): rescore of `pr_eval_pr_dev200.json` (old
   prompt, cutoff 8, guard_diff evidence only, limited to the candidate's function, with
   `weights_only` in guard_diff's vocabulary): introducing strict 16/55 (verified 12/55),
   function-level 21/55 (16/55); fix PRs flagged 3/57 (2/57); benign 0/48 (0/48; only 48 of 80
@@ -639,7 +645,8 @@ python -m ml.evaluation.run_pr_eval --dry-run --arm pr      # also: --arm units 
 # Semgrep leads for the selection (one engine run; see ROADMAP for time / RAM)
 python -m ml.evaluation.run_pr_eval --semgrep-precompute \
     --semgrep-cache ml/evaluation/results/pr_semgrep_dev200.json
-# live runs (real provider calls), then offline comparison
+# live runs (real provider calls), then offline comparison; this is the historical dev200
+# Qwen run (the free Qwen model is gone): the held-out test command is in the next section
 python -m ml.evaluation.run_pr_eval --arm pr --llm-model openrouter:qwen/qwen3.8-27b:free \
     --llm-tpm 0 --llm-sleep 3 --llm-max-calls 950 \
     --semgrep-cache ml/evaluation/results/pr_semgrep_dev200.json \
@@ -649,6 +656,119 @@ python -m ml.evaluation.run_pr_eval --compare ml/evaluation/results/pr_eval_unit
 python -m ml.evaluation.run_pr_eval --compare A.json A.json --view-a audit_only --view-b verified
 python -m ml.evaluation.run_pr_eval --rescore A.json --localise-tolerance 5 --out A5.json
 ```
+
+### Held-out test results (v2)
+
+One run on 2026-10-08 of the never-before-evaluated test file `pr_eval_v2_test.jsonl` (217
+PRs: 60 `vuln_introducing` reversed CVE fixes, their 60 `vuln_fix` real fixes, 97
+`real_commit` everyday commits from the same test repos, filtered of security-keyword
+commits; see [PR-shaped eval v2](#pr-shaped-eval-v2-real-benign-commits)). The configuration
+and metrics were pre-registered before the run
+(`ml/evaluation/results/pr_eval_v2_test217_preregistration.md`, commit 1d80979); nothing was
+tuned afterwards. Results: `ml/evaluation/results/pr_eval_pr_v2_test217_super.json` (+ `.log`),
+commit 1b1af98.
+
+**Configuration** (the shipped default since commit f7e4072): `--arm pr`,
+`openrouter:nvidia/nemotron-3-super-120b-a12b:free` as audit and verifier model with no
+fallback (OpenRouter `allow_fallbacks: false`), temperature 0.2 (no `LLM_SAMPLING` entry),
+`LLM_MAX_OUTPUT_TOKENS` 16000, `LLM_CALL_DEADLINE_S` 300, `PR_REVIEW_MAX_PROMPT_TOKENS` 12000,
+`PR_REVIEW_MIN_CONFIDENCE` 7, worth-a-look tier on, Semgrep leads from
+`pr_semgrep_v2_test217.json`, retrieval off, localisation tolerance ±2 lines.
+
+**Coverage.** 214 of 217 PRs completed. 3 `vuln_introducing` PRs are `error` (`bad_output`):
+the model returned null content after spending all 16,000 output tokens on reasoning
+(`finish_reason` `length`, ~58-65K reasoning characters): celery CVE-2021-23727, airflow
+CVE-2023-25754, ansible CVE-2024-11079. In production that is a `partial` / `failed` review,
+never a clean one. 1 completed PR came back `partial`.
+
+**Primary metrics** (the verified report: confirmed findings + guard_diff alerts; 95% Wilson
+CIs), next to the dev run on `pr_eval_v2_sample_dev.jsonl`
+(`pr_eval_pr_v2_dev240_super.json`, same model; dev was used for tuning and ran before the
+last round of fixes, commits 4232557 to f7e4072):
+
+| Metric | Test (217) | Dev (240) |
+|---|---|---|
+| Bug-introducing PRs caught in the right function | **34/57 = 60%** (47-71%) | 28/58 = 48% (36-61%) |
+| ... on the exact lines (±2) | 27/57 = 47% (35-60%) | 22/58 = 38% (27-51%) |
+| ... excluding DoS + timing/race (not targeted by the prompt), function | 29/47 = 62% (47-74%) | 26/45 = 58% (43-71%) |
+| Fix PRs flagged (any finding) | **1/60 = 1.7%** (0.3-8.9%) | 5/60 = 8.3% |
+| Everyday commits flagged (any finding) | **4/97 = 4.1%** (1.6-10.1%; exact upper bound 10.2%) | 5/120 = 4.2% (exact upper bound 9.5%) |
+| Precision at 1 / 2 / 5% base rate (point) | 10% / 19% / 38% | 8% / 16% / 32% |
+| ... at the FPR's exact upper bound | 4.5% / 8.6% / 20% | 3.9% / 7.6% / 17% |
+
+Test and dev intervals overlap; the higher test numbers are not evidence that the last fixes
+helped. Worst case over all 60 bug-introducing PRs (the errored items' partial results
+counted, the one unknown as a miss): 36/60 = 60% function-level, 28/60 = 47% strict. Pairs
+(introducing caught on the lines vs its fix flagged): 27 introducing only, 0 both, 0 fix only,
+30 neither. By language: Python 28/46 caught (function), 1/49 fix and 4/65 everyday flagged;
+JavaScript 6/11, 0/11 and 0/32.
+
+**By PR size** (pre-registered; added + deleted lines over the PR's files, completed items):
+
+| | < 50 changed lines | ≥ 50 changed lines |
+|---|---|---|
+| Everyday commits flagged | 2/81 = 2.5% | 2/16 = 12.5% |
+| Fix PRs flagged | 0/46 | 1/14 |
+| Bug-introducing PRs caught (function) | 23/45 | 11/12 |
+
+False alarms grow with PR size (about 1 in 8 larger everyday commits), and real PRs are often
+larger than this sample, so expect more than the 4.1% headline in real use. If 2% of PRs
+introduce a vulnerability, roughly 1 warning in 5 is a real bug (1 in 10 at 1%): useful as
+review comments, too noisy to block merges automatically. Keep the Action's
+`INPUT_FAIL_ON_SEVERITY` at `high` and treat findings as review input.
+
+**The verifier's effect** (`audit_only` = every candidate that reached the verifier):
+
+| | Audit only | Verified |
+|---|---|---|
+| Bug-introducing caught, right function | 37/57 | 34/57 |
+| Bug-introducing caught, exact lines | 29/57 | 27/57 |
+| Fix PRs flagged | 4/60 | 1/60 |
+| Everyday commits flagged | 6/97 | 4/97 |
+
+The verifier removed 3 fix false alarms (systemdspawner CVE-2020-26261, sglang CVE-2025-10164,
+BentoML CVE-2025-54381) and 2 everyday ones (jquery.terminal, lollms) at the cost of 3 catches
+(sentry-javascript CVE-2023-46729, mlflow CVE-2023-6831, mlflow CVE-2026-2611). Funnel: 5
+audit findings dropped (quote not in the new file); of 66 candidates 1 hard-excluded (generic
+DoS), 65 verified: 50 confirmed, 10 rejected, 5 uncertain. Cutoffs 5 to 8 give identical
+PR-level results; ≥ 9 would give 26/57 function-level, 1/60 fix and 1/97 everyday (reported,
+not acted on: no tuning on test). On dev the verifier cost more (audit-only 38/58 vs verified
+28/58 function-level) and removed 1 fix alarm and no everyday one.
+
+**Worth-a-look tier**: added nothing on the test set (0 `review_suggested`; verified + worth a
+look = verified). On dev it added 2 function-level catches and no false alarm.
+
+**Context loop**: used in 25 PRs (28 rounds); 34 symbols requested, 13 resolved from the PR's
+files; 7 final answers still asked for context (`context_unresolved`), mostly code outside the
+PR, which the reviewer cannot be shown.
+
+**Cost and latency** (completed PRs, provider-reported tokens): 349 LLM calls (284 audit, 65
+verifier; 359 including the errored items), mean 1.6 calls per PR (p90 3); ~17K tokens per
+PR (p90 ~39K; prompt estimate mean ~11K), 3.56M in total; model time ~69 s per PR (p90 ~190
+s). Dev: 1.6 calls, ~16K tokens, ~65 s per PR.
+
+**Reproduce** (needs `OPENROUTER_API_KEY` for cache misses; the committed
+`ml/evaluation/results/pr_llm_cache.jsonl` replays the recorded answers; the gitignored
+dataset is rebuilt offline with `python scripts/build_pr_eval.py --v2`, see
+[PR-shaped eval v2](#pr-shaped-eval-v2-real-benign-commits)):
+
+```bash
+python -m ml.evaluation.run_pr_eval --arm pr --dataset ml/evaluation/datasets/pr_eval/pr_eval_v2_test.jsonl \
+    --split test --i-know-this-is-the-test-set \
+    --llm-model openrouter:nvidia/nemotron-3-super-120b-a12b:free --llm-tpm 0 --llm-sleep 4 \
+    --llm-max-calls 800 --semgrep-cache ml/evaluation/results/pr_semgrep_v2_test217.json \
+    --out ml/evaluation/results/pr_eval_pr_v2_test217_super.json
+```
+
+**Known limitations.** The bug-introducing PRs are reversed fixes, so most are "a guard was
+removed"; real vulnerabilities are often additions. DoS and timing bugs are out of scope by
+design. The default model is a free OpenRouter model with no fallback: an outage or 429 fails
+the review (`failed`, red via the coverage gate), and free models can be withdrawn (the free
+Qwen default was); set `OPENROUTER_FALLBACK_MODEL` / `LLM_FALLBACK_PROVIDER` to add one. About
+5% of bug-introducing PRs (3/60) failed on reasoning that exhausted the 16K output cap. The
+reviewer only sees the PR's changed files, so context requests for code outside the PR can't
+be served. The per-function "1 of 8" result and the dev200 Qwen numbers are historical and
+superseded by these.
 
 ---
 
@@ -922,3 +1042,4 @@ sha256 against the v1 manifest, and never rebuilds or rewrites v1.
   sample 296 / 680 / 2,677 requests (floor / scenario / ceiling), 2.3M / 5.7M / 32M tokens;
   test file 257 / 588 / 2,417 requests, 2.0M / 5.2M / 29M tokens. No dev PR and one test PR
   (a real commit touching a 23.6K-line Ghost file) come out pipeline-partial.
+- **Results**: [Held-out test results (v2)](#held-out-test-results-v2).

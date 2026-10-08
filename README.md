@@ -23,8 +23,8 @@ How a review works:
      code): known vulnerable code from public CVEs (published security bugs) and the team's
      own past review comments.
 3. **Audit the whole PR with an LLM** (a large language model). It asks "what does this change
-   newly make exploitable?" It may ask for more code from the PR before it answers (the
-   option exists, but the model never used it in the 160-PR eval run).
+   newly make exploitable?" It may ask for more code from the PR before it answers (it did
+   in 25 of 214 PRs of the held-out test; code outside the PR can't be shown to it).
 4. **Double-check every finding.** Each candidate goes to a separate verifier call. Only
    findings confirmed with high confidence are reported. A candidate the verifier can't
    confirm, at a spot where the change deleted code that looks like a security check
@@ -45,42 +45,57 @@ job API, and a small **web dashboard** for pasting code by hand.
 
 ## Key numbers
 
-| What was measured | Result | Sample |
+Measured once on a held-out test set never used for tuning, with the shipped default setup
+(the free `nvidia/nemotron-3-super-120b-a12b:free` model on OpenRouter). Setup and metrics
+were fixed before the run
+([pre-registration](ml/evaluation/results/pr_eval_v2_test217_preregistration.md)); nothing was
+tuned afterwards. The 217 test PRs come from real open-source Python and JavaScript projects:
+60 **bug-introducing PRs** (real security fixes for published CVEs, played backwards, so the
+PR puts the vulnerability back), the 60 real **fix PRs** (nothing to report), and 97
+**everyday commits** from the same projects (commits mentioning security filtered out).
+
+| Question | Result |
+|---|---|
+| Does it catch a bug-introducing PR, in the right function? | **34 of 57 (60%)**, 95% CI 47-71%. On the exact lines (±2): 27 of 57 (47%). |
+| ...leaving out denial-of-service and timing bugs, which it isn't built to find | 29 of 47 (62%) |
+| Does it wrongly flag a fix PR? | **1 of 60 (1.7%)** |
+| Does it wrongly flag an everyday commit? | **4 of 97 (4.1%)**; with 95% confidence at most 10.2% |
+
+3 bug-introducing PRs errored (see below); counting what they found before failing and the
+rest as misses, 36 of 60 (60%) were caught. Larger PRs draw more false alarms:
+
+| | Under 50 changed lines | 50 or more |
 |---|---|---|
-| Similarity search alone | Can't tell a bug from its fix: precision 0.5 (a coin flip) at every threshold. A function and its fixed version embed at cosine 0.96-0.998. | 1,054 eval functions |
-| Old design: LLM reviews each changed function on its own | Caught **1 of 8** real bugs on the right lines (95% CI 2-47%) | 8 bug/fix pairs + 13 ordinary functions; a different, much smaller test than the PR-level row, so not directly comparable |
-| Static checks only (Semgrep + guard-removal check), best case | Reach **23%** of bugs at a **4%** false-alarm rate on benign changes | 502 held-out bug/fix pairs |
-| Guard-removal "alert" tier alone | Fires on **3%** of bugs, **0** false alarms measured | 506 pairs + 994 benign edits |
-| **Current design: PR-level review** (preliminary; measured with the previous configuration, see below) | Reported findings (after the verifier): catches **12/55** bug-introducing PRs on the exact lines and **16/55** within the changed function; **16/41** within the function when denial-of-service and timing bugs (which the prompt doesn't target) are left out. Wrongly flags **2/57** fix PRs and **0/48** benign PRs. Audit candidates before the verifier: **35/55** caught within the function, 4/57 fix and 2/48 benign PRs flagged. | 160 of 200 dev PRs scored: 55 of 60 bug-introducing, 57 of 60 fix, only 48 of 80 benign |
+| Everyday commits flagged | 2 of 81 (2.5%) | 2 of 16 (12.5%) |
+| Fix PRs flagged | 0 of 46 | 1 of 14 |
+| Bug-introducing PRs caught (right function) | 23 of 45 | 11 of 12 |
 
 What this means:
 
-- Finding "similar" code is not enough to call something vulnerable, so retrieval is only
-  context. The LLM review with verification makes the decision.
-- Static checks are precise but see less than a quarter of the bugs. They work as leads for
-  the LLM, not as the verdict.
-- The PR-level numbers come from a partial run on a dev sample built from real CVE fix commits
-  (each fix reversed gives a bug-introducing PR), using the free Qwen 3.8 27B model through
-  OpenRouter, with temperature 0, the old verifier prompt and a confidence cutoff of 8. The
-  current defaults differ (the model is now Nemotron 3 Super 120B, free on OpenRouter, at
-  temperature 0.2; a rewritten verifier prompt, cutoff 7, 12K-token prompts). **A rerun with the current defaults is
-  pending**, and so is the held-out test split.
-- The benign PRs are files that changed alongside security fixes in the same commits, not
-  ordinary PRs. Only 48 of the 80 were scored: if all 32 unknown ones were flagged, the
-  false-alarm rate would be 32/80. The 0/48 also rests on the cutoff of 8: one benign PR
-  (pypiserver) was confirmed at confidence 7, so the same verdicts at today's cutoff of 7
-  would give 1/48.
-- The verifier trades recall for quiet: within the changed function it keeps 16 of the 35
-  catches the audit made, and removes both benign false alarms and 2 of the 4 fix-PR alarms.
-  Tuning that trade-off is the next step.
+- **Use findings as review comments, not as a merge blocker.** Few real PRs introduce a
+  vulnerability. If 2% do, about **1 in 5 warnings is a real bug** (1 in 10 at 1%, 2 in 5 at
+  5%; worse if the false-alarm rate is at the top of its range). Keep the Action's severity
+  gate at `high` and let a person judge each finding.
+- **Expect more than 4% false alarms on your PRs.** About 1 in 8 larger everyday commits was
+  flagged, and real PRs are often larger than this sample's.
+- **The benchmark is narrow.** Its bugs are reversed fixes, so most of them delete a check;
+  real vulnerabilities are often new code. Denial-of-service and timing bugs are out of scope.
+  The reviewer sees only the PR's changed files, not the rest of the repository.
+- **The default model is free, with no fallback.** An OpenRouter outage or rate limit fails
+  the review (`failed`, a red check), and free models can be withdrawn (the previous default
+  was). You can add a fallback model in `.env` (see below).
+- **The model sometimes thinks too long.** 3 of 60 bug-introducing PRs (5%) failed because it
+  spent its whole 16K-token output budget reasoning. Such a review says `partial` or `failed`,
+  never clean.
+- **Cost:** on average 1.6 LLM calls, 17K tokens and 69 s of model time per PR (1 in 10 PRs
+  uses over 39K tokens; 1 in 10 takes over 190 s).
 
-Other facts worth knowing: the CVE corpus holds 2,890 vulnerable/fixed code pairs (25
-handwritten, the rest mined from real fix commits of PyPI and npm advisories). Code is
-embedded with `jina-embeddings-v2-base-code` on CPU. A typical PR review costs about 1-6 LLM
-calls (roughly 5K-40K tokens), at most 12.
-
-Method, per-stage results and caveats: [docs/DETAILS.md](docs/DETAILS.md) and
-[ROADMAP.md](ROADMAP.md).
+Earlier measurements explain the design: similarity search can't tell a bug from its fix
+(precision 0.5 at every threshold, 1,054 functions), so CVE retrieval (2,890 vulnerable/fixed
+pairs) is only context; static checks alone (Semgrep + guard-removal check) reach 23% of bugs
+at a 4% false-alarm rate (502 held-out pairs), so they are leads for the LLM, not the verdict.
+Full results (dev vs test, the verifier's effect, cost) and caveats:
+[docs/DETAILS.md](docs/DETAILS.md#held-out-test-results-v2) and [ROADMAP.md](ROADMAP.md).
 
 ## Run it on your machine
 

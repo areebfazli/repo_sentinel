@@ -16,7 +16,13 @@ Decided 2026-09-22. Ordered by expected impact.
    and verifies each candidate separately (`REVIEW_MODE=pr`, default; `units` kept). Next:
    measure it against the per-unit review on the PR eval set (`ml/evaluation/datasets/pr_eval/`)
    before tuning any threshold. Harness built (`ml/evaluation/run_pr_eval.py`, "PR-level eval
-   harness" below; dry run done); the live runs are pending.
+   harness" below). **Done**: dev runs (dev200 Qwen, v2 dev240 Nemotron Super) and the
+   pre-registered held-out test run (2026-10-08, "Held-out test (2026-10-08)" below).
+10. **Status 2026-10-08: further prompt / verifier tuning is paused** pending dogfooding on real
+    PRs (the held-out test set has now been used once). Next candidates:
+    cross-file context for the audit and verifier (today the reviewer sees only the PR's
+    changed files), handling the 16K-output reasoning-exhaustion failures (3/60
+    bug-introducing test PRs), and a fallback model behind the free default.
 
 ## Findings 2026-09-24 (precision research + adversarial review)
 
@@ -229,6 +235,29 @@ candidate per file, each verified; `ceiling` = every context round the audit bud
 reuse their base items' entries). 2-item smoke test: 12 s engine time (mostly fixed start-up),
 ~0.9 GB peak for the engine processes; the cached hits served per PR matched a direct engine
 run on the same units. Not yet run on the dataset.
+
+## Held-out test (2026-10-08)
+
+Pre-registered (`ml/evaluation/results/pr_eval_v2_test217_preregistration.md`, commit 1d80979),
+one run, no tuning afterwards, shipped default configuration (commit f7e4072:
+`openrouter:nvidia/nemotron-3-super-120b-a12b:free`, no fallback, temperature 0.2, 16K output
+cap, 300 s call deadline, 12K prompts, verifier cutoff 7, worth-a-look on) on
+`pr_eval_v2_test.jsonl` (60 bug-introducing, 60 fix, 97 everyday commits). 214/217 completed
+(3 bug-introducing PRs errored: the model spent all 16K output tokens reasoning).
+
+- Bug-introducing caught in the right function 34/57 = 60% (95% CI 47-71%), exact lines 27/57;
+  in scope (no DoS / timing) 29/47; worst case over all 60: 36/60.
+- Fix PRs flagged 1/60; everyday commits flagged 4/97 = 4.1% (exact upper bound 10.2%); < 50
+  changed lines 2/81, >= 50 lines 2/16. Precision at 1 / 2 / 5% base rate ~10 / 19 / 38%.
+- Verifier: audit-only 37/57, fix 4/60, everyday 6/97; it removed 3 fix + 2 everyday false
+  alarms for 3 catches. Worth-a-look tier added nothing.
+- Cost: mean 1.6 calls, ~17K tokens, ~69 s model time per PR (p90 ~39K tokens, ~190 s).
+- Dev240 (same model, before the last fixes): 28/58 function-level, 22/58 strict, fix 5/60,
+  everyday 5/120.
+
+Reading: about 1 in 5 warnings real at a 2% vulnerable-PR rate, so findings are review input,
+not a merge gate (keep the Action's severity gate at `high`). Full tables:
+[docs/DETAILS.md, "Held-out test results (v2)"](docs/DETAILS.md#held-out-test-results-v2).
 
 ## 1. Detection quality
 

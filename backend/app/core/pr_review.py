@@ -24,9 +24,11 @@ per-function in isolation. Stages:
    appended (at most ``PR_REVIEW_CONTEXT_MAX_TOKENS`` per prompt) and the audit
    re-asked, at most ``PR_REVIEW_CONTEXT_ROUNDS`` times per prompt; the loop
    stops early when nothing new resolves (one last call then asks for the
-   final answer). A final answer that still only asks for context gives no
-   findings for that prompt and makes the review partial
-   (``context_unresolved``), never a failed call. Our own implementation of
+   final answer). A final answer that still only asks for context (usually
+   code outside the PR, which the symbol index cannot serve) gives no findings
+   for that prompt; its units still count as reviewed (the model saw all of
+   the PR's code), recorded as ``context_unresolved`` with a report note, and
+   it is neither a failed call nor a partial review. Our own implementation of
    the idea; nothing from vulnhuntr.
 4. **Validation**: every finding must quote the NEW file (``locate_quote``,
    searched near the claimed line first; failing that anywhere, a loose
@@ -664,8 +666,9 @@ def audit_schema_problem(data, *, final: bool = False):
     ``need_context`` beside it is ignored once no more context can be given),
     or a non-empty ``need_context`` list. The latter is accepted on the final
     call too (no more context rounds): ``run_pr_review`` then records it as
-    ``context_unresolved`` (no findings from that prompt, review partial)
-    instead of failing the call. On the final call it is only a
+    ``context_unresolved`` (no findings from that prompt; its units count as
+    reviewed, the review is not partial because of it) instead of failing the
+    call. On the final call it is only a
     ``FALLBACK_ANSWER`` (falsy): ``extract_json`` prefers any object of the
     reply with a findings list, so a findings answer followed by a trailing
     need_context object keeps its findings. Anything else (a non-object, a bare finding
@@ -1435,11 +1438,13 @@ async def run_pr_review(
                 candidates.extend(found)
             elif final:
                 # Only need_context although no more context can be given (the
-                # prompt says so): no findings from this prompt, but not a clean
-                # review either - the model could not judge without more code.
-                logger.warning("PR audit final answer from {} still asks for context ({} "
-                               "file(s)): reviewed as partial (context_unresolved)",
-                               provider, len(chunk.paths))
+                # prompt says so): no findings from this prompt. The model saw
+                # all of the PR's code it was given (what it still wants is
+                # usually outside the PR), so its units count as reviewed:
+                # recorded (stat + report note), not a partial review.
+                logger.info("PR audit final answer from {} still asks for context ({} "
+                            "file(s)): no findings from it (context_unresolved)",
+                            provider, len(chunk.paths))
                 answered = unresolved = True
                 stats["context_unresolved"] += 1
                 break
@@ -1581,11 +1586,12 @@ async def run_pr_review(
 def pr_coverage(n_units: int, outcome: dict) -> dict:
     """``scan_runner.review_coverage`` for the PR review: "failed" when no
     audit call succeeded although there was code to review; "partial" when
-    some units weren't audited, a file's diff was clipped, the final audit
-    answer still asked for context (``context_unresolved``: counted as partly
-    reviewed), or a candidate could not be verified; else "complete"."""
+    some units weren't audited, a file's diff was clipped, or a candidate
+    could not be verified; else "complete". A final audit answer that still
+    asked for context (``context_unresolved``) does not make it partial: those
+    units were reviewed (``pr_notes`` mentions them)."""
     reviewed = outcome["reviewed_units"]
-    partial = sum(bool(u.get("partial") or u.get("context_unresolved")) for u in reviewed)
+    partial = sum(bool(u.get("partial")) for u in reviewed)
     unverified = outcome["stats"]["unverified"]
     if n_units == 0:
         status = "complete"
@@ -1634,9 +1640,10 @@ def pr_notes(outcome: dict) -> list[str]:
     unresolved = [f"{u.get('file_path')}:{u.get('function_name') or u.get('start_line')}"
                   for u in reviewed if u.get("context_unresolved")]
     if unresolved:
-        notes.append(f"_⚠️ {len(unresolved)} unit(s) only partly reviewed (context_unresolved: "
-                     f"the LLM still asked for code it was not shown after the context rounds "
-                     f"ran out, so it reported nothing there): {_labels(unresolved)}._")
+        n = s.get("context_unresolved") or 1
+        notes.append(f"_The reviewer asked for code outside this PR that it could not be shown "
+                     f"({n} request(s)); findings are based on the PR's own code: "
+                     f"{_labels(unresolved)}._")
     for reason, why in (
         ("budget", f"PR review budget: {cfg.max_audit_calls} audit call(s) of "
                    f"~{cfg.max_prompt_tokens} tokens"),

@@ -1473,7 +1473,8 @@ def operational_metrics(records: list[dict], arm: str) -> dict:
             "symbols_requested": funnel["context_requested"],
             "symbols_resolved": funnel["context_resolved"],
             # Final answers still asking for context (0 in runs recorded before
-            # the stat existed): those PRs are review_status "partial".
+            # the stat existed). Not a partial review: the PR's code was reviewed
+            # (runs recorded before this change have such PRs "partial").
             "prompts_unresolved": funnel["context_unresolved"],
         }
         statuses = Counter()

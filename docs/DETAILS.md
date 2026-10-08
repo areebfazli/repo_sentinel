@@ -439,10 +439,15 @@ reviewer reads one, not function by function:
    rounds left) the prompt says need_context is no longer allowed; an answer with a
    `findings` list is used as is (any `need_context` beside it ignored; a reply holding a
    findings object and a separate need_context object uses the findings), while one that
-   still only asks for context is not a failed call: that prompt gives no findings and its
-   units count as partly reviewed, so the review is `partial` (`context_unresolved`: stat
-   `pr_review.context_unresolved`, a report note, the eval's funnel). Answers without
-   either (or with the wrong types) stay bad output.
+   still only asks for context (usually code outside the PR, which the symbol index cannot
+   serve) is not a failed call: that prompt gives no findings, but its units count as
+   reviewed (the model saw all of the PR's code), so it does not make the review `partial`
+   and the Action's coverage gate stays green (`context_unresolved`: stat
+   `pr_review.context_unresolved`, the eval's funnel, and a report note "The reviewer asked
+   for code outside this PR that it could not be shown (N request(s)); findings are based on
+   the PR's own code"). Findings from earlier rounds or other prompts stand. Answers without
+   either (or with the wrong types) stay bad output (units not reviewed, review `partial` /
+   `failed`).
 5. **Validation + filters**: the quote must be in the NEW file (searched near the claimed line
    first; diff markers tolerated; failing that, a loose fallback that ignores quote / backtick
    characters and their backslash escapes, only within 3 lines of the claimed line, never
